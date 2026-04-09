@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.0.0
+; uBASIC 8088  v1.0.1
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -33,13 +33,16 @@
 ;   0x1E00..0x1FFF               stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.0.1 (2026-04-09)  Minor tweaks to print string routine
 ;   v1.0.0 (2026-04-09)  First release. Clean 8088 port from uBASIC 65c02 v17.0.
 ;                         Line editor logic from uBASIC8088 v2.1.0.
 ; =============================================================================
 
         cpu 8086
-        org 0x0100              ; COM file. Change to 0x0000 for EPROM.
-
+        org 0x0100              ; COM file origin. Change to 0x0 for EPROM. 
+                                ; Comment out for 8 bit workshop
+	; section .TEXT		; Uncomment to test in 8bitworkshop
+        
 ; --- RAM addresses -----------------------------------------------------------
 VARS:           equ 0x1000      ; 52 bytes: A-Z variables (word each)
 RUNNING:        equ 0x1034      ; byte:  0=immediate, 1=running
@@ -80,7 +83,8 @@ T_DS:           equ 0xA4        ; '$'  CHR$
 start:
         cld
         mov sp, STACK_TOP
-
+	push cs			; required for 8bitworkshop, minimal mode ROM
+        pop ds			; and load from Bootsector
         mov di, VARS            ; zero A-Z variables (26 words = 52 bytes)
         xor ax, ax
         mov cx, 26
@@ -89,8 +93,8 @@ start:
         mov word [PROG_END], PROGRAM
         mov word [PROGRAM], 0   ; empty program end-marker
 
-        mov si, str_banner
-        call print_z
+        mov si, str_banner	; signon banner
+        call dp_str
         call do_free            ; print free bytes on startup
         ; fall through into main_loop
 
@@ -133,7 +137,8 @@ do_error:
         cmp byte [RUNNING], 0
         je do_error_nl
         mov si, str_in          ; " IN "
-        call print_z
+        call dp_str
+;      call print_z
         mov ax, [CURLN]
         call output_number
 do_error_nl:
@@ -388,7 +393,8 @@ do_rem_r:
 
 ; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
-;
+; dp_str - si is ptr to string. Like Print_z but terminator is 0x0d for automatic
+; newline or 0x22,";" to supress newline
 ; Items: "string literal", CHR$(n), numeric expression.
 ; ';' between items suppresses inter-item space.
 ; Trailing ';' suppresses final CR+LF.
@@ -511,8 +517,8 @@ do_free:
         mov al, ' '
         call output
         mov si, str_free
-        call print_z
-        call new_line
+        ;call print_z
+        call dp_str
         ret
 
 ; =============================================================================
@@ -558,7 +564,6 @@ expr:
         je rel_eq
         cmp al, '<'
         je rel_lt
-        cmp al, '>'
         je rel_gt
         ret                     ; no relational op
 
@@ -952,18 +957,6 @@ input_key:
         ret
 
 ; =============================================================================
-; PRINT_Z  print null-terminated string at SI
-; Clobbers: AX, SI
-; =============================================================================
-print_z:
-        lodsb
-        or al, al
-        je pz_r
-        call output
-        jmp print_z
-pz_r:   ret
-
-; =============================================================================
 ; LINE EDITOR
 ; Retained and adapted from uBASIC8088 v2.1.0
 ; =============================================================================
@@ -1202,8 +1195,8 @@ kw_usr:     db 0x55,0x53,T_R              ; USR
 ; =============================================================================
 ; String constants (null-terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.0",0x0d,0x0a,0
-str_in:     db " IN ",0
-str_free:   db "FREE",0
+str_banner: db "uBASIC 8088 v1.0.0", 0x0d
+str_in:     db " IN ",0x22,";" ; no newline
+str_free:   db "FREE",0x0d
 
 ROM_END:
