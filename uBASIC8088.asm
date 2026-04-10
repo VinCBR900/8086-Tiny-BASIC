@@ -1199,4 +1199,8 @@ str_banner: db "uBASIC 8088 v1.0.0", 0x0d
 str_in:     db " IN ",0x22,";" ; no newline
 str_free:   db "FREE",0x0d
 
+; pad to 2048 bytes
+	times 2048-($-$$) db 0xff
+	
+
 ROM_END:
