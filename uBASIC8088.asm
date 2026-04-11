@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.0.1
+; uBASIC 8088  v1.0.7
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -12,38 +12,63 @@
 ; Multi-stmt : colon separator ':'
 ; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable
 ;
-; Segment model: CS=DS=ES=SS (single segment).
-;   Works as DOS .COM file and as bare-metal EPROM (no segment arithmetic needed).
-; I/O: BIOS INT 10h display, INT 16h keyboard. Replace output/input_key for UART.
+; Segment model: CS=DS=ES=SS=0x0000 (single segment, flat).
+;   Boot sector (bootsect.asm) loads 4 sectors to 0x7E00 and jumps there.
+;   All absolute addresses in RAM (VARS, PROGRAM, etc.) are segment-0 offsets.
 ;
-; Line store format: <linenum_lo> <linenum_hi> <raw ASCII body> <CR>
-; No tokenisation - body stored and re-parsed every execution.
+; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
 ;
-; RAM layout (flat single segment, 0x1000..0x1FFF):
-;   0x1000  vars[26]   52 bytes  A-Z word variables
-;   0x1034  running     1 byte   0=immediate 1=running
+; Line store: <linenum_lo> <linenum_hi> <raw ASCII body> <CR>  (no tokenization)
+;
+; RAM layout (0x1000..0x1FFF, segment 0):
+;   0x1000  vars[26]   52 bytes   A-Z word variables (2 bytes each)
+;   0x1034  running     1 byte    0=immediate, 1=running
 ;   0x1035  (pad)       1 byte
-;   0x1036  curln       2 bytes  current executing line# (for error reports)
-;   0x1038  ibuf       34 bytes  input line buffer
-;   0x105A  prog_end    2 bytes  one-past-last byte of program store
-;   0x105C  run_next    2 bytes  next-line DI for run loop
-;   0x105E  ins_tmp     2 bytes  temp for insline end-marker address
-;   0x1060  program     ...      program store (grows toward 0x1E00)
-;   0x1E00  PROGRAM_TOP          top of usable program store
-;   0x1E00..0x1FFF               stack (512 bytes, SP init = 0x2000)
+;   0x1036  curln       2 bytes   current executing line number (for errors)
+;   0x1038  ibuf       34 bytes   input line buffer
+;   0x105A  prog_end    2 bytes   one-past-last byte of program store
+;   0x105C  run_next    2 bytes   next-line pointer for run loop
+;   0x105E  ins_tmp     2 bytes   temp word for insline end-marker address
+;   0x1060  program     ...       program store (grows toward 0x1E00)
+;   0x1E00  PROGRAM_TOP           top of program store / base of stack
+;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
-;   v1.0.1 (2026-04-09)  Minor tweaks to print string routine
+;   v1.0.7 (2026-04-10)  Fix modulo: IDIV clobbers DX (DL=operator) with
+;                         remainder; save DL to BL before IDIV, compare BL.
+;   v1.0.6 (2026-04-10)  Fix rel_lt and rel_gt plain-op paths: pop ax before
+;                         call rel_setup was missing (stack imbalance + wrong BX).
+;   v1.0.5 (2026-04-10)  Fix expression register preservation:
+;     expr: push/pop AX (not BX) to save left operand across peek;
+;     rel_xx: pop AX (restore left) before call rel_setup;
+;     rel_setup: reverted to push ax/call expr_add/pop bx;
+;     ea_do: push/pop DX to preserve operator DL across call expr1.
+;   v1.0.4 (2026-04-10)  Fix expr: save expr_add result in BX before relational
+;                         peek; mov al,[si] was overwriting AL (low byte of AX),
+;                         corrupting all expression results to 0x0D (CR).
+;   v1.0.3 (2026-04-10)  Fix expr2: reload AL from [si] after kw_match chain
+;                         (kw_match clobbers AL; stale value used for digit/var test)
+;   v1.0.2 (2026-04-10)  Fix for 8086tiny / boot sector execution:
+;     - ORG changed from 0x0100 to 0x7E00 to match boot sector load address.
+;       All dw pointers in st_tab and kw tables now resolve correctly.
+;     - Init: CX increased from 26 to 48 words so rep stosw zeroes all RAM
+;       control variables (RUNNING, CURLN, IBUF, PROG_END, RUN_NEXT, INS_TMP).
+;     - Segment setup: push cs / pop ds/es/ss added to ensure CS=DS=ES=SS=0.
+;       Boot sector leaves DS=ES=SS=0 already; this is defensive.
+;     - expr: fixed dead 'je rel_gt' (was 'cmp al,<' / 'je rel_lt' / 'je rel_gt').
+;       Now correctly: 'cmp al,>' / 'je rel_gt' so '>' operators work.
+;     - String printing: replaced dp_str (PRINT parser re-entry, fragile) with
+;       print_z (null-terminated), matching original v1.0.0 design.
+;       str_banner, str_in, str_free now null-terminated; new_line called explicitly.
+;     - do_input: added variable-letter validation before get_var_addr (was absent).
+;   v1.0.1 (2026-04-09)  Added push cs/pop ds; changed string routine to dp_str.
 ;   v1.0.0 (2026-04-09)  First release. Clean 8088 port from uBASIC 65c02 v17.0.
-;                         Line editor logic from uBASIC8088 v2.1.0.
 ; =============================================================================
 
         cpu 8086
-        org 0x0100              ; COM file origin. Change to 0x0 for EPROM. 
-                                ; Comment out for 8 bit workshop
-	; section .TEXT		; Uncomment to test in 8bitworkshop
-        
-; --- RAM addresses -----------------------------------------------------------
+        org 0x7E00              ; Boot sector loads us here (0x0000:0x7E00)
+
+; --- RAM addresses (segment 0 offsets) ---------------------------------------
 VARS:           equ 0x1000      ; 52 bytes: A-Z variables (word each)
 RUNNING:        equ 0x1034      ; byte:  0=immediate, 1=running
 CURLN:          equ 0x1036      ; word:  current line number (error reports)
@@ -56,13 +81,13 @@ PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
 ; --- Error codes -------------------------------------------------------------
-ERR_SN:         equ 0           ; syntax / bad expression
-ERR_UL:         equ 1           ; undefined line number
-ERR_OV:         equ 2           ; division or modulo by zero
-ERR_OM:         equ 3           ; out of memory
-ERR_UK:         equ 4           ; bad variable name
+ERR_SN:         equ 0
+ERR_UL:         equ 1
+ERR_OV:         equ 2
+ERR_OM:         equ 3
+ERR_UK:         equ 4
 
-; --- Keyword last-byte constants: ASCII value | 0x80 -------------------------
+; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
 T_F:            equ 0xC6        ; 'F'  IF
 T_O:            equ 0xCF        ; 'O'  GOTO
@@ -77,25 +102,35 @@ T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
 
 ; =============================================================================
-; INIT  cold start
+; INIT  cold start; entered at 0x0000:0x7E00 by boot sector
 ; Clobbers: everything
 ; =============================================================================
 start:
         cld
+        ; Ensure CS=DS=ES=SS=0 (boot sector sets them but be defensive)
+        push cs
+        pop ds
+        push cs
+        pop es
+        push cs
+        pop ss
         mov sp, STACK_TOP
-	push cs			; required for 8bitworkshop, minimal mode ROM
-        pop ds			; and load from Bootsector
-        mov di, VARS            ; zero A-Z variables (26 words = 52 bytes)
+
+        ; Zero all RAM control area: VARS through end of INS_TMP (0x1000..0x105F)
+        ; = 0x60 bytes = 48 words.  Covers vars, RUNNING, CURLN, IBUF,
+        ;   PROG_END, RUN_NEXT, INS_TMP.
+        mov di, VARS
         xor ax, ax
-        mov cx, 26
-        rep stosw               ; also zeroes RUNNING,CURLN,ibuf... to 0x1060
+        mov cx, 48
+        rep stosw
 
         mov word [PROG_END], PROGRAM
         mov word [PROGRAM], 0   ; empty program end-marker
 
-        mov si, str_banner	; signon banner
-        call dp_str
-        call do_free            ; print free bytes on startup
+        mov si, str_banner
+        call print_z
+        call new_line
+        call do_free
         ; fall through into main_loop
 
 ; =============================================================================
@@ -137,8 +172,7 @@ do_error:
         cmp byte [RUNNING], 0
         je do_error_nl
         mov si, str_in          ; " IN "
-        call dp_str
-;      call print_z
+        call print_z
         mov ax, [CURLN]
         call output_number
 do_error_nl:
@@ -147,7 +181,6 @@ do_error_nl:
 
 ; =============================================================================
 ; STMT_LINE  execute ':'-separated statements on line at SI
-; Clobbers: AX, BX, CX, DX, SI, DI
 ; =============================================================================
 stmt_line:
         call stmt
@@ -162,20 +195,19 @@ sl_ret:
 
 ; =============================================================================
 ; STMT  execute one statement from SI
-; Clobbers: AX, BX, CX, DX, SI, DI
 ; =============================================================================
 stmt:
         call spaces
         cmp byte [si], 0x0d
         je stmt_ret
-        mov bx, st_tab          ; walk dispatch table
+        mov bx, st_tab
 stmt_lp:
         mov ax, [bx]
         or ax, ax
-        je stmt_let             ; sentinel: fall through to LET/assignment
+        je stmt_let             ; sentinel -> implicit LET/assignment
         call kw_match
         jnc stmt_call
-        add bx, 4               ; next entry (kw_ptr word + handler word)
+        add bx, 4
         jmp stmt_lp
 stmt_call:
         call [bx+2]             ; indirect call to handler
@@ -185,7 +217,7 @@ stmt_let:
 stmt_ret:
         ret
 
-; --- Statement dispatch table: dw kw_ptr, dw handler; ends with dw 0 --------
+; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
 st_tab:
         dw kw_print,    do_print
         dw kw_if,       do_if
@@ -200,38 +232,35 @@ st_tab:
         dw kw_poke,     do_poke
         dw kw_free,     do_free
         dw kw_help,     do_help
-        dw 0                    ; sentinel
+        dw 0
 
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ;
-; Inputs  : BX -> table entry, word 0 = keyword string ptr
-;           SI -> input text (leading spaces skipped internally)
+; Inputs  : BX -> table entry word 0 = keyword string ptr
+;           SI -> input text
 ; Outputs : CF=0 matched, SI advanced past keyword
 ;           CF=1 no match, SI unchanged
 ; Clobbers: AX, DI, DL
-;
-; Keywords use bit-7 termination on their last byte.
-; After matching, next source char must not be A-Z, a-z, 0-9, or _.
 ; =============================================================================
 kw_match:
         push si
-        call spaces             ; skip leading spaces in input
-        mov di, [bx]            ; DI -> keyword string
+        call spaces
+        mov di, [bx]
 kw_lp:
-        mov al, [di]            ; keyword byte
+        mov al, [di]
         inc di
-        mov ah, al              ; save for bit-7 test later
-        and al, 0x7f            ; strip bit 7 to get true ASCII
-        call uc_al              ; uppercase (keyword already UC, defensive)
-        mov dl, [si]            ; source byte
+        mov ah, al
+        and al, 0x7f
+        call uc_al
+        mov dl, [si]
         inc si
-        call uc_dl              ; uppercase source
+        call uc_dl
         cmp al, dl
         jne kw_fail
-        test ah, 0x80           ; last char of keyword?
+        test ah, 0x80           ; last char?
         jz kw_lp
-        ; Full match -- verify word boundary in source
+        ; verify word boundary
         mov al, [si]
         call uc_al
         cmp al, '_'
@@ -245,17 +274,16 @@ kw_lp:
         cmp al, '9'
         jbe kw_fail
 kw_ok:
-        pop ax                  ; discard saved SI
+        pop ax
         clc
         ret
 kw_fail:
-        pop si                  ; restore SI
+        pop si
         stc
         ret
 
 ; =============================================================================
-; UC_AL / UC_DL  uppercase register A or DL
-; Clobbers: only the named register
+; UC_AL / UC_DL  uppercase AL or DL
 ; =============================================================================
 uc_al:
         cmp al, 'a'
@@ -277,38 +305,36 @@ uc_dl_r:
 
 ; =============================================================================
 ; DO_IF  IF <expr> [THEN] <stmt>
-; False: returns (stmt_line stops at CR naturally)
-; True:  consumes optional THEN, falls into stmt
 ; =============================================================================
 do_if:
         call expr
         or ax, ax
         je do_if_false
         mov bx, then_tab
-        call kw_match           ; consume optional THEN; CF=1 = absent (SI restored)
+        call kw_match
         jmp stmt
 do_if_false:
         ret
 
-then_tab:       dw kw_then, 0   ; single-entry table for THEN match
+then_tab:       dw kw_then, 0
 
 ; =============================================================================
 ; DO_GOTO  GOTO <expr>
 ; =============================================================================
 do_goto:
-        call expr               ; AX = target line number
+        call expr
         push ax
-        call find_line          ; DI -> first line >= AX
+        call find_line
         pop bx
         cmp [di], bx
         je dg_found
         mov ax, ERR_UL
         jmp do_error
 dg_found:
-        mov [RUN_NEXT], di      ; update next-line pointer
+        mov [RUN_NEXT], di
         cmp byte [RUNNING], 0
         jne dg_ret
-        mov byte [RUNNING], 1   ; start running if in immediate mode
+        mov byte [RUNNING], 1
         jmp run_loop
 dg_ret:
         ret
@@ -322,15 +348,15 @@ do_run:
         mov [RUN_NEXT], di
 run_loop:
         mov di, [RUN_NEXT]
-        cmp word [di], 0        ; end marker?
+        cmp word [di], 0
         je run_end
         mov ax, [di]
-        mov [CURLN], ax         ; save line# for error reports
+        mov [CURLN], ax
         push di
-        call next_line_ptr      ; DI -> next line
-        mov [RUN_NEXT], di      ; default advance
+        call next_line_ptr
+        mov [RUN_NEXT], di
         pop di
-        lea si, [di+2]          ; SI -> body of current line
+        lea si, [di+2]
         call stmt_line
         jmp run_loop
 run_end:
@@ -338,7 +364,7 @@ run_end:
         ret
 
 ; =============================================================================
-; DO_LIST  LIST: print all program lines
+; DO_LIST
 ; =============================================================================
 do_list:
         mov di, PROGRAM
@@ -349,7 +375,7 @@ dl_lp:
         call output_number
         mov al, ' '
         call output
-        lea si, [di+2]          ; SI -> body
+        lea si, [di+2]
 dl_body:
         lodsb
         call output
@@ -357,13 +383,13 @@ dl_body:
         jne dl_body
         mov al, 0x0a
         call output
-        call next_line_ptr      ; DI -> next line (updates DI in place)
+        call next_line_ptr
         jmp dl_lp
 dl_done:
         ret
 
 ; =============================================================================
-; DO_NEW  NEW: clear program store
+; DO_NEW
 ; =============================================================================
 do_new:
         mov word [PROGRAM], 0
@@ -371,17 +397,16 @@ do_new:
         ret
 
 ; =============================================================================
-; DO_END  END: stop execution
+; DO_END
 ; =============================================================================
 do_end:
         mov byte [RUNNING], 0
-        ; Force run_loop exit: write end-marker where run_next points
         mov di, [RUN_NEXT]
         mov word [di], 0
         ret
 
 ; =============================================================================
-; DO_REM  REM: skip rest of line
+; DO_REM  skip rest of line
 ; =============================================================================
 do_rem:
         cmp byte [si], 0x0d
@@ -393,12 +418,8 @@ do_rem_r:
 
 ; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
-; dp_str - si is ptr to string. Like Print_z but terminator is 0x0d for automatic
-; newline or 0x22,";" to supress newline
-; Items: "string literal", CHR$(n), numeric expression.
-; ';' between items suppresses inter-item space.
-; Trailing ';' suppresses final CR+LF.
-; Clobbers: AX, BX, CX, DX, SI, DI
+; Items: "string", CHR$(n), expression.
+; ';' between items or trailing ';' suppresses CR+LF.
 ; =============================================================================
 do_print:
 dp_top:
@@ -407,25 +428,23 @@ dp_top:
         je dp_nl
         cmp byte [si], '"'
         jne dp_expr
-        inc si                  ; consume opening '"'
+        inc si
 dp_str:
         lodsb
         cmp al, '"'
         je dp_after
-        cmp al, 0x0d            ; unterminated string: treat as end
+        cmp al, 0x0d
         je dp_str_eol
         call output
         jmp dp_str
 dp_str_eol:
-        dec si                  ; put CR back for caller
+        dec si
         jmp dp_nl
-
 dp_expr:
-        ; CHR$(n) or numeric expression?
         mov bx, chrs_tab
         call kw_match
-        jc dp_num               ; not CHR$: evaluate as number
-        call eat_paren_expr     ; CHR$(expr) -> AX
+        jc dp_num
+        call eat_paren_expr
         call output
         jmp dp_after
 dp_num:
@@ -435,10 +454,10 @@ dp_after:
         call spaces
         cmp byte [si], ';'
         jne dp_nl
-        inc si                  ; consume ';'
+        inc si
         call spaces
         cmp byte [si], 0x0d
-        je dp_ret               ; trailing ';': suppress CR+LF
+        je dp_ret
         jmp dp_top
 dp_nl:
         call new_line
@@ -451,20 +470,31 @@ chrs_tab:       dw kw_chrs, 0
 ; DO_INPUT  INPUT <var>
 ; =============================================================================
 do_input:
-        call get_var_addr       ; DI = &var; SI advanced past letter
+        ; Validate variable letter before proceeding
+        call spaces
+        mov al, [si]
+        call uc_al
+        cmp al, 'A'
+        jb di_err
+        cmp al, 'Z'
+        ja di_err
+        call get_var_addr       ; DI = &var; SI advanced
         push di
         mov al, '?'
         call output
         mov al, ' '
         call output
-        call input_line         ; read expression text; SI -> IBUF
-        call expr               ; AX = value
+        call input_line
+        call expr
         pop di
         mov [di], ax
         ret
+di_err:
+        mov ax, ERR_UK
+        jmp do_error
 
 ; =============================================================================
-; DO_LET  [LET] <var> = <expr>  (LET keyword optional)
+; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
         call spaces
@@ -474,13 +504,13 @@ do_let:
         jb dl_err
         cmp al, 'Z'
         ja dl_err
-        call get_var_addr       ; DI = &var; SI advanced
+        call get_var_addr
         push di
         call spaces
         cmp byte [si], '='
         jne dl_err2
         inc si
-        call expr               ; AX = value
+        call expr
         pop di
         mov [di], ax
         ret
@@ -494,13 +524,13 @@ dl_err:
 ; DO_POKE  POKE <addr>, <val>
 ; =============================================================================
 do_poke:
-        call expr               ; AX = address
+        call expr
         mov di, ax
         call spaces
         cmp byte [si], ','
         jne dpk_err
         inc si
-        call expr               ; AX = value
+        call expr
         mov [di], al
         ret
 dpk_err:
@@ -508,7 +538,7 @@ dpk_err:
         jmp do_error
 
 ; =============================================================================
-; DO_FREE  FREE: print free program-store bytes
+; DO_FREE  print free program-store bytes
 ; =============================================================================
 do_free:
         mov ax, PROGRAM_TOP
@@ -517,30 +547,26 @@ do_free:
         mov al, ' '
         call output
         mov si, str_free
-        ;call print_z
-        call dp_str
+        call print_z
+        call new_line
         ret
 
 ; =============================================================================
-; DO_HELP  HELP: print all keywords
-;
-; Walks kw_tab_start, printing each char (stripping bit 7 on last byte);
-; separates keywords with space; ends with CR+LF.
-; The 0x00 sentinel byte ends the walk.
+; DO_HELP  print all keywords
 ; =============================================================================
 do_help:
         mov si, kw_tab_start
 dh_lp:
         lodsb
         or al, al
-        je dh_done              ; 0x00 sentinel
+        je dh_done
         push ax
         and al, 0x7f
         call output
         pop ax
-        test al, 0x80           ; last char of this keyword?
+        test al, 0x80
         jz dh_lp
-        mov al, ' '             ; space between keywords
+        mov al, ' '
         call output
         jmp dh_lp
 dh_done:
@@ -548,34 +574,39 @@ dh_done:
         ret
 
 ; =============================================================================
-; EXPR  evaluate expression, including relational operators
+; EXPR  evaluate expression including relational operators
 ;
 ; Inputs  : SI -> expression text
-; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000; SI advanced
+; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000
 ; Clobbers: AX, BX, CX, DX, SI
 ;
-; Precedence (low to high): relational  <  additive  <  mul/div/mod  <  atom
+; FIX v1.0.2: restored missing 'cmp al,>' before 'je rel_gt'.
+; FIX v1.0.5: push/pop AX around peek (BX unsafe - clobbered by expr2).
+;             rel_xx pop left before rel_setup. rel_setup reverted to original.
 ; =============================================================================
 expr:
-        call expr_add           ; left -> AX
+        call expr_add           ; left operand -> AX
+        push ax                 ; save left (BX clobbered by expr2 kw_match loads)
         call spaces
-        mov al, [si]
+        mov al, [si]            ; peek for relational operator
         cmp al, '='
         je rel_eq
         cmp al, '<'
         je rel_lt
+        cmp al, '>'
         je rel_gt
-        ret                     ; no relational op
+        pop ax                  ; no relational op: restore result
+        ret
 
-; rel_setup: first op char already consumed by caller.
-; In: AX=left; Out: AX=right BX=left
+; rel_setup: in AX=left; out AX=right BX=left
 rel_setup:
-        push ax
-        call expr_add
-        pop bx
+        push ax                 ; save left
+        call expr_add           ; right -> AX
+        pop bx                  ; BX = left
         ret
 
 rel_eq:
+        pop ax                  ; left from expr's push
         inc si
         call rel_setup
         cmp bx, ax
@@ -590,17 +621,20 @@ rel_lt:
         je rel_ne
         cmp al, '='
         je rel_le
-        call rel_setup          ; plain <
+        pop ax                  ; left operand from expr's push
+        call rel_setup          ; plain <: BX=left AX=right
         cmp bx, ax
         jl rel_t
         jmp rel_f
 rel_ne:
+        pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
         jne rel_t
         jmp rel_f
 rel_le:
+        pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
@@ -613,11 +647,13 @@ rel_gt:
         mov al, [si]
         cmp al, '='
         je rel_ge
-        call rel_setup          ; plain >
+        pop ax                  ; left operand from expr's push
+        call rel_setup          ; plain >: BX=left AX=right
         cmp bx, ax
         jg rel_t
         jmp rel_f
 rel_ge:
+        pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
@@ -642,13 +678,15 @@ ea_lp:
         cmp dl, '-'
         jne ea_ret
 ea_do:
+        push dx                 ; save operator DL (clobbered by expr1)
         push ax                 ; save left
         inc si
-        call expr1              ; right -> AX
+        call expr1
         pop bx                  ; BX = left
+        pop dx                  ; DL = operator
         cmp dl, '-'
         jne ea_add
-        neg ax                  ; subtract: negate right then add
+        neg ax
 ea_add:
         add ax, bx
         jmp ea_lp
@@ -671,30 +709,27 @@ e1_lp:
         jne e1_ret
 e1_do:
         inc si
-        push dx                 ; save operator char
-        push ax                 ; save left operand
-        call expr2              ; right -> AX
-        pop cx                  ; CX = left operand
+        push dx
+        push ax
+        call expr2
+        pop cx                  ; CX = left
         pop dx                  ; DL = operator
-
         cmp dl, '*'
         jne e1_div
         xchg ax, cx             ; AX = left, CX = right
-        imul cx                 ; DX:AX = left*right; keep AX (low 16 bits)
+        imul cx
         jmp e1_lp
-
 e1_div:
-        ; CX=left, AX=right (divisor)
-        or ax, ax
+        or ax, ax               ; AX = right (divisor)
         je e1_zero
-        xchg ax, cx             ; AX = left (dividend), CX = right (divisor)
-        cwd                     ; sign-extend AX -> DX:AX
-        idiv cx                 ; AX = quotient, DX = remainder
-        cmp dl, '%'
+        xchg ax, cx             ; AX = left, CX = right
+        mov bl, dl              ; save operator before IDIV clobbers DX
+        cwd
+        idiv cx                 ; AX=quotient DX=remainder (DL overwritten!)
+        cmp bl, '%'
         jne e1_lp
-        mov ax, dx              ; mod: use remainder
+        mov ax, dx              ; modulo: return remainder
         jmp e1_lp
-
 e1_zero:
         mov ax, ERR_OV
         jmp do_error
@@ -702,7 +737,7 @@ e1_ret:
         ret
 
 ; =============================================================================
-; EXPR2  atom level: parens, unary, CHR$, PEEK, USR, number, variable
+; EXPR2  atom level
 ; =============================================================================
 expr2:
         call spaces
@@ -713,60 +748,55 @@ expr2:
         je e2_neg
         cmp al, '+'
         je e2_pos
-
-        ; CHR$(n)
+        ; CHR$
         mov bx, chrs_tab
         call kw_match
         jc e2_nchrs
-        call eat_paren_expr     ; -> AX (character code)
+        call eat_paren_expr
         ret
-
 e2_nchrs:
-        ; PEEK(addr)
+        ; PEEK
         mov bx, peek_tab
         call kw_match
         jc e2_npeek
-        call eat_paren_expr     ; AX = address
+        call eat_paren_expr
         mov bx, ax
         xor ah, ah
-        mov al, [bx]            ; read byte at address
+        mov al, [bx]
         ret
-
 e2_npeek:
-        ; USR(addr)
+        ; USR
         mov bx, usr_tab
         call kw_match
         jc e2_nusr
-        call eat_paren_expr     ; AX = address
-        call ax                 ; call user routine; return value in AX
+        call eat_paren_expr
+        call ax
         ret
-
 e2_nusr:
-        ; Decimal literal?
+        ; Reload AL from [si] - kw_match may have clobbered it
+        mov al, [si]
+        ; decimal literal?
         cmp al, '0'
         jb e2_var
         cmp al, '9'
         ja e2_var
-        call input_number       ; -> AX, SI past digits
+        call input_number
         ret
-
 e2_var:
-        ; Variable A-Z (case-insensitive)?
+        ; variable A-Z?
         call uc_al
         cmp al, 'A'
         jb e2_bad
         cmp al, 'Z'
         ja e2_bad
-        call get_var_addr       ; DI = &var; SI advanced
+        call get_var_addr
         mov ax, [di]
         ret
-
 e2_bad:
-        xor ax, ax              ; unrecognised atom: return 0
+        xor ax, ax
         ret
-
 e2_par:
-        inc si                  ; consume '('
+        inc si
         call expr
         call spaces
         cmp byte [si], ')'
@@ -776,18 +806,16 @@ e2_par:
 e2_perr:
         mov ax, ERR_SN
         jmp do_error
-
 e2_neg:
         inc si
         call expr2
         neg ax
         ret
-
 e2_pos:
         inc si
-        jmp expr2               ; tail call (saves one RET)
+        jmp expr2
 
-; --- eat_paren_expr: skip spaces, expect '(', eval expr, expect ')' -> AX ---
+; eat_paren_expr: '(' expr ')' -> AX
 eat_paren_expr:
         call spaces
         cmp byte [si], '('
@@ -807,24 +835,20 @@ peek_tab:       dw kw_peek, 0
 usr_tab:        dw kw_usr,  0
 
 ; =============================================================================
-; GET_VAR_ADDR  map letter at [SI] to variable address
-;
-; Inputs  : SI -> letter (not yet consumed; any case)
-; Outputs : DI = &vars[(letter-'A')*2]; SI advanced past letter
-; Clobbers: AX, DI
+; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
 ; =============================================================================
 get_var_addr:
         lodsb
         call uc_al
-        sub al, 'A'             ; 0..25
+        sub al, 'A'
         xor ah, ah
-        add ax, ax              ; *2 (word per variable)
+        add ax, ax
         add ax, VARS
         mov di, ax
         ret
 
 ; =============================================================================
-; SPACES  skip spaces at SI; preserves AX, BX, CX, DX
+; SPACES  skip spaces; preserves AX, BX, CX, DX
 ; =============================================================================
 spaces:
         cmp byte [si], ' '
@@ -834,14 +858,10 @@ spaces:
 sp_r:   ret
 
 ; =============================================================================
-; INPUT_NUMBER  parse unsigned decimal integer from [SI] -> AX
-;
-; Inputs  : SI -> text (spaces NOT skipped here; call spaces first if needed)
-; Outputs : AX = value (0 if no digits); SI -> first non-digit char
-; Clobbers: AX, BX, CX
+; INPUT_NUMBER  parse unsigned decimal from [SI] -> AX; SI past digits
 ; =============================================================================
 input_number:
-        xor bx, bx              ; BX = accumulator
+        xor bx, bx
 inm_lp:
         mov al, [si]
         sub al, '0'
@@ -849,20 +869,18 @@ inm_lp:
         cmp al, 9
         ja inm_done
         inc si
-        cbw                     ; zero-extend digit to AX
-        xchg ax, bx             ; AX = old accum, BX = new digit
+        cbw
+        xchg ax, bx
         mov cx, 10
-        mul cx                  ; AX = old_accum * 10
-        add bx, ax              ; BX = accum*10 + digit
+        mul cx
+        add bx, ax
         jmp inm_lp
 inm_done:
         mov ax, bx
         ret
 
 ; =============================================================================
-; OUTPUT_NUMBER  print signed 16-bit AX to terminal
-;
-; Clobbers: AX, CX, DX
+; OUTPUT_NUMBER  signed 16-bit AX -> terminal
 ; =============================================================================
 output_number:
         or ax, ax
@@ -875,53 +893,48 @@ output_number:
 on_pos:
         xor dx, dx
         mov cx, 10
-        div cx                  ; AX = quotient, DX = remainder
-        push dx                 ; save this digit
+        div cx
+        push dx
         or ax, ax
         je on_digit
-        call output_number      ; recurse for higher digits
+        call output_number
 on_digit:
         pop ax
         add al, '0'
-        jmp output              ; tail call
+        jmp output
 
 ; =============================================================================
-; OUTPUT  write AL to terminal via BIOS INT 10h TTY function
-; Clobbers: AX, BX (BIOS uses BH=page, BL=attr)
+; OUTPUT  AL -> BIOS INT 10h TTY
 ; =============================================================================
 output:
         push bx
         mov ah, 0x0e
-        mov bx, 0x0007          ; page 0, white on black
+        mov bx, 0x0007
         int 0x10
         pop bx
         ret
 
 ; =============================================================================
-; NEW_LINE  emit CR + LF
-; Clobbers: AX, BX
+; NEW_LINE  CR + LF
 ; =============================================================================
 new_line:
         mov al, 0x0d
         call output
         mov al, 0x0a
-        jmp output              ; tail call
+        jmp output
 
 ; =============================================================================
-; INPUT_LINE  read edited line from keyboard into IBUF
-;
-; Outputs : IBUF = typed characters + CR; SI -> IBUF
-; Clobbers: AX, CX, DI
+; INPUT_LINE  read edited line into IBUF; SI -> IBUF
 ; =============================================================================
 input_line:
         mov di, IBUF
-        xor cx, cx              ; character count
+        xor cx, cx
 ipl_lp:
-        call input_key          ; AL = keystroke
-        cmp al, 0x08            ; backspace?
+        call input_key
+        cmp al, 0x08
         jne ipl_nbs
         or cx, cx
-        je ipl_lp               ; ignore BS at start of line
+        je ipl_lp
         dec di
         dec cx
         mov al, 0x08
@@ -932,24 +945,22 @@ ipl_lp:
         call output
         jmp ipl_lp
 ipl_nbs:
-        cmp al, 0x0d            ; CR = end of line
+        cmp al, 0x0d
         je ipl_cr
-        cmp cx, 32              ; buffer full?
+        cmp cx, 32
         jnb ipl_lp
-        call output             ; echo
+        call output
         stosb
         inc cx
         jmp ipl_lp
 ipl_cr:
-        call output             ; echo CR
-        stosb                   ; store CR in buffer
+        call output
+        stosb
         mov si, IBUF
         ret
 
 ; =============================================================================
-; INPUT_KEY  read one keystroke (blocking) via BIOS INT 16h
-; Outputs : AL = ASCII character
-; Clobbers: AX
+; INPUT_KEY  -> AL  (BIOS INT 16h)
 ; =============================================================================
 input_key:
         mov ah, 0x00
@@ -957,17 +968,20 @@ input_key:
         ret
 
 ; =============================================================================
-; LINE EDITOR
-; Retained and adapted from uBASIC8088 v2.1.0
+; PRINT_Z  print null-terminated string at SI
+; =============================================================================
+print_z:
+        lodsb
+        or al, al
+        je pz_r
+        call output
+        jmp print_z
+pz_r:   ret
+
+; =============================================================================
+; LINE EDITOR  (from uBASIC8088 v2.1.0)
 ; =============================================================================
 
-; -----------------------------------------------------------------------------
-; WALK_LINES
-; Function: walk program from start; stop at first line >= AX or end marker
-; Inputs  : AX = stop threshold (0xFFFF = walk to true end)
-; Outputs : DI = pointer to first line with line# >= AX, or end marker
-; Clobbers: AX, BX
-; -----------------------------------------------------------------------------
 walk_lines:
         mov di, PROGRAM
 wl_lp:
@@ -981,48 +995,30 @@ wl_lp:
 wl_done:
         ret
 
-; FIND_LINE  DI -> first line >= AX (or end marker)
 find_line:
-        jmp walk_lines          ; AX already set by caller
+        jmp walk_lines
 
-; FIND_PROGRAM_END  DI -> end marker
 find_program_end:
         mov ax, 0xffff
         jmp walk_lines
 
-; -----------------------------------------------------------------------------
-; NEXT_LINE_PTR
-; Function: advance DI to start of next line (past current line's CR)
-; Inputs  : DI -> current line header (word linenum + body + CR)
-; Outputs : DI -> next line header
-; Clobbers: DI
-; -----------------------------------------------------------------------------
 next_line_ptr:
-        add di, 2               ; skip 2-byte line number
+        add di, 2
 nlp_lp:
         cmp byte [di], 0x0d
         je nlp_done
         inc di
         jmp nlp_lp
 nlp_done:
-        inc di                  ; skip CR
+        inc di
         ret
 
-; -----------------------------------------------------------------------------
-; EDITLN
-; Function: insert / replace / delete a numbered program line
-; Inputs  : AX = line number; SI -> body text starting at first non-space
-;           after the line number (i.e. spaces already skipped by main_loop)
-; Outputs : program image updated in RAM; PROG_END updated
-; Clobbers: AX, BX, CX, DX, SI, DI, BP
-; -----------------------------------------------------------------------------
+; EDITLN  AX=linenum, SI->body+CR
 editln:
         push ax
-        call spaces             ; skip any spaces between line# and body
-        pop dx                  ; DX = line number
-        mov bx, si              ; BX -> body start (save for later)
-
-        ; Count body length: CX = bytes including CR
+        call spaces
+        pop dx
+        mov bx, si
         mov cx, 1
 el_len:
         cmp byte [si], 0x0d
@@ -1031,58 +1027,34 @@ el_len:
         inc cx
         jmp el_len
 el_ldone:
-        ; Find insertion/match point
         mov ax, dx
-        call find_line          ; DI -> first line >= AX, or end marker
-        cmp [di], dx            ; exact match?
+        call find_line
+        cmp [di], dx
         jne el_noex
-        call deline             ; delete existing line with same number
+        call deline
 el_noex:
-        cmp byte [bx], 0x0d     ; empty body (just line number) = delete only
+        cmp byte [bx], 0x0d
         je el_done
-        mov si, bx              ; SI -> body
-        mov ax, dx              ; AX = line number
-        add cx, 2               ; +2 for line number word in store
+        mov si, bx
+        mov ax, dx
+        add cx, 2
         call insline
 el_done:
         ret
 
-; -----------------------------------------------------------------------------
-; INSLINE
-; Function: insert a new line into the program store
-; Inputs  : AX = line number
-;           DI = insertion point (from find_line after any deline)
-;           SI -> body text (first char through CR inclusive)
-;           CX = total bytes to store (2-byte header + body + CR)
-; Outputs : program shifted up; new line written; PROG_END updated
-; Clobbers: AX, BX, CX, DX, SI, DI, BP
-;
-; Strategy:
-;   1. Find end marker -> save to INS_TMP (RAM temp, avoids BP/SP conflict).
-;   2. OOM check.
-;   3. Shift [insert_point .. end_marker+1] upward by CX bytes using STD movsb.
-;   4. Re-find insert point via find_line (DI was clobbered by movsb).
-;   5. Write 2-byte header then copy body.
-;   6. Update PROG_END.
-; -----------------------------------------------------------------------------
+; INSLINE  AX=linenum, DI=insert-pt, SI->body, CX=total-size
 insline:
-        ; Save all inputs - we need them after find_program_end clobbers DI
-        push ax                 ; [SP+6] line number
-        push cx                 ; [SP+4] total size (header + body + CR)
-        push si                 ; [SP+2] body pointer
-        push di                 ; [SP+0] insertion point
+        push ax                 ; [BP+6] line number
+        push cx                 ; [BP+4] total size
+        push si                 ; [BP+2] body pointer
+        push di                 ; [BP+0] insertion point
 
-        call find_program_end   ; DI = end marker address
-        mov [INS_TMP], di       ; save to RAM - avoids BP register conflict
+        call find_program_end
+        mov [INS_TMP], di
 
-        ; OOM check: require end_marker + 2 + total_size <= PROGRAM_TOP
-        mov bx, di
-        add bx, 2
-        ; 8086 has no [SP+n] addressing. Use BP as frame pointer instead.
         mov bp, sp
-        ; Frame: [BP+0]=DI_insert [BP+2]=SI_body [BP+4]=CX_size [BP+6]=AX_linenum
-        mov cx, [bp+4]          ; CX = total line size
-        mov ax, [bp+6]          ; AX = line number (restore from frame)
+        mov cx, [bp+4]
+        mov ax, [bp+6]
 
         mov bx, [INS_TMP]
         add bx, 2
@@ -1090,117 +1062,89 @@ insline:
         cmp bx, PROGRAM_TOP
         ja ins_oom
 
-        ; Shift bytes from [insert..end+1] up by CX (= line size) bytes
-        ; Use STD (decrement): source top = end_marker+1, dest top = end_marker+1+CX
-        ; bytes_to_move = end_marker + 2 - insert_point
         mov di, [INS_TMP]
         mov si, di
-        inc si                  ; SI = end_marker + 1 (top of source)
+        inc si
         add di, cx
-        inc di                  ; DI = end_marker + 1 + CX (top of dest)
+        inc di
         mov bx, [INS_TMP]
         add bx, 2
-        sub bx, [bp+0]          ; BX = bytes to move = end+2 - insert_point
-        push bx                 ; save move count
+        sub bx, [bp+0]
+        push bx
         mov cx, bx
         std
-        rep movsb               ; shift upward
+        rep movsb
         cld
 
-        ; Reload saved inputs from BP frame (movsb clobbered SI and DI)
-        pop bx                  ; discard saved move count
-        mov ax, [bp+6]          ; AX = line number
-        mov si, [bp+2]          ; SI = body pointer
-        mov cx, [bp+4]          ; CX = total line size
-        add sp, 8               ; discard 4 original push saves (AX,CX,SI,DI)
+        pop bx                  ; discard move count
+        mov ax, [bp+6]
+        mov si, [bp+2]
+        mov cx, [bp+4]
+        add sp, 8               ; discard 4 original saves
 
-        ; Re-find insertion point (DI was clobbered by movsb)
-        call find_line          ; DI -> correct insertion slot
-
-        ; Write line number header
+        call find_line          ; DI -> insertion slot
         mov [di], ax
         add di, 2
-
-        ; Copy body + CR
 ins_copy:
         lodsb
         stosb
         cmp al, 0x0d
         jne ins_copy
 
-        ; Update PROG_END
-        add [PROG_END], cx      ; CX = total line size
-
-        ; Write new end marker after inserted line (find_program_end recalculates)
+        add [PROG_END], cx
         mov word [di], 0
         ret
 
 ins_oom:
-        add sp, 8               ; clean stack (4 original pushes)
+        add sp, 8
         mov ax, ERR_OM
         jmp do_error
 
-; -----------------------------------------------------------------------------
-; DELINE
-; Function: delete the line at DI by sliding content above it downward
-; Inputs  : DI -> first byte of line to delete (line number word)
-; Outputs : program slid down; PROG_END decremented by deleted line size
-; Clobbers: AX, BX, CX, SI, DI
-; -----------------------------------------------------------------------------
+; DELINE  delete line at DI
 deline:
-        push di                 ; save destination (start of deleted line)
-        call next_line_ptr      ; DI -> first byte of next line (past deleted CR)
-        mov si, di              ; SI = source for slide-down
-        call find_program_end   ; DI = end marker
+        push di
+        call next_line_ptr
+        mov si, di
+        call find_program_end
         mov cx, di
-        add cx, 2               ; CX = end_marker + 2 (include end marker word)
-        pop di                  ; DI = destination (start of deleted line)
+        add cx, 2
+        pop di
         mov bx, si
-        sub bx, di              ; BX = size of deleted line (source - dest)
-        sub cx, si              ; CX = bytes to slide down (from next-line to end+2)
-        rep movsb               ; forward move (no overlap since dest < source)
-        sub [PROG_END], bx      ; update program end
+        sub bx, di
+        sub cx, si
+        rep movsb
+        sub [PROG_END], bx
         ret
 
 ; =============================================================================
-; Keyword strings (bit-7 termination on last byte; 0x00 ends do_help table)
-;
-; kw_tab_start is walked by do_help (stops at 0x00 sentinel).
-; Statement keywords follow in st_tab dispatch order.
-; Expression keywords (THEN, CHR$, PEEK, USR) come after the sentinel.
-; Using db hex to avoid any assembler quoting issues with special chars.
+; Keyword strings (bit-7 terminated; 0x00 sentinel ends do_help table)
 ; =============================================================================
 kw_tab_start:
-kw_print:   db 0x50,0x52,0x49,0x4e,T_T     ; PRINT
-kw_if:      db 0x49,T_F                     ; IF
-kw_goto:    db 0x47,0x4f,0x54,T_O          ; GOTO
-kw_list:    db 0x4c,0x49,0x53,T_T          ; LIST
-kw_run:     db 0x52,0x55,T_N               ; RUN
-kw_new:     db 0x4e,0x45,T_W              ; NEW
-kw_input:   db 0x49,0x4e,0x50,0x55,T_T    ; INPUT
-kw_rem:     db 0x52,0x45,T_M              ; REM
-kw_end:     db 0x45,0x4e,T_D             ; END
-kw_let:     db 0x4c,0x45,T_T             ; LET
-kw_poke:    db 0x50,0x4f,0x4b,T_E        ; POKE
-kw_free:    db 0x46,0x52,0x45,T_E        ; FREE
-kw_help:    db 0x48,0x45,0x4c,T_P        ; HELP
-            db 0                           ; sentinel (end of do_help table)
+kw_print:   db 0x50,0x52,0x49,0x4e,T_T
+kw_if:      db 0x49,T_F
+kw_goto:    db 0x47,0x4f,0x54,T_O
+kw_list:    db 0x4c,0x49,0x53,T_T
+kw_run:     db 0x52,0x55,T_N
+kw_new:     db 0x4e,0x45,T_W
+kw_input:   db 0x49,0x4e,0x50,0x55,T_T
+kw_rem:     db 0x52,0x45,T_M
+kw_end:     db 0x45,0x4e,T_D
+kw_let:     db 0x4c,0x45,T_T
+kw_poke:    db 0x50,0x4f,0x4b,T_E
+kw_free:    db 0x46,0x52,0x45,T_E
+kw_help:    db 0x48,0x45,0x4c,T_P
+            db 0
 
-; Expression-only keywords (not in do_help walk, not in st_tab)
-kw_then:    db 0x54,0x48,0x45,T_N         ; THEN
-kw_chrs:    db 0x43,0x48,0x52,T_DS        ; CHR$
-kw_peek:    db 0x50,0x45,0x45,T_K         ; PEEK
-kw_usr:     db 0x55,0x53,T_R              ; USR
+kw_then:    db 0x54,0x48,0x45,T_N
+kw_chrs:    db 0x43,0x48,0x52,T_DS
+kw_peek:    db 0x50,0x45,0x45,T_K
+kw_usr:     db 0x55,0x53,T_R
 
 ; =============================================================================
-; String constants (null-terminated)
+; Strings (null-terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.0", 0x0d
-str_in:     db " IN ",0x22,";" ; no newline
-str_free:   db "FREE",0x0d
-
-; pad to 2048 bytes
-	times 2048-($-$$) db 0xff
-	
+str_banner: db "uBASIC 8088 v1.0.7",0
+str_in:     db " IN ",0
+str_free:   db "FREE",0
 
 ROM_END:
