@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.0.9
+; uBASIC 8088  v1.0.10
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -41,7 +41,7 @@
 ;   v1.0.9 (2026-04-12)  Expand IBUF 34->64 bytes; input limit 32->62 chars.
 ;                         Fixes silent truncation of long lines (e.g. nested
 ;                         IF with multi-digit numbers). Embed Mandelbrot
-;                         showcase as pre-loaded ROM program (not in COM build).
+;                         showcase as pre-loaded ROM program (COM build).
 ;   v1.0.8 (2026-04-10)  Fix editln: push/pop BX around find_line+deline;
 ;                         walk_lines clobbered BX (body pointer), causing
 ;                         ins_copy to read from 0x0000 (IVT) instead of IBUF.
@@ -68,9 +68,6 @@
 ;       Boot sector leaves DS=ES=SS=0 already; this is defensive.
 ;     - expr: fixed dead 'je rel_gt' (was 'cmp al,<' / 'je rel_lt' / 'je rel_gt').
 ;       Now correctly: 'cmp al,>' / 'je rel_gt' so '>' operators work.
-;     - String printing: replaced dp_str (PRINT parser re-entry, fragile) with
-;       print_z (null-terminated), matching original v1.0.0 design.
-;       str_banner, str_in, str_free now null-terminated; new_line called explicitly.
 ;     - do_input: added variable-letter validation before get_var_addr (was absent).
 ;   v1.0.1 (2026-04-09)  Added push cs/pop ds; changed string routine to dp_str.
 ;   v1.0.0 (2026-04-09)  First release. Clean 8088 port from uBASIC 65c02 v17.0.
@@ -81,7 +78,7 @@
 %ifdef COM_BUILD
         org 0x0100              ; DOS COM file: PSP at 0x0000, code at 0x0100
 %else
-        org 0x7E00              ; ROM: boot sector loads to 0x0000:0x7E00
+;        org 0x7E00              ; ROM: boot sector loads to 0x0000:0x7E00
 %endif
 
 ; --- RAM addresses (segment 0 offsets) ---------------------------------------
@@ -141,8 +138,7 @@ start:
         rep stosw
 
 %ifdef COM_BUILD
-        mov word [PROG_END], PROGRAM
-        mov word [PROGRAM], 0   ; empty program for DOS COM build
+        call do_new
 %else
         ; Copy pre-loaded showcase from ROM to RAM program store
         mov si, SHOWCASE_DATA
@@ -153,8 +149,7 @@ start:
 %endif
 
         mov si, str_banner
-        call print_z
-        call new_line
+        call dp_str
         call do_free
         ; fall through into main_loop
 
@@ -177,8 +172,10 @@ main_loop:
 
         call input_number       ; parse optional line number -> AX
         or ax, ax
-        je stmt_line            ; no number: direct command
-
+        jne ml_numbered
+        call stmt_line          ; CALL - correct return address
+        jmp main_loop
+ml_numbered:
         call editln             ; numbered line: store/edit in program
         jmp main_loop
 
@@ -197,7 +194,7 @@ do_error:
         cmp byte [RUNNING], 0
         je do_error_nl
         mov si, str_in          ; " IN "
-        call print_z
+        call dp_str
         mov ax, [CURLN]
         call output_number
 do_error_nl:
@@ -215,8 +212,6 @@ sl_chk:
         jne sl_ret
         inc si
         jmp stmt_line
-sl_ret:
-        ret
 
 ; =============================================================================
 ; STMT  execute one statement from SI
@@ -236,29 +231,38 @@ stmt_lp:
         jmp stmt_lp
 stmt_call:
         call [bx+2]             ; indirect call to handler
-        ret
-stmt_let:
-        jmp do_let
 stmt_ret:
+sl_ret:
         ret
-
-; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
-st_tab:
-        dw kw_print,    do_print
-        dw kw_if,       do_if
-        dw kw_goto,     do_goto
-        dw kw_list,     do_list
-        dw kw_run,      do_run
-        dw kw_new,      do_new
-        dw kw_input,    do_input
-        dw kw_rem,      do_rem
-        dw kw_end,      do_end
-        dw kw_let,      do_let
-        dw kw_poke,     do_poke
-        dw kw_free,     do_free
-        dw kw_help,     do_help
-        dw 0
-
+        
+stmt_let:
+; =============================================================================
+; DO_LET  [LET] <var> = <expr>
+; =============================================================================
+do_let:
+        call spaces
+        mov al, [si]
+        call uc_al
+        cmp al, 'A'
+        jb dl_err
+        cmp al, 'Z'
+        ja dl_err
+        call get_var_addr
+        push di
+        call spaces
+        cmp byte [si], '='
+        jne dl_err2
+        inc si
+        call expr
+        pop di
+        mov [di], ax
+        ret
+dl_err2:
+        pop di
+dl_err:
+        mov ax, ERR_UK
+        jmp do_error
+        
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ;
@@ -335,7 +339,7 @@ do_if:
         call expr
         or ax, ax
         je do_if_false
-        mov bx, then_tab
+        mov bx,then_tab
         call kw_match
         jmp stmt
 do_if_false:
@@ -355,6 +359,7 @@ do_goto:
         je dg_found
         mov ax, ERR_UL
         jmp do_error
+        
 dg_found:
         mov [RUN_NEXT], di
         cmp byte [RUNNING], 0
@@ -449,6 +454,9 @@ do_rem_r:
 ; DO_PRINT  PRINT [item [; item] ...]
 ; Items: "string", CHR$(n), expression.
 ; ';' between items or trailing ';' suppresses CR+LF.
+; Also used to print strings - 
+;	terminator is EITHER NULL for newline OR 0x22,';' for no newline.
+;	CLAUDE.AI - DO NOT CHANGE
 ; =============================================================================
 do_print:
 dp_top:
@@ -462,13 +470,16 @@ dp_str:
         lodsb
         cmp al, '"'
         je dp_after
-        cmp al, 0x0d
+        cmp al, 0
         je dp_str_eol
         call output
         jmp dp_str
 dp_str_eol:
         dec si
-        jmp dp_nl
+dp_nl:
+        call new_line
+dp_ret:
+        ret
 dp_expr:
         mov bx, chrs_tab
         call kw_match
@@ -488,10 +499,6 @@ dp_after:
         cmp byte [si], 0x0d
         je dp_ret
         jmp dp_top
-dp_nl:
-        call new_line
-dp_ret:
-        ret
 
 chrs_tab:       dw kw_chrs, 0
 
@@ -523,33 +530,6 @@ di_err:
         jmp do_error
 
 ; =============================================================================
-; DO_LET  [LET] <var> = <expr>
-; =============================================================================
-do_let:
-        call spaces
-        mov al, [si]
-        call uc_al
-        cmp al, 'A'
-        jb dl_err
-        cmp al, 'Z'
-        ja dl_err
-        call get_var_addr
-        push di
-        call spaces
-        cmp byte [si], '='
-        jne dl_err2
-        inc si
-        call expr
-        pop di
-        mov [di], ax
-        ret
-dl_err2:
-        pop di
-dl_err:
-        mov ax, ERR_UK
-        jmp do_error
-
-; =============================================================================
 ; DO_POKE  POKE <addr>, <val>
 ; =============================================================================
 do_poke:
@@ -576,8 +556,7 @@ do_free:
         mov al, ' '
         call output
         mov si, str_free
-        call print_z
-        call new_line
+        call dp_str
         ret
 
 ; =============================================================================
@@ -933,6 +912,14 @@ on_digit:
         jmp output
 
 ; =============================================================================
+; NEW_LINE  CR + LF
+; =============================================================================
+new_line:
+        mov al, 0x0d
+        call output
+        mov al, 0x0a
+	; drop through
+; =============================================================================
 ; OUTPUT  AL -> BIOS INT 10h TTY
 ; =============================================================================
 output:
@@ -942,15 +929,6 @@ output:
         int 0x10
         pop bx
         ret
-
-; =============================================================================
-; NEW_LINE  CR + LF
-; =============================================================================
-new_line:
-        mov al, 0x0d
-        call output
-        mov al, 0x0a
-        jmp output
 
 ; =============================================================================
 ; INPUT_LINE  read edited line into IBUF; SI -> IBUF
@@ -997,20 +975,12 @@ input_key:
         ret
 
 ; =============================================================================
-; PRINT_Z  print null-terminated string at SI
-; =============================================================================
-print_z:
-        lodsb
-        or al, al
-        je pz_r
-        call output
-        jmp print_z
-pz_r:   ret
-
-; =============================================================================
 ; LINE EDITOR  (from uBASIC8088 v2.1.0)
 ; =============================================================================
-
+find_program_end:
+        mov ax, 0xffff
+find_line:
+;         
 walk_lines:
         mov di, PROGRAM
 wl_lp:
@@ -1021,15 +991,11 @@ wl_lp:
         jnb wl_done
         call next_line_ptr
         jmp wl_lp
+
+nlp_done:
+        inc di
 wl_done:
-        ret
-
-find_line:
-        jmp walk_lines
-
-find_program_end:
-        mov ax, 0xffff
-        jmp walk_lines
+	ret
 
 next_line_ptr:
         add di, 2
@@ -1038,9 +1004,6 @@ nlp_lp:
         je nlp_done
         inc di
         jmp nlp_lp
-nlp_done:
-        inc di
-        ret
 
 ; EDITLN  AX=linenum, SI->body+CR
 editln:
@@ -1164,20 +1127,39 @@ kw_let:     db 0x4c,0x45,T_T
 kw_poke:    db 0x50,0x4f,0x4b,T_E
 kw_free:    db 0x46,0x52,0x45,T_E
 kw_help:    db 0x48,0x45,0x4c,T_P
-            db 0
 
 kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 
+            db 0
+
 ; =============================================================================
 ; Strings (null-terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.9",0
-str_in:     db " IN ",0
+str_banner: db "uBASIC 8088 v1.0.10",0
+str_in:     db " IN ",0x22,';'
 str_free:   db "FREE",0
 
+; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
+st_tab:
+        dw kw_print,    do_print
+        dw kw_if,       do_if
+        dw kw_goto,     do_goto
+        dw kw_list,     do_list
+        dw kw_run,      do_run
+        dw kw_new,      do_new
+        dw kw_input,    do_input
+        dw kw_rem,      do_rem
+        dw kw_end,      do_end
+        dw kw_let,      do_let
+        dw kw_poke,     do_poke
+        dw kw_free,     do_free
+        dw kw_help,     do_help
+        dw 0
+
+ROM_END:	nop
 
 ; =============================================================================
 ; Pre-loaded showcase + Mandelbrot program (ROM build only, %ifndef COM_BUILD)
@@ -1226,6 +1208,4 @@ SHOWCASE_DATA:
         dw 0                    ; end-of-program marker
 SHOWCASE_END:
 %endif
-%endif
 
-ROM_END:
