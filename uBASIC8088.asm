@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.0.7
+; uBASIC 8088  v1.0.9
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -13,7 +13,7 @@
 ; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable
 ;
 ; Segment model: CS=DS=ES=SS=0x0000 (single segment, flat).
-;   Boot sector (bootsect.asm) loads 4 sectors to 0x7E00 and jumps there.
+;   Boot sector (bootsect.asm) loads 5 sectors to 0x7E00 and jumps there.
 ;   All absolute addresses in RAM (VARS, PROGRAM, etc.) are segment-0 offsets.
 ;
 ; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
@@ -25,15 +25,26 @@
 ;   0x1034  running     1 byte    0=immediate, 1=running
 ;   0x1035  (pad)       1 byte
 ;   0x1036  curln       2 bytes   current executing line number (for errors)
-;   0x1038  ibuf       34 bytes   input line buffer
-;   0x105A  prog_end    2 bytes   one-past-last byte of program store
-;   0x105C  run_next    2 bytes   next-line pointer for run loop
-;   0x105E  ins_tmp     2 bytes   temp word for insline end-marker address
-;   0x1060  program     ...       program store (grows toward 0x1E00)
+;   0x1038  ibuf       64 bytes   input line buffer (max 62 chars + CR)
+;   0x1078  prog_end    2 bytes   one-past-last byte of program store
+;   0x107A  run_next    2 bytes   next-line pointer for run loop
+;   0x107C  ins_tmp     2 bytes   temp word for insline end-marker address
+;   0x107E  program     ...       program store (grows toward 0x1E00)
 ;   0x1E00  PROGRAM_TOP           top of program store / base of stack
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.0.8+ COM_BUILD: %ifdef COM_BUILD assembles as DOS .COM (ORG 0x0100)
+;            for cross-checking in 8bitworkshop/DOSBox. I/O unchanged
+;            (INT 10h display, INT 16h keyboard). RAM 0x1000-0x1FFF
+;            stays well above PSP. Build: tinyasm -f com ... (uses -DCOM_BUILD).
+;   v1.0.9 (2026-04-12)  Expand IBUF 34->64 bytes; input limit 32->62 chars.
+;                         Fixes silent truncation of long lines (e.g. nested
+;                         IF with multi-digit numbers). Embed Mandelbrot
+;                         showcase as pre-loaded ROM program (not in COM build).
+;   v1.0.8 (2026-04-10)  Fix editln: push/pop BX around find_line+deline;
+;                         walk_lines clobbered BX (body pointer), causing
+;                         ins_copy to read from 0x0000 (IVT) instead of IBUF.
 ;   v1.0.7 (2026-04-10)  Fix modulo: IDIV clobbers DX (DL=operator) with
 ;                         remainder; save DL to BL before IDIV, compare BL.
 ;   v1.0.6 (2026-04-10)  Fix rel_lt and rel_gt plain-op paths: pop ax before
@@ -66,17 +77,22 @@
 ; =============================================================================
 
         cpu 8086
-        org 0x7E00              ; Boot sector loads us here (0x0000:0x7E00)
+
+%ifdef COM_BUILD
+        org 0x0100              ; DOS COM file: PSP at 0x0000, code at 0x0100
+%else
+        org 0x7E00              ; ROM: boot sector loads to 0x0000:0x7E00
+%endif
 
 ; --- RAM addresses (segment 0 offsets) ---------------------------------------
 VARS:           equ 0x1000      ; 52 bytes: A-Z variables (word each)
 RUNNING:        equ 0x1034      ; byte:  0=immediate, 1=running
 CURLN:          equ 0x1036      ; word:  current line number (error reports)
-IBUF:           equ 0x1038      ; 34 bytes: input line buffer
-PROG_END:       equ 0x105A      ; word:  one past last program byte
-RUN_NEXT:       equ 0x105C      ; word:  next-line pointer for run loop
-INS_TMP:        equ 0x105E      ; word:  insline end-marker temp
-PROGRAM:        equ 0x1060      ; program store starts here
+IBUF:           equ 0x1038      ; 64 bytes: input line buffer (max 62 chars+CR)
+PROG_END:       equ 0x1078      ; word:  one past last program byte
+RUN_NEXT:       equ 0x107A      ; word:  next-line pointer for run loop
+INS_TMP:        equ 0x107C      ; word:  insline end-marker temp
+PROGRAM:        equ 0x107E      ; program store starts here
 PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
@@ -116,16 +132,25 @@ start:
         pop ss
         mov sp, STACK_TOP
 
-        ; Zero all RAM control area: VARS through end of INS_TMP (0x1000..0x105F)
-        ; = 0x60 bytes = 48 words.  Covers vars, RUNNING, CURLN, IBUF,
+        ; Zero all RAM control area: VARS through end of INS_TMP (0x1000..0x107D)
+        ; = 0x7E bytes = 63 words.  Covers VARS, RUNNING, CURLN, IBUF,
         ;   PROG_END, RUN_NEXT, INS_TMP.
         mov di, VARS
         xor ax, ax
-        mov cx, 48
+        mov cx, 63
         rep stosw
 
+%ifdef COM_BUILD
         mov word [PROG_END], PROGRAM
-        mov word [PROGRAM], 0   ; empty program end-marker
+        mov word [PROGRAM], 0   ; empty program for DOS COM build
+%else
+        ; Copy pre-loaded showcase from ROM to RAM program store
+        mov si, SHOWCASE_DATA
+        mov di, PROGRAM
+        mov cx, SHOWCASE_END-SHOWCASE_DATA
+        rep movsb
+        mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
+%endif
 
         mov si, str_banner
         call print_z
@@ -397,12 +422,16 @@ do_new:
         ret
 
 ; =============================================================================
-; DO_END
+; DO_END  END statement - stops program execution
+; In COM build, also issues INT 20h to exit to DOS.
 ; =============================================================================
 do_end:
         mov byte [RUNNING], 0
         mov di, [RUN_NEXT]
         mov word [di], 0
+%ifdef COM_BUILD
+        int 0x20                ; exit to DOS when END encountered
+%endif
         ret
 
 ; =============================================================================
@@ -947,7 +976,7 @@ ipl_lp:
 ipl_nbs:
         cmp al, 0x0d
         je ipl_cr
-        cmp cx, 32
+        cmp cx, 62
         jnb ipl_lp
         call output
         stosb
@@ -1017,8 +1046,8 @@ nlp_done:
 editln:
         push ax
         call spaces
-        pop dx
-        mov bx, si
+        pop dx                  ; DX = line number
+        mov bx, si              ; BX = body pointer
         mov cx, 1
 el_len:
         cmp byte [si], 0x0d
@@ -1027,17 +1056,19 @@ el_len:
         inc cx
         jmp el_len
 el_ldone:
+        push bx                 ; save body ptr: find_line/deline clobber BX
         mov ax, dx
-        call find_line
+        call find_line          ; walk_lines clobbers BX
         cmp [di], dx
         jne el_noex
-        call deline
+        call deline             ; also clobbers BX
 el_noex:
-        cmp byte [bx], 0x0d
+        pop bx                  ; restore body pointer
+        cmp byte [bx], 0x0d     ; empty body = delete only
         je el_done
-        mov si, bx
-        mov ax, dx
-        add cx, 2
+        mov si, bx              ; SI = body pointer
+        mov ax, dx              ; AX = line number
+        add cx, 2               ; +2 for linenum word
         call insline
 el_done:
         ret
@@ -1143,8 +1174,58 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (null-terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.7",0
+str_banner: db "uBASIC 8088 v1.0.9",0
 str_in:     db " IN ",0
 str_free:   db "FREE",0
+
+
+; =============================================================================
+; Pre-loaded showcase + Mandelbrot program (ROM build only, %ifndef COM_BUILD)
+; Copied to RAM at startup. Type RUN to execute, NEW to clear.
+; Lines 10-160: feature demos.  Lines 170-400: Mandelbrot renderer.
+; Fixed-point arithmetic (scale 1/64), 16 iterations, ASCII density display.
+; =============================================================================
+%ifndef COM_BUILD
+SHOWCASE_DATA:
+        db 0x0A,0x00,"REM uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
+        db 0x14,0x00,"PRINT ",0x22,"-- uBASIC 8088 v1.0.9 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.0.9 --"
+        db 0x1E,0x00,"PRINT ",0x22,"--- ARITHMETIC ---",0x22,0x0D  ; 30 PRINT "--- ARITHMETIC ---"
+        db 0x28,0x00,"PRINT ",0x22,"3+4=",0x22,";3+4;",0x22,"  6*7=",0x22,";6*7",0x0D  ; 40 PRINT "3+4=";3+4;"  6*7=";6*7
+        db 0x32,0x00,"PRINT ",0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 50 PRINT "20/4=";20/4;"  17%5=";17%5
+        db 0x3C,0x00,"PRINT ",0x22,"--- COMPARISONS ---",0x22,0x0D  ; 60 PRINT "--- COMPARISONS ---"
+        db 0x46,0x00,"IF 5>3 THEN PRINT ",0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
+        db 0x50,0x00,"IF 3<5 THEN PRINT ",0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
+        db 0x5A,0x00,"IF 3>=3 THEN PRINT ",0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
+        db 0x64,0x00,"IF 4<>3 THEN PRINT ",0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
+        db 0x6E,0x00,"PRINT ",0x22,"--- LOOP ---",0x22,0x0D  ; 110 PRINT "--- LOOP ---"
+        db 0x78,0x00,"I=1",0x0D  ; 120 I=1
+        db 0x82,0x00,"IF I>5 THEN GOTO 160",0x0D  ; 130 IF I>5 THEN GOTO 160
+        db 0x8C,0x00,"PRINT I;",0x0D  ; 140 PRINT I;
+        db 0x96,0x00,"I=I+1:GOTO 130",0x0D  ; 150 I=I+1:GOTO 130
+        db 0xA0,0x00,"PRINT ",0x22,0x22,0x0D  ; 160 PRINT ""
+        db 0xAA,0x00,"PRINT ",0x22,"--- MANDELBROT ---",0x22,0x0D  ; 170 PRINT "--- MANDELBROT ---"
+        db 0xB4,0x00,"I=-64",0x0D  ; 180 I=-64
+        db 0xBE,0x00,"IF I>56 THEN GOTO 400",0x0D  ; 190 IF I>56 THEN GOTO 400
+        db 0xC8,0x00,"D=I",0x0D  ; 200 D=I
+        db 0xD2,0x00,"C=-128",0x0D  ; 210 C=-128
+        db 0xDC,0x00,"IF C>16 THEN GOTO 370",0x0D  ; 220 IF C>16 THEN GOTO 370
+        db 0xE6,0x00,"A=C:B=D:E=0:N=1",0x0D  ; 230 A=C:B=D:E=0:N=1
+        db 0xF0,0x00,"IF N>16 THEN GOTO 310",0x0D  ; 240 IF N>16 THEN GOTO 310
+        db 0xFA,0x00,"T=A*A/64-B*B/64+C",0x0D  ; 250 T=A*A/64-B*B/64+C
+        db 0x04,0x01,"B=2*A*B/64+D:A=T",0x0D  ; 260 B=2*A*B/64+D:A=T
+        db 0x0E,0x01,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+        db 0x18,0x01,"N=N+1:IF N<=16 THEN GOTO 240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
+        db 0x36,0x01,"IF E>0 THEN PRINT CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
+        db 0x40,0x01,"IF E=0 THEN PRINT CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
+        db 0x4A,0x01,"C=C+4",0x0D  ; 330 C=C+4
+        db 0x54,0x01,"GOTO 220",0x0D  ; 340 GOTO 220
+        db 0x72,0x01,"PRINT ",0x22,0x22,0x0D  ; 370 PRINT ""
+        db 0x7C,0x01,"I=I+6",0x0D  ; 380 I=I+6
+        db 0x86,0x01,"GOTO 190",0x0D  ; 390 GOTO 190
+        db 0x90,0x01,"END",0x0D  ; 400 END
+        dw 0                    ; end-of-program marker
+SHOWCASE_END:
+%endif
+%endif
 
 ROM_END:
