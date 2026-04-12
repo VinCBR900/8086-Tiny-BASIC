@@ -73,23 +73,31 @@
 ;   v1.0.0 (2026-04-09)  First release. Clean 8088 port from uBASIC 65c02 v17.0.
 ; =============================================================================
 
-        cpu 8086
+        	cpu 8086
+                
+	; configure Program origin based on Target Platform                
+%ifdef __YASM_MAJOR__
+    		SECTION .text	; running under 8 bit workshop
+%define COM_BUILD	; include demo program
+ORIGIN:		equ 0    
 
-%ifdef COM_BUILD
-        org 0x0100              ; DOS COM file: PSP at 0x0000, code at 0x0100
+%elifdef	COM_BUILD	; testing with freedos
+ORIGIN: 	equ 0x0100      ; DOS COM file: PSP at 0x0000, code at 0x0100
+
 %else
-;        org 0x7E00              ; ROM: boot sector loads to 0x0000:0x7E00
+ORIGIN:  	equ 0x7E00      ; ROM: boot sector loads to 0x0000:0x7E00
 %endif
-
+		org ORIGIN
+        
 ; --- RAM addresses (segment 0 offsets) ---------------------------------------
 VARS:           equ 0x1000      ; 52 bytes: A-Z variables (word each)
 RUNNING:        equ 0x1034      ; byte:  0=immediate, 1=running
 CURLN:          equ 0x1036      ; word:  current line number (error reports)
 IBUF:           equ 0x1038      ; 64 bytes: input line buffer (max 62 chars+CR)
-PROG_END:       equ 0x1078      ; word:  one past last program byte
 RUN_NEXT:       equ 0x107A      ; word:  next-line pointer for run loop
 INS_TMP:        equ 0x107C      ; word:  insline end-marker temp
 PROGRAM:        equ 0x107E      ; program store starts here
+PROG_END:       equ 0x1078      ; word:  one past last program byte
 PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
@@ -137,14 +145,9 @@ start:
         mov cx, 63
         rep stosw
 
-%ifdef COM_BUILD
+%ifndef COM_BUILD
         call do_new
 %else
-        ; Copy pre-loaded showcase from ROM to RAM program store
-        mov si, SHOWCASE_DATA
-        mov di, PROGRAM
-        mov cx, SHOWCASE_END-SHOWCASE_DATA
-        rep movsb
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
 
@@ -160,10 +163,9 @@ main_loop:
         mov sp, STACK_TOP
         mov byte [RUNNING], 0
 
-        mov al, '>'
+	mov al, '>'
         call output
-        mov al, ' '
-        call output
+        
         call input_line         ; read line; SI -> IBUF
 
         call spaces
@@ -193,8 +195,8 @@ do_error:
         call output             ; print "?N"
         cmp byte [RUNNING], 0
         je do_error_nl
-        mov si, str_in          ; " IN "
-        call dp_str
+        mov al, '@'
+        call output
         mov ax, [CURLN]
         call output_number
 do_error_nl:
@@ -428,15 +430,11 @@ do_new:
 
 ; =============================================================================
 ; DO_END  END statement - stops program execution
-; In COM build, also issues INT 20h to exit to DOS.
 ; =============================================================================
 do_end:
         mov byte [RUNNING], 0
         mov di, [RUN_NEXT]
         mov word [di], 0
-%ifdef COM_BUILD
-        int 0x20                ; exit to DOS when END encountered
-%endif
         ret
 
 ; =============================================================================
@@ -468,9 +466,9 @@ dp_top:
         inc si
 dp_str:
         lodsb
-        cmp al, '"'
-        je dp_after
-        cmp al, 0
+        cmp al, '"'	; check forclosing "
+        je dp_after	; yup no newline
+        cmp al, 0	; alternate NULL, newline
         je dp_str_eol
         call output
         jmp dp_str
@@ -910,26 +908,7 @@ on_digit:
         pop ax
         add al, '0'
         jmp output
-
-; =============================================================================
-; NEW_LINE  CR + LF
-; =============================================================================
-new_line:
-        mov al, 0x0d
-        call output
-        mov al, 0x0a
-	; drop through
-; =============================================================================
-; OUTPUT  AL -> BIOS INT 10h TTY
-; =============================================================================
-output:
-        push bx
-        mov ah, 0x0e
-        mov bx, 0x0007
-        int 0x10
-        pop bx
-        ret
-
+       
 ; =============================================================================
 ; INPUT_LINE  read edited line into IBUF; SI -> IBUF
 ; =============================================================================
@@ -961,11 +940,30 @@ ipl_nbs:
         inc cx
         jmp ipl_lp
 ipl_cr:
-        call output
         stosb
         mov si, IBUF
-        ret
+        ; drop through
+        
+; =============================================================================
+; NEW_LINE  CR + LF
+; =============================================================================
+new_line:
+        mov al, 0x0d
+        call output
+        mov al, 0x0a
+	; drop through
 
+; =============================================================================
+; OUTPUT  AL -> BIOS INT 10h TTY
+; =============================================================================
+output:
+        push bx
+        mov ah, 0x0e
+        mov bx, 0x0007
+        int 0x10
+        pop bx
+        ret
+        
 ; =============================================================================
 ; INPUT_KEY  -> AL  (BIOS INT 16h)
 ; =============================================================================
@@ -1139,7 +1137,6 @@ kw_usr:     db 0x55,0x53,T_R
 ; Strings (null-terminated)
 ; =============================================================================
 str_banner: db "uBASIC 8088 v1.0.10",0
-str_in:     db " IN ",0x22,';'
 str_free:   db "FREE",0
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1167,7 +1164,8 @@ ROM_END:	nop
 ; Lines 10-160: feature demos.  Lines 170-400: Mandelbrot renderer.
 ; Fixed-point arithmetic (scale 1/64), 16 iterations, ASCII density display.
 ; =============================================================================
-%ifndef COM_BUILD
+%ifdef COM_BUILD
+	times PROGRAM - ($-$$) nop
 SHOWCASE_DATA:
         db 0x0A,0x00,"REM uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
         db 0x14,0x00,"PRINT ",0x22,"-- uBASIC 8088 v1.0.9 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.0.9 --"
