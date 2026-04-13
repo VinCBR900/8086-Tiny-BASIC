@@ -4,9 +4,9 @@
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
 ; Target: <=2048 bytes code ROM, 4096 bytes RAM.
-; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
 ;
-; Credit to Oscar Toledo for his x86 BootBASIC inspiration.
+; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
+; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
 ; Statements : PRINT IF..THEN GOTO LET INPUT REM END RUN LIST NEW POKE FREE HELP
 ; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
@@ -36,7 +36,8 @@
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
-;   v1.0.8+ COM_BUILD: %ifdef COM_BUILD assembles as DOS .COM (ORG 0x0100)
+;   V1.0.10 Size optimization	
+;   v1.0.9+ COM_BUILD: %ifdef COM_BUILD assembles as DOS .COM (ORG 0x0100)
 ;            for cross-checking in 8bitworkshop/DOSBox. I/O unchanged
 ;            (INT 10h display, INT 16h keyboard). RAM 0x1000-0x1FFF
 ;            stays well above PSP. Build: tinyasm -f com ... (uses -DCOM_BUILD).
@@ -152,7 +153,6 @@ start:
 %else
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
-
         mov si, str_banner
         call dp_str
         call do_free
@@ -288,7 +288,13 @@ kw_lp:
         call uc_al
         mov dl, [si]
         inc si
-        call uc_dl
+ uc_dl:
+        cmp dl, 'a'
+        jb uc_dl_r
+        cmp dl, 'z'
+        ja uc_dl_r
+        and dl, 0xdf
+uc_dl_r:
         cmp al, dl
         jne kw_fail
         test ah, 0x80           ; last char?
@@ -316,7 +322,7 @@ kw_fail:
         ret
 
 ; =============================================================================
-; UC_AL / UC_DL  uppercase AL or DL
+; UC_AL uppercase 
 ; =============================================================================
 uc_al:
         cmp al, 'a'
@@ -325,15 +331,6 @@ uc_al:
         ja uc_al_r
         and al, 0xdf
 uc_al_r:
-        ret
-
-uc_dl:
-        cmp dl, 'a'
-        jb uc_dl_r
-        cmp dl, 'z'
-        ja uc_dl_r
-        and dl, 0xdf
-uc_dl_r:
         ret
 
 ; =============================================================================
@@ -348,8 +345,6 @@ do_if:
         jmp stmt
 do_if_false:
         ret
-
-then_tab:       dw kw_then, 0
 
 ; =============================================================================
 ; DO_GOTO  GOTO <expr>
@@ -393,8 +388,16 @@ run_loop:
         lea si, [di+2]
         call stmt_line
         jmp run_loop
+        
+; =============================================================================
+; DO_END  END statement - stops program execution
+; =============================================================================
+do_end:
+	xor ax,ax
+	mov di, [RUN_NEXT]
+        mov word [di],ax
 run_end:
-        mov byte [RUNNING], 0
+        mov byte [RUNNING], al
         ret
 
 ; =============================================================================
@@ -403,77 +406,80 @@ run_end:
 do_list:
         mov di, PROGRAM
 dl_lp:
-        cmp word [di], 0
-        je dl_done
-        mov ax, [di]
+        mov ax, [di]        ; Load word at DI
+        test ax, ax         ; Shortest way to check for NULL sentinel
+        jz dl_done          ; Exit if 0
+
         call output_number
         mov al, ' '
         call output
-        lea si, [di+2]
+
+        mov si, di          ; SI = DI
+        inc si              ; SI = DI + 2 (using two INCs is 2 bytes, 
+        inc si              ; same as ADD SI, 2, but often cleaner)
+
 dl_body:
         lodsb
         call output
-        cmp al, 0x0d
+        cmp al, 0x0d        ; Check for CR
         jne dl_body
+
         mov al, 0x0a
         call output
-        call next_line_ptr
+
+        call next_line_ptr  ; Assuming this updates DI to the next record
         jmp dl_lp
 dl_done:
         ret
+
 
 ; =============================================================================
 ; DO_NEW
 ; =============================================================================
 do_new:
-        mov word [PROGRAM], 0
+	xor ax,ax
+	mov word [PROGRAM], ax
         mov word [PROG_END], PROGRAM
-        ret
-
-; =============================================================================
-; DO_END  END statement - stops program execution
-; =============================================================================
-do_end:
-        mov byte [RUNNING], 0
-        mov di, [RUN_NEXT]
-        mov word [di], 0
         ret
 
 ; =============================================================================
 ; DO_REM  skip rest of line
 ; =============================================================================
 do_rem:
-        cmp byte [si], 0x0d
-        je do_rem_r
-        inc si
-        jmp do_rem
-do_rem_r:
+        lodsb           ; AL = [SI], then SI++
+        cmp al, 0x0d    ; Was it the CR?
+        jne do_rem      ; If not, keep going
         ret
 
 ; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
 ; Items: "string", CHR$(n), expression.
 ; ';' between items or trailing ';' suppresses CR+LF.
-; Also used to print strings - 
-;	terminator is EITHER NULL for newline OR 0x22,';' for no newline.
-;	CLAUDE.AI - DO NOT CHANGE
+; Also used to print strings - terminator top bit set
 ; =============================================================================
 do_print:
 dp_top:
         call spaces
-        cmp byte [si], 0x0d
+        cmp byte [si], 0x0d	; empty line PRINT
         je dp_nl
         cmp byte [si], '"'
         jne dp_expr
-        inc si
+        inc si		; skip over "
 dp_str:
         lodsb
-        cmp al, '"'	; check forclosing "
-        je dp_after	; yup no newline
-        cmp al, 0	; alternate NULL, newline
-        je dp_str_eol
+    	cmp al, 0x22	; check for PRINT terminator
+    	je dp_after
+    
+    	test al, 0x80	; check for top bit terminator
+    	jz loop_print
+    
+    	and al, 0x7f
+    	jmp output        ; Tail-call optimization: output will RET for us
+
+loop_print:
         call output
-        jmp dp_str
+        jmp dp_str		
+        
 dp_str_eol:
         dec si
 dp_nl:
@@ -492,15 +498,13 @@ dp_num:
         call output_number
 dp_after:
         call spaces
-        cmp byte [si], ';'
+        cmp byte [si], ';' ; no newline
         jne dp_nl
         inc si
         call spaces
         cmp byte [si], 0x0d
         je dp_ret
         jmp dp_top
-
-chrs_tab:       dw kw_chrs, 0
 
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
@@ -545,41 +549,6 @@ do_poke:
 dpk_err:
         mov ax, ERR_SN
         jmp do_error
-
-; =============================================================================
-; DO_FREE  print free program-store bytes
-; =============================================================================
-do_free:
-        mov ax, PROGRAM_TOP
-        sub ax, [PROG_END]
-        call output_number
-        mov al, ' '
-        call output
-        mov si, str_free
-        call dp_str
-        ret
-
-; =============================================================================
-; DO_HELP  print all keywords
-; =============================================================================
-do_help:
-        mov si, kw_tab_start
-dh_lp:
-        lodsb
-        or al, al
-        je dh_done
-        push ax
-        and al, 0x7f
-        call output
-        pop ax
-        test al, 0x80
-        jz dh_lp
-        mov al, ' '
-        call output
-        jmp dh_lp
-dh_done:
-        call new_line
-        ret
 
 ; =============================================================================
 ; EXPR  evaluate expression including relational operators
@@ -803,17 +772,20 @@ e2_var:
 e2_bad:
         xor ax, ax
         ret
+; eat_paren_expr: '(' expr ')' -> AX
+eat_paren_expr:
+        call spaces
+        cmp byte [si], '('
+        jne epe_err
 e2_par:
-        inc si
+	inc si
         call expr
         call spaces
         cmp byte [si], ')'
-        jne e2_perr
+        jne epe_err
         inc si
-        ret
-e2_perr:
-        mov ax, ERR_SN
-        jmp do_error
+        ret        
+        
 e2_neg:
         inc si
         call expr2
@@ -823,24 +795,11 @@ e2_pos:
         inc si
         jmp expr2
 
-; eat_paren_expr: '(' expr ')' -> AX
-eat_paren_expr:
-        call spaces
-        cmp byte [si], '('
-        jne epe_err
-        inc si
-        call expr
-        call spaces
-        cmp byte [si], ')'
-        jne epe_err
-        inc si
-        ret
+
 epe_err:
         mov ax, ERR_SN
         jmp do_error
 
-peek_tab:       dw kw_peek, 0
-usr_tab:        dw kw_usr,  0
 
 ; =============================================================================
 ; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
@@ -965,7 +924,33 @@ output:
         int 0x10
         pop bx
         ret
-        
+; =============================================================================
+; DO_FREE  print free program-store bytes
+; =============================================================================
+do_free:
+        mov ax, PROGRAM_TOP
+        sub ax, [PROG_END]
+        call output_number
+        mov al, ' '
+        call output
+        mov si, kw_free
+        call dp_str
+	jmp new_line     ; Tail-call: new_line will RET for us
+
+; =============================================================================
+; DO_HELP  print all keywords
+; =============================================================================
+do_help:
+    mov si, kw_tab_start
+dh_lp:
+    call dp_str
+    mov al, ' '
+    call output
+    cmp byte [si], 0 ; Check for sentinel
+    jne dh_lp        ; Loop back if not zero
+
+    jmp new_line     ; Tail-call: new_line will RET for us
+    
 ; =============================================================================
 ; INPUT_KEY  -> AL  (BIOS INT 16h)
 ; =============================================================================
@@ -1138,8 +1123,8 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (null-terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.10",0
-str_free:   db "FREE",0
+str_banner: db "uBASIC 8088 v1.0.10"
+CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
 st_tab:
@@ -1157,8 +1142,12 @@ st_tab:
         dw kw_free,     do_free
         dw kw_help,     do_help
         dw 0
+peek_tab:       dw kw_peek, 0
+usr_tab:        dw kw_usr,  0
+then_tab:       dw kw_then, 0
+chrs_tab:       dw kw_chrs, 0
 
-ROM_END:	nop
+ROM_END:	
 
 ; =============================================================================
 ; Pre-loaded showcase + Mandelbrot program (ROM build only, %ifndef COM_BUILD)
@@ -1205,7 +1194,7 @@ SHOWCASE_DATA:
         db 0x7C,0x01,"I=I+6",0x0D  ; 380 I=I+6
         db 0x86,0x01,"GOTO 190",0x0D  ; 390 GOTO 190
         db 0x90,0x01,"END",0x0D  ; 400 END
-        dw 0                    ; end-of-program marker
+        dw 0
 SHOWCASE_END:
 %endif
 
