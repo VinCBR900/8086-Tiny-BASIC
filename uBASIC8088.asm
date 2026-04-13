@@ -6,6 +6,8 @@
 ; Target: <=2048 bytes code ROM, 4096 bytes RAM.
 ; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
 ;
+; Credit to Oscar Toledo for his x86 BootBASIC inspiration.
+;
 ; Statements : PRINT IF..THEN GOTO LET INPUT REM END RUN LIST NEW POKE FREE HELP
 ; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
 ; Numbers    : signed 16-bit (-32768..32767)
