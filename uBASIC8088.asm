@@ -1142,10 +1142,10 @@ st_tab:
         dw kw_free,     do_free
         dw kw_help,     do_help
         dw 0
-peek_tab:       dw kw_peek, 0
-usr_tab:        dw kw_usr,  0
-then_tab:       dw kw_then, 0
-chrs_tab:       dw kw_chrs, 0
+peek_tab:       dw kw_peek
+usr_tab:        dw kw_usr
+then_tab:       dw kw_then
+chrs_tab:       dw kw_chrs
 
 ROM_END:	
 
