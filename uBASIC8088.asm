@@ -105,11 +105,11 @@ PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
 ; --- Error codes -------------------------------------------------------------
-ERR_SN:         equ 0
-ERR_UL:         equ 1
-ERR_OV:         equ 2
-ERR_OM:         equ 3
-ERR_UK:         equ 4
+ERR_SN:         equ "0" ; 0
+ERR_UL:         equ "1" ; 1
+ERR_OV:         equ "2" ; 
+ERR_OM:         equ "3" ;
+ERR_UK:         equ "4" ;
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -140,20 +140,19 @@ start:
         pop ss
         mov sp, STACK_TOP
 
-        ; Zero all RAM control area: VARS through end of INS_TMP (0x1000..0x107D)
-        ; = 0x7E bytes = 63 words.  Covers VARS, RUNNING, CURLN, IBUF,
-        ;   PROG_END, RUN_NEXT, INS_TMP.
+        ; Zero all RAM control area: VARS through end of Program
         mov di, VARS
         xor ax, ax
-        mov cx, 63
-        rep stosw
-
+        mov cx, 63	; this should include program RAM if no demo
+	rep stosw	; clear memory
+        
 %ifndef COM_BUILD
         call do_new
 %else
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
-        mov si, str_banner
+
+	mov si, str_banner
         call dp_str
         call do_free
         ; fall through into main_loop
@@ -170,8 +169,7 @@ main_loop:
         
         call input_line         ; read line; SI -> IBUF
 
-        call spaces
-        cmp byte [si], 0x0d     ; blank line?
+        call peek_line     	; blank line?
         je main_loop
 
         call input_number       ; parse optional line number -> AX
@@ -190,13 +188,16 @@ ml_numbered:
 do_error:
         push ax
         call new_line
+        
         mov al, '?'
         call output
         pop ax
-        add al, '0'
+        ; add al, '0'
         call output             ; print "?N"
+        ; direct mode?
         cmp byte [RUNNING], 0
         je do_error_nl
+        
         mov al, '@'
         call output
         mov ax, [CURLN]
@@ -212,17 +213,27 @@ stmt_line:
         call stmt
 sl_chk:
         call spaces
-        cmp byte [si], ':'
-        jne sl_ret
-        inc si
-        jmp stmt_line
+        lodsb               ; AL = [SI], SI = SI + 1
+        cmp al, ':'         ; Was it the multi-statement separator?
+        je stmt_line        ; Yes: Jump to execute next statement
+        
+        dec si              ; No: Back up SI so it points to the non-':' char
+sl_ret:
+        ret
+
+; =============================================================================
+; PEEK_LINE  Advance and check for CR
+; =============================================================================
+peek_line:
+        call spaces
+        cmp byte [si], 0x0d
+        ret
 
 ; =============================================================================
 ; STMT  execute one statement from SI
 ; =============================================================================
 stmt:
-        call spaces
-        cmp byte [si], 0x0d
+        call peek_line
         je stmt_ret
         mov bx, st_tab
 stmt_lp:
@@ -236,7 +247,6 @@ stmt_lp:
 stmt_call:
         call [bx+2]             ; indirect call to handler
 stmt_ret:
-sl_ret:
         ret
         
 stmt_let:
@@ -248,9 +258,9 @@ do_let:
         mov al, [si]
         call uc_al
         cmp al, 'A'
-        jb dl_err
+        jb JERRUK
         cmp al, 'Z'
-        ja dl_err
+        ja JERRUK
         call get_var_addr
         push di
         call spaces
@@ -263,8 +273,8 @@ do_let:
         ret
 dl_err2:
         pop di
-dl_err:
-        mov ax, ERR_UK
+JERRUK:
+        mov al, ERR_UK
         jmp do_error
         
 ; =============================================================================
@@ -330,7 +340,9 @@ uc_al:
         cmp al, 'z'
         ja uc_al_r
         and al, 0xdf
+do_if_false:
 uc_al_r:
+dg_ret:
         ret
 
 ; =============================================================================
@@ -343,8 +355,6 @@ do_if:
         mov bx,then_tab
         call kw_match
         jmp stmt
-do_if_false:
-        ret
 
 ; =============================================================================
 ; DO_GOTO  GOTO <expr>
@@ -356,7 +366,8 @@ do_goto:
         pop bx
         cmp [di], bx
         je dg_found
-        mov ax, ERR_UL
+JERRUL:        
+        mov al, ERR_UL
         jmp do_error
         
 dg_found:
@@ -365,8 +376,6 @@ dg_found:
         jne dg_ret
         mov byte [RUNNING], 1
         jmp run_loop
-dg_ret:
-        ret
 
 ; =============================================================================
 ; DO_RUN  RUN: execute from first line
@@ -390,6 +399,15 @@ run_loop:
         jmp run_loop
         
 ; =============================================================================
+; DO_NEW
+; =============================================================================
+do_new:
+	xor ax,ax
+	mov word [PROGRAM], ax
+        mov word [PROG_END], PROGRAM
+        ; drop through        
+
+; =============================================================================
 ; DO_END  END statement - stops program execution
 ; =============================================================================
 do_end:
@@ -398,6 +416,7 @@ do_end:
         mov word [di],ax
 run_end:
         mov byte [RUNNING], al
+dl_done:
         ret
 
 ; =============================================================================
@@ -429,18 +448,6 @@ dl_body:
 
         call next_line_ptr  ; Assuming this updates DI to the next record
         jmp dl_lp
-dl_done:
-        ret
-
-
-; =============================================================================
-; DO_NEW
-; =============================================================================
-do_new:
-	xor ax,ax
-	mov word [PROGRAM], ax
-        mov word [PROG_END], PROGRAM
-        ret
 
 ; =============================================================================
 ; DO_REM  skip rest of line
@@ -459,8 +466,7 @@ do_rem:
 ; =============================================================================
 do_print:
 dp_top:
-        call spaces
-        cmp byte [si], 0x0d	; empty line PRINT
+        call peek_line	; empty line PRINT
         je dp_nl
         cmp byte [si], '"'
         jne dp_expr
@@ -501,8 +507,7 @@ dp_after:
         cmp byte [si], ';' ; no newline
         jne dp_nl
         inc si
-        call spaces
-        cmp byte [si], 0x0d
+        call peek_line
         je dp_ret
         jmp dp_top
 
@@ -530,24 +535,24 @@ do_input:
         mov [di], ax
         ret
 di_err:
-        mov ax, ERR_UK
+        mov al, ERR_UK
         jmp do_error
 
 ; =============================================================================
-; DO_POKE  POKE <addr>, <val>
+; DO_POKE  POKE <addr>, <val> - need to finagle addresses above 32768
 ; =============================================================================
 do_poke:
         call expr
         mov di, ax
         call spaces
         cmp byte [si], ','
-        jne dpk_err
+        jne JERRSN
         inc si
         call expr
         mov [di], al
         ret
-dpk_err:
-        mov ax, ERR_SN
+JERRSN:
+        mov al, ERR_SN
         jmp do_error
 
 ; =============================================================================
@@ -708,7 +713,7 @@ e1_div:
         mov ax, dx              ; modulo: return remainder
         jmp e1_lp
 e1_zero:
-        mov ax, ERR_OV
+        mov al, ERR_OV
         jmp do_error
 e1_ret:
         ret
@@ -797,7 +802,7 @@ e2_pos:
 
 
 epe_err:
-        mov ax, ERR_SN
+        mov al, ERR_SN
         jmp do_error
 
 
@@ -812,7 +817,7 @@ get_var_addr:
         add ax, ax
         add ax, VARS
         mov di, ax
-        ret
+sp_r:   ret
 
 ; =============================================================================
 ; SPACES  skip spaces; preserves AX, BX, CX, DX
@@ -822,7 +827,6 @@ spaces:
         jne sp_r
         inc si
         jmp spaces
-sp_r:   ret
 
 ; =============================================================================
 ; INPUT_NUMBER  parse unsigned decimal from [SI] -> AX; SI past digits
@@ -904,9 +908,9 @@ ipl_cr:
         stosb
         mov si, IBUF
         ; drop through
-        
+                
 ; =============================================================================
-; NEW_LINE  CR + LF
+; NEW_LINE  CR + LF - does not touch SI or DI
 ; =============================================================================
 new_line:
         mov al, 0x0d
@@ -977,11 +981,6 @@ wl_lp:
         call next_line_ptr
         jmp wl_lp
 
-nlp_done:
-        inc di
-wl_done:
-	ret
-
 next_line_ptr:
         add di, 2
 nlp_lp:
@@ -989,6 +988,11 @@ nlp_lp:
         je nlp_done
         inc di
         jmp nlp_lp
+nlp_done:
+        inc di
+wl_done:
+el_done:
+	ret
 
 ; EDITLN  AX=linenum, SI->body+CR
 editln:
@@ -1017,10 +1021,8 @@ el_noex:
         mov si, bx              ; SI = body pointer
         mov ax, dx              ; AX = line number
         add cx, 2               ; +2 for linenum word
-        call insline
-el_done:
-        ret
-
+	; drop through
+        
 ; INSLINE  AX=linenum, DI=insert-pt, SI->body, CX=total-size
 insline:
         push ax                 ; [BP+6] line number
@@ -1112,7 +1114,7 @@ kw_let:     db 0x4c,0x45,T_T
 kw_poke:    db 0x50,0x4f,0x4b,T_E
 kw_free:    db 0x46,0x52,0x45,T_E
 kw_help:    db 0x48,0x45,0x4c,T_P
-
+; not commands but still want to print in help
 kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
@@ -1121,7 +1123,7 @@ kw_usr:     db 0x55,0x53,T_R
             db 0
 
 ; =============================================================================
-; Strings (null-terminated)
+; Strings (bit 7 terminated)
 ; =============================================================================
 str_banner: db "uBASIC 8088 v1.0.10"
 CRLF:	    db 0x0d, 0x0a + 0x80	
@@ -1142,6 +1144,7 @@ st_tab:
         dw kw_free,     do_free
         dw kw_help,     do_help
         dw 0
+        ; non commands but still match
 peek_tab:       dw kw_peek
 usr_tab:        dw kw_usr
 then_tab:       dw kw_then
