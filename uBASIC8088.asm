@@ -183,31 +183,6 @@ ml_numbered:
         jmp short main_loop
 
 ; =============================================================================
-; DO_ERROR  print error; never returns to caller
-; Inputs  : AX = error code
-; =============================================================================
-do_error:
-        push ax
-        call new_line
-        
-        mov al, '?'
-        call output
-        pop ax
-        ; add al, '0'
-        call output             ; print "?N"
-        ; direct mode?
-        cmp byte [RUNNING], 0
-        je do_error_nl
-        
-        mov al, '@'
-        call output
-        mov ax, [CURLN]
-        call output_number
-do_error_nl:
-        call new_line
-        jmp short main_loop
-
-; =============================================================================
 ; STMT_LINE  execute ':'-separated statements on line at SI
 ; =============================================================================
 stmt_line:
@@ -229,8 +204,20 @@ peek_line:
         call spaces
         cmp byte [si], 0x0d
 stmt_ret:
+do_if_false:
 	ret
-
+        
+; =============================================================================
+; DO_IF  IF <expr> [THEN] <stmt>
+; =============================================================================
+do_if:
+        call expr
+        or ax, ax
+        je do_if_false
+        mov bx,then_tab
+        call kw_match
+        ; drop through
+        
 ; =============================================================================
 ; STMT  execute one statement from SI
 ; =============================================================================
@@ -241,7 +228,7 @@ stmt:
 stmt_lp:
         mov ax, [bx]
         or ax, ax
-        je stmt_let             ; sentinel -> implicit LET/assignment
+        je do_let             ; sentinel -> implicit LET/assignment
         call kw_match
         jnc stmt_call
         add bx, 4
@@ -249,7 +236,6 @@ stmt_lp:
 stmt_call:
         jmp [bx+2]             ; indirect call to handler
         
-stmt_let:
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
@@ -275,7 +261,7 @@ dl_err2:
         pop di
 JERRUK:
         mov al, ERR_UK
-        jmp short do_error
+        jmp do_error
         
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
@@ -339,21 +325,9 @@ uc_al:
         cmp al, 'z'
         ja uc_al_r
         and al, 0xdf
-do_if_false:
 uc_al_r:
 dg_ret:
         ret
-
-; =============================================================================
-; DO_IF  IF <expr> [THEN] <stmt>
-; =============================================================================
-do_if:
-        call expr
-        or ax, ax
-        je do_if_false
-        mov bx,then_tab
-        call kw_match
-        jmp stmt
 
 ; =============================================================================
 ; DO_GOTO / DO_RUN
@@ -924,7 +898,30 @@ dh_lp:
     jne dh_lp        ; Loop back if not zero
 
     jmp new_line     ; Tail-call: new_line will RET for us
-    
+; =============================================================================
+; DO_ERROR  print error; never returns to caller
+; Inputs  : AX = error code
+; =============================================================================
+do_error:
+        push ax
+        call new_line
+        
+        mov al, '?'
+        call output
+        pop ax
+        ; add al, '0'
+        call output             ; print "?N"
+        ; direct mode?
+        cmp byte [RUNNING], 0
+        je do_error_nl
+        
+        mov al, '@'
+        call output
+        mov ax, [CURLN]
+        call output_number
+do_error_nl:
+        call new_line
+        jmp main_loop    
 ; =============================================================================
 ; INPUT_KEY  -> AL  (BIOS INT 16h)
 ; =============================================================================
