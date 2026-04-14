@@ -287,48 +287,47 @@ JERRUK:
 ; Clobbers: AX, DI, DL
 ; =============================================================================
 kw_match:
-        push si
-        call spaces
-        mov di, [bx]
-kw_lp:
-        mov al, [di]
-        inc di
-        mov ah, al
-        and al, 0x7f
-        call uc_al
-        mov dl, [si]
-        inc si
- uc_dl:
-        cmp dl, 'a'
-        jb uc_dl_r
-        cmp dl, 'z'
-        ja uc_dl_r
-        and dl, 0xdf
-uc_dl_r:
-        cmp al, dl
-        jne kw_fail
-        test ah, 0x80           ; last char?
-        jz kw_lp
-        ; verify word boundary
-        mov al, [si]
-        call uc_al
-        cmp al, '_'
-        je kw_fail
-        cmp al, 'A'
-        jb kw_ok
-        cmp al, 'Z'
-        jbe kw_fail
-        cmp al, '0'
-        jb kw_ok
-        cmp al, '9'
-        jbe kw_fail
-kw_ok:
-        pop ax
-        clc
+        push    si              ; Save SI for failure restoration
+        call    spaces          ; Skip whitespace
+        mov     di, [bx]        ; DI = pointer to keyword string
+.match_lp:
+        mov     al, [di]        ; Get keyword char
+        inc     di              ; Move to next keyword char
+        mov     dl, al          ; DL holds char + "end-of-word" flag (bit 7)
+        and     al, 0x7F        ; Strip flag for comparison
+        call    uc_al           ; Uppercase keyword char
+        mov     ah, al          ; Store uppercased keyword char in AH
+        
+        lodsb                   ; Load input char into AL, SI++
+        call    uc_al           ; Uppercase input char
+        
+        cmp     al, ah          ; Compare input (AL) with keyword (AH)
+        jne     .fail           ; Mismatch? Restore SI and exit
+        
+        test    dl, 0x80        ; Was that keyword char the last one?
+        jz      .match_lp       ; No? Keep matching characters
+        
+        ; --- Boundary Check: Ensure we didn't match a prefix (e.g., IF vs IFFY) ---
+        mov     al, [si]        ; Peek at next char in input
+        call    uc_al           ; Standardize to uppercase
+        cmp     al, '_'         ; Underscore is part of a word
+        je      .fail
+        cmp     al, 'A'         ; If < 'A'...
+        jb      .check_num      ; ...it might be a number
+        cmp     al, 'Z'         ; If 'A'-'Z'...
+        jbe     .fail           ; ...it's still a word (no boundary)
+.check_num:
+        cmp     al, '0'         ; If < '0'...
+        jb      .ok             ; ...it's a valid boundary (space, etc.)
+        cmp     al, '9'         ; If '0'-'9'...
+        jbe     .fail           ; ...it's a word (no boundary)
+.ok:
+        pop     ax              ; Match success! Discard saved SI
+        clc                     ; Clear Carry Flag (Matched)
         ret
-kw_fail:
-        pop si
-        stc
+.fail:
+        pop     si              ; Match failed: Restore SI to start
+        stc                     ; Set Carry Flag (No Match)
         ret
 
 ; =============================================================================
