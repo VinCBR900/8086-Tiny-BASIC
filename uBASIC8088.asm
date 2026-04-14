@@ -1123,8 +1123,8 @@ chrs_tab:       dw kw_chrs
 ROM_END:	
 
 ; =============================================================================
-; Pre-loaded showcase + Mandelbrot program (ROM build only, %ifndef COM_BUILD)
-; Copied to RAM at startup. Type RUN to execute, NEW to clear.
+; Pre-loaded showcase + Mandelbrot program (8BitWorkshop Only)
+; Type RUN to execute, NEW to clear.
 ; Lines 10-160: feature demos.  Lines 170-400: Mandelbrot renderer.
 ; Fixed-point arithmetic (scale 1/64), 16 iterations, ASCII density display.
 ; =============================================================================
