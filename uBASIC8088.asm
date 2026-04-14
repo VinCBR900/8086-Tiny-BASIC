@@ -81,7 +81,6 @@
 	; configure Program origin based on Target Platform                
 %ifdef __YASM_MAJOR__
     		SECTION .text	; running under 8 bit workshop
-%define COM_BUILD	; include demo program
 ORIGIN:		equ 0    
 
 %elifdef	COM_BUILD	; testing with freedos
@@ -105,11 +104,11 @@ PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
 ; --- Error codes -------------------------------------------------------------
-ERR_SN:         equ "0" ; 0
-ERR_UL:         equ "1" ; 1
-ERR_OV:         equ "2" ; 
-ERR_OM:         equ "3" ;
-ERR_UK:         equ "4" ;
+ERR_SN:         equ "0" 
+ERR_UL:         equ "1" 
+ERR_OV:         equ "2"  
+ERR_OM:         equ "3" 
+ERR_UK:         equ "4" 
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -130,8 +129,8 @@ T_DS:           equ 0xA4        ; '$'  CHR$
 ; Clobbers: everything
 ; =============================================================================
 start:
-        cld
-        ; Ensure CS=DS=ES=SS=0 (boot sector sets them but be defensive)
+%ifndef COM_BUILD
+	; Ensure CS=DS=ES=SS since 8bitworkshop produces EXE file
         push cs
         pop ds
         push cs
@@ -139,6 +138,8 @@ start:
         push cs
         pop ss
         mov sp, STACK_TOP
+%endif
+	cld
 
         ; Zero all RAM control area: VARS through end of Program
         mov di, VARS
@@ -146,10 +147,10 @@ start:
         mov cx, 63	; this should include program RAM if no demo
 	rep stosw	; clear memory
         
-%ifndef COM_BUILD
-        call do_new
-%else
+%ifdef __YASM_MAJOR__
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
+%else
+        call do_new
 %endif
 
 	mov si, str_banner
@@ -176,10 +177,10 @@ main_loop:
         or ax, ax
         jne ml_numbered
         call stmt_line          ; CALL - correct return address
-        jmp main_loop
+        jmp short main_loop
 ml_numbered:
         call editln             ; numbered line: store/edit in program
-        jmp main_loop
+        jmp short main_loop
 
 ; =============================================================================
 ; DO_ERROR  print error; never returns to caller
@@ -204,7 +205,7 @@ do_error:
         call output_number
 do_error_nl:
         call new_line
-        jmp main_loop
+        jmp short main_loop
 
 ; =============================================================================
 ; STMT_LINE  execute ':'-separated statements on line at SI
@@ -227,7 +228,8 @@ sl_ret:
 peek_line:
         call spaces
         cmp byte [si], 0x0d
-        ret
+stmt_ret:
+	ret
 
 ; =============================================================================
 ; STMT  execute one statement from SI
@@ -243,11 +245,9 @@ stmt_lp:
         call kw_match
         jnc stmt_call
         add bx, 4
-        jmp stmt_lp
+        jmp short stmt_lp
 stmt_call:
-        call [bx+2]             ; indirect call to handler
-stmt_ret:
-        ret
+        jmp [bx+2]             ; indirect call to handler
         
 stmt_let:
 ; =============================================================================
@@ -275,7 +275,7 @@ dl_err2:
         pop di
 JERRUK:
         mov al, ERR_UK
-        jmp do_error
+        jmp short do_error
         
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
@@ -392,7 +392,7 @@ run_loop:
         
         ; SI is already pointing to the body because of LODSW!
         call    stmt_line       ; Execute the statement
-        jmp     run_loop
+        jmp     short run_loop
         
 ; =============================================================================
 ; DO_NEW
@@ -452,6 +452,7 @@ do_rem:
         lodsb           ; AL = [SI], then SI++
         cmp al, 0x0d    ; Was it the CR?
         jne do_rem      ; If not, keep going
+dp_ret:
         ret
 
 ; =============================================================================
@@ -480,21 +481,19 @@ dp_str:
 
 loop_print:
         call output
-        jmp dp_str		
+        jmp short dp_str		
         
 dp_str_eol:
         dec si
 dp_nl:
-        call new_line
-dp_ret:
-        ret
+        jmp new_line	; tail call   
 dp_expr:
         mov bx, chrs_tab
         call kw_match
         jc dp_num
         call eat_paren_expr
         call output
-        jmp dp_after
+        jmp short dp_after
 dp_num:
         call expr
         call output_number
@@ -505,7 +504,7 @@ dp_after:
         inc si
         call peek_line
         je dp_ret
-        jmp dp_top
+        jmp short dp_top
 
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
@@ -589,7 +588,7 @@ rel_eq:
         call rel_setup
         cmp bx, ax
         je rel_t
-        jmp rel_f
+        jmp short rel_f
 
 rel_lt:
         inc si
@@ -603,21 +602,21 @@ rel_lt:
         call rel_setup          ; plain <: BX=left AX=right
         cmp bx, ax
         jl rel_t
-        jmp rel_f
+        jmp short rel_f
 rel_ne:
         pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
         jne rel_t
-        jmp rel_f
+        jmp short rel_f
 rel_le:
         pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
         jle rel_t
-        jmp rel_f
+        jmp short rel_f
 
 rel_gt:
         inc si
@@ -629,19 +628,21 @@ rel_gt:
         call rel_setup          ; plain >: BX=left AX=right
         cmp bx, ax
         jg rel_t
-        jmp rel_f
+        jmp short rel_f
 rel_ge:
         pop ax                  ; left
         inc si
         call rel_setup
         cmp bx, ax
         jge rel_t
-        jmp rel_f
+        jmp short rel_f
 
-rel_t:  mov ax, 0xffff
-        ret
-rel_f:  xor ax, ax
-        ret
+rel_f:  xor ax, ax		
+        db 0xb3			; consume dec AX
+rel_t:  dec ax
+ea_ret:
+e1_ret:
+	ret
 
 ; =============================================================================
 ; EXPR_ADD  additive level: + and -
@@ -668,8 +669,6 @@ ea_do:
 ea_add:
         add ax, bx
         jmp ea_lp
-ea_ret:
-        ret
 
 ; =============================================================================
 ; EXPR1  multiplicative level: * / %
@@ -711,8 +710,6 @@ e1_div:
 e1_zero:
         mov al, ERR_OV
         jmp do_error
-e1_ret:
-        ret
 
 ; =============================================================================
 ; EXPR2  atom level
@@ -730,8 +727,8 @@ expr2:
         mov bx, chrs_tab
         call kw_match
         jc e2_nchrs
-        call eat_paren_expr
-        ret
+        jmp short eat_paren_expr	; tail call
+        
 e2_nchrs:
         ; PEEK
         mov bx, peek_tab
@@ -758,8 +755,8 @@ e2_nusr:
         jb e2_var
         cmp al, '9'
         ja e2_var
-        call input_number
-        ret
+        jmp short input_number	; tail call
+        
 e2_var:
         ; variable A-Z?
         call uc_al
@@ -796,7 +793,6 @@ e2_pos:
         inc si
         jmp expr2
 
-
 epe_err:
         mov al, ERR_SN
         jmp do_error
@@ -820,9 +816,9 @@ sp_r:   ret
 ; =============================================================================
 spaces:
         cmp byte [si], ' '
-        jne sp_r
+        jne sp_r	; return
         inc si
-        jmp spaces
+        jmp short spaces
 
 ; =============================================================================
 ; INPUT_NUMBER  parse unsigned decimal from [SI] -> AX; SI past digits
@@ -924,6 +920,7 @@ output:
         int 0x10
         pop bx
         ret
+        
 ; =============================================================================
 ; DO_FREE  print free program-store bytes
 ; =============================================================================
@@ -1154,7 +1151,7 @@ ROM_END:
 ; Lines 10-160: feature demos.  Lines 170-400: Mandelbrot renderer.
 ; Fixed-point arithmetic (scale 1/64), 16 iterations, ASCII density display.
 ; =============================================================================
-%ifdef COM_BUILD
+%ifdef __YASM_MAJOR__
 	times PROGRAM - ($-$$) nop
 SHOWCASE_DATA:
         db 0x0A,0x00,"REM uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
