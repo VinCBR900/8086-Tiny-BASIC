@@ -556,89 +556,60 @@ JERRSN:
 ; Inputs  : SI -> expression text
 ; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000
 ; Clobbers: AX, BX, CX, DX, SI
-;
-; FIX v1.0.2: restored missing 'cmp al,>' before 'je rel_gt'.
-; FIX v1.0.5: push/pop AX around peek (BX unsafe - clobbered by expr2).
-;             rel_xx pop left before rel_setup. rel_setup reverted to original.
-; =============================================================================
 expr:
-        call expr_add           ; left operand -> AX
-        push ax                 ; save left (BX clobbered by expr2 kw_match loads)
-        call spaces
-        mov al, [si]            ; peek for relational operator
-        cmp al, '='
-        je rel_eq
-        cmp al, '<'
-        je rel_lt
-        cmp al, '>'
-        je rel_gt
-        pop ax                  ; no relational op: restore result
+        call    expr_add        ; Left operand -> AX
+        push    ax              ; Save left
+        call    spaces
+        
+        ; Map relational operators to a bitmask (LT=1, EQ=2, GT=4)
+        xor     dx, dx          ; DX = 0 (Our mask)
+.op_loop:
+        lodsb                   ; Peek/get char
+        cmp     al, '<'
+        jne     .not_lt
+        or      dl, 1
+        jmp short     .op_loop
+.not_lt:
+        cmp     al, '='
+        jne     .not_eq
+        or      dl, 2
+        jmp short     .op_loop
+.not_eq:
+        cmp     al, '>'
+        jne     .not_gt
+        or      dl, 4
+        jmp short     .op_loop
+.not_gt:
+        dec     si              ; Backtrack SI (non-relational char)
+        test    dl, dl          ; Did we find any relational operators?
+        jnz     .do_rel         ; Yes, go handle them
+        pop     ax              ; No, restore left operand
         ret
 
-; rel_setup: in AX=left; out AX=right BX=left
-rel_setup:
-        push ax                 ; save left
-        call expr_add           ; right -> AX
-        pop bx                  ; BX = left
-        ret
+.do_rel:
+        push    dx              ; Save our operator mask
+        call    expr_add        ; Right operand -> AX
+        pop     dx              ; Restore mask
+        pop     bx              ; BX = Left operand
+        
+        cmp     bx, ax          ; Compare Left (BX) and Right (AX)
+        
+        ; Now we convert CPU flags into our bitmask format
+        mov     ah, 0           ; AH = Result mask
+        jl      .is_lt
+        jg      .is_gt
+        mov     ah, 2           ; It's Equal (bit 1)
+        jmp     .check
+.is_lt: mov     ah, 1           ; It's Less (bit 0)
+        jmp     .check
+.is_gt: mov     ah, 4           ; It's Greater (bit 2)
 
-rel_eq:
-        pop ax                  ; left from expr's push
-        inc si
-        call rel_setup
-        cmp bx, ax
-        je rel_t
-        jmp short rel_f
-
-rel_lt:
-        inc si
-        call spaces
-        mov al, [si]
-        cmp al, '>'
-        je rel_ne
-        cmp al, '='
-        je rel_le
-        pop ax                  ; left operand from expr's push
-        call rel_setup          ; plain <: BX=left AX=right
-        cmp bx, ax
-        jl rel_t
-        jmp short rel_f
-rel_ne:
-        pop ax                  ; left
-        inc si
-        call rel_setup
-        cmp bx, ax
-        jne rel_t
-        jmp short rel_f
-rel_le:
-        pop ax                  ; left
-        inc si
-        call rel_setup
-        cmp bx, ax
-        jle rel_t
-        jmp short rel_f
-
-rel_gt:
-        inc si
-        call spaces
-        mov al, [si]
-        cmp al, '='
-        je rel_ge
-        pop ax                  ; left operand from expr's push
-        call rel_setup          ; plain >: BX=left AX=right
-        cmp bx, ax
-        jg rel_t
-        jmp short rel_f
-rel_ge:
-        pop ax                  ; left
-        inc si
-        call rel_setup
-        cmp bx, ax
-        jge rel_t
-        jmp short rel_f
+.check:
+        test    ah, dl          ; Does our result match the user's operators?
+        jnz     rel_t           ; e.g., if result is LT and user typed <= (1 | 2)
 
 rel_f:  xor ax, ax		
-        db 0xb3			; consume dec AX
+        db 0xb3			; consume `dec AX` with `mov bl, 0x48` (`dec ax` opcode)
 rel_t:  dec ax
 ea_ret:
 e1_ret:
@@ -739,6 +710,7 @@ e2_nchrs:
         xor ah, ah
         mov al, [bx]
         ret
+        
 e2_npeek:
         ; USR
         mov bx, usr_tab
@@ -747,6 +719,7 @@ e2_npeek:
         call eat_paren_expr
         call ax
         ret
+        
 e2_nusr:
         ; Reload AL from [si] - kw_match may have clobbered it
         mov al, [si]
@@ -770,6 +743,7 @@ e2_var:
 e2_bad:
         xor ax, ax
         ret
+        
 ; eat_paren_expr: '(' expr ')' -> AX
 eat_paren_expr:
         call spaces
@@ -837,7 +811,7 @@ inm_lp:
         mov cx, 10
         mul cx
         add bx, ax
-        jmp inm_lp
+        jmp short inm_lp
 inm_done:
         mov ax, bx
         ret
@@ -880,17 +854,20 @@ ipl_lp:
         je ipl_lp
         dec di
         dec cx
-        mov al, 0x08
-        call output
+        call backsp
         mov al, ' '
         call output
+        call backsp
+        jmp ipl_lp
+backsp:
         mov al, 0x08
         call output
-        jmp ipl_lp
+	ret
+        
 ipl_nbs:
         cmp al, 0x0d
         je ipl_cr
-        cmp cx, 62
+        cmp cx, 62	; max line length - need a EQU really
         jnb ipl_lp
         call output
         stosb
