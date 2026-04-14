@@ -357,46 +357,43 @@ do_if:
         jmp stmt
 
 ; =============================================================================
-; DO_GOTO  GOTO <expr>
+; DO_GOTO / DO_RUN
 ; =============================================================================
 do_goto:
-        call expr
-        push ax
-        call find_line
-        pop bx
-        cmp [di], bx
-        je dg_found
-JERRUL:        
-        mov al, ERR_UL
-        jmp do_error
-        
-dg_found:
-        mov [RUN_NEXT], di
-        cmp byte [RUNNING], 0
-        jne dg_ret
-        mov byte [RUNNING], 1
-        jmp run_loop
+        call    expr            ; AX = target line
+        call    find_line       ; DI = pointer to line >= AX
+        cmp     [di], ax        ; Does it exist exactly?
+        je      dg_common       ; Yes: proceed to run/resume
+JERRUL:
+        mov     al, ERR_UL      ; No: Undefined Line error
+        jmp     do_error
+
+do_run:
+        mov     di, PROGRAM     ; RUN always starts at the beginning
+dg_common:
+        mov     [RUN_NEXT], di  ; Update the program counter
+        cmp     byte [RUNNING], 0
+        jne     dg_ret          ; If already running (from a GOTO), just return
+        inc     byte [RUNNING]  ; Set RUNNING to 1
+        ; Fall through to run_loop
 
 ; =============================================================================
-; DO_RUN  RUN: execute from first line
+; RUN_LOOP
 ; =============================================================================
-do_run:
-        mov di, PROGRAM
-        mov byte [RUNNING], 1
-        mov [RUN_NEXT], di
 run_loop:
-        mov di, [RUN_NEXT]
-        cmp word [di], 0
-        je run_end
-        mov ax, [di]
-        mov [CURLN], ax
-        push di
-        call next_line_ptr
-        mov [RUN_NEXT], di
-        pop di
-        lea si, [di+2]
-        call stmt_line
-        jmp run_loop
+        mov     di, [RUN_NEXT]  ; Get pointer to current line
+        mov     si, di
+        lodsw                   ; AX = Line Number, SI = points to body
+        test    ax, ax          ; Is it 0000 (End of Program)?
+        jz      run_end
+        
+        mov     [CURLN], ax     ; Update current line number for error reporting
+        call    next_line_ptr   ; This uses DI to find the START of the NEXT line
+        mov     [RUN_NEXT], di  ; Store it for the next iteration
+        
+        ; SI is already pointing to the body because of LODSW!
+        call    stmt_line       ; Execute the statement
+        jmp     run_loop
         
 ; =============================================================================
 ; DO_NEW
@@ -1200,4 +1197,3 @@ SHOWCASE_DATA:
         dw 0
 SHOWCASE_END:
 %endif
-
