@@ -976,14 +976,18 @@ el_len:
         inc cx
         jmp el_len
 el_ldone:
+        push cx                 ; preserve new body length across find/delete
         push bx                 ; save body ptr: find_line/deline clobber BX
         mov ax, dx
         call find_line          ; walk_lines clobbers BX
         cmp [di], dx
         jne el_noex
-        call deline             ; also clobbers BX
+        push di                 ; preserve insertion point for replacement
+        call deline             ; also clobbers BX/CX/DI
+        pop di
 el_noex:
         pop bx                  ; restore body pointer
+        pop cx                  ; restore new body length
         cmp byte [bx], 0x0d     ; empty body = delete only
         je el_done
         mov si, bx              ; SI = body pointer
@@ -1041,7 +1045,6 @@ ins_copy:
         jne ins_copy
 
         add [PROG_END], cx
-        mov word [di], 0
         ret
 
 ins_oom:
