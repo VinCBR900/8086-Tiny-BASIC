@@ -163,8 +163,8 @@ start:
 ; =============================================================================
 main_loop:
         mov sp, STACK_TOP
-        mov byte [RUNNING], 0
-
+	call do_end		; not running
+        
 	mov al, '>'
         call output
         
@@ -898,6 +898,7 @@ dh_lp:
     jne dh_lp        ; Loop back if not zero
 
     jmp new_line     ; Tail-call: new_line will RET for us
+    
 ; =============================================================================
 ; DO_ERROR  print error; never returns to caller
 ; Inputs  : AX = error code
