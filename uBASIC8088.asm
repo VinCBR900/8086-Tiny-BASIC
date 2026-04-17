@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.0.10
+; uBASIC 8088  v1.1.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -36,7 +36,13 @@
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
-;   V1.0.10 Size optimization	
+;   v1.1.0 (2026-04-17)  Bug fixes and do_new improvement:
+;     - expr: add xor ax,ax before test ah,dl so rel_t (dec ax) yields
+;       0xFFFF; AX held right operand, giving wrong relational results.
+;     - do_new: rep stosw to clear entire program store, not just sentinel;
+;       prevents stale data confusing walk_lines after future LOAD/SAVE.
+;     - equ "0".."4" changed to equ 0x30..0x34 (tinyasm compatibility).
+;     - dp_str_eol dead label removed.
 ;   v1.0.9+ COM_BUILD: %ifdef COM_BUILD assembles as DOS .COM (ORG 0x0100)
 ;            for cross-checking in 8bitworkshop/DOSBox. I/O unchanged
 ;            (INT 10h display, INT 16h keyboard). RAM 0x1000-0x1FFF
@@ -104,11 +110,11 @@ PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
 
 ; --- Error codes -------------------------------------------------------------
-ERR_SN:         equ "0" 
-ERR_UL:         equ "1" 
-ERR_OV:         equ "2"  
-ERR_OM:         equ "3" 
-ERR_UK:         equ "4" 
+ERR_SN:         equ 0x30  
+ERR_UL:         equ 0x31  
+ERR_OV:         equ 0x32   
+ERR_OM:         equ 0x33  
+ERR_UK:         equ 0x34  
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -369,13 +375,17 @@ run_loop:
         jmp     short run_loop
         
 ; =============================================================================
-; DO_NEW
+; DO_NEW  clear program store (PROGRAM..PROGRAM_TOP) and reset PROG_END
+; Uses rep stosw so the sentinel at PROG_END is always 0x0000.
+; Also eliminates stale data that could confuse walk_lines after LOAD/SAVE.
 ; =============================================================================
 do_new:
-	xor ax,ax
-	mov word [PROGRAM], ax
+        mov di, PROGRAM         ; start of program store
         mov word [PROG_END], PROGRAM
-        ; drop through        
+        xor ax, ax
+        mov cx, (PROGRAM_TOP - PROGRAM) / 2   ; words to clear
+        rep stosw               ; zero entire program store
+        ; fall through to do_end (clears RUNNING via run_end)
 
 ; =============================================================================
 ; DO_END  END statement - stops program execution
@@ -457,8 +467,6 @@ loop_print:
         call output
         jmp short dp_str		
         
-dp_str_eol:
-        dec si
 dp_nl:
         jmp new_line	; tail call   
 dp_expr:
@@ -561,33 +569,30 @@ expr:
         ret
 
 .do_rel:
-        push    dx              ; Save our operator mask
-        call    expr_add        ; Right operand -> AX
-        pop     dx              ; Restore mask
-        pop     bx              ; BX = Left operand
-        
-        cmp     bx, ax          ; Compare Left (BX) and Right (AX)
-        
-        ; Now we convert CPU flags into our bitmask format
-        mov     ah, 0           ; AH = Result mask
-        jl      .is_lt
-        jg      .is_gt
-        mov     ah, 2           ; It's Equal (bit 1)
-        jmp     .check
-.is_lt: mov     ah, 1           ; It's Less (bit 0)
-        jmp     .check
-.is_gt: mov     ah, 4           ; It's Greater (bit 2)
+        push    dx              ; save operator mask
+        call    expr_add        ; right operand -> AX
+        pop     dx              ; restore mask (DL)
+        pop     bx              ; BX = left operand
 
-.check:
-        test    ah, dl          ; Does our result match the user's operators?
-        jnz     rel_t           ; e.g., if result is LT and user typed <= (1 | 2)
-
-rel_f:  xor ax, ax		
-        db 0xb3			; consume `dec AX` with `mov bl, 0x48` (`dec ax` opcode)
-rel_t:  dec ax
+        cmp     bx, ax          ; compare left vs right (sets SF,OF,ZF,CF)
+        ; branch FIRST on cmp flags before any instruction clobbers them
+        jl      .is_lt          ; SF!=OF -> less-than
+        jg      .is_gt          ; ZF=0 and SF=OF -> greater-than
+        mov     al, 2           ; equal: EQ bit
+        jmp short .check
+.is_lt: mov     al, 1           ; less-than: LT bit
+        jmp short .check
+.is_gt: mov     al, 4           ; greater-than: GT bit
+        ; AL now has the result bit; AH has garbage from right operand
+.check: xor     ah, ah          ; zero AH (doesn't affect SF/OF/ZF from branches - already past them)
+        test    al, dl          ; does result bit match operator mask?
+        jz      rel_f           ; no: false
+	mov ax, 0xffff		; 0xFFFF = true
 ea_ret:
 e1_ret:
-	ret
+        ret
+rel_f:  xor     ax, ax          ; false: AX = 0
+        ret
 
 ; =============================================================================
 ; EXPR_ADD  additive level: + and -
@@ -1096,7 +1101,7 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.0.10"
+str_banner: db "uBASIC 8088 v1.1.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
