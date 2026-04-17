@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.1.0
+; uBASIC 8088  v1.2.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -8,11 +8,11 @@
 ; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
-; Statements : PRINT IF..THEN GOTO LET INPUT REM END RUN LIST NEW POKE FREE HELP
+; Statements : PRINT IF..THEN GOTO GOSUB RETURN LET INPUT REM END RUN LIST NEW POKE FREE HELP
 ; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
 ; Numbers    : signed 16-bit (-32768..32767)
 ; Multi-stmt : colon separator ':'
-; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable
+; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable  ?5 return without gosub
 ;
 ; Segment model: CS=DS=ES=SS=0x0000 (single segment, flat).
 ;   Boot sector (bootsect.asm) loads 5 sectors to 0x7E00 and jumps there.
@@ -31,11 +31,19 @@
 ;   0x1078  prog_end    2 bytes   one-past-last byte of program store
 ;   0x107A  run_next    2 bytes   next-line pointer for run loop
 ;   0x107C  ins_tmp     2 bytes   temp word for insline end-marker address
-;   0x107E  program     ...       program store (grows toward 0x1E00)
+;   0x107E  gosub_sp    2 bytes   gosub stack depth counter (0..7)
+;   0x1080  gosub_stk  16 bytes   gosub return-address stack (8 entries)
+;   0x1090  program     ...       program store (grows toward 0x1E00)
 ;   0x1E00  PROGRAM_TOP           top of program store / base of stack
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.2.0 (2026-04-17)  Add GOSUB/RETURN:
+;     - Dedicated 8-entry GOSUB stack at 0x107E (GOSUB_SP) + 0x1080 (GOSUB_STK)
+;     - PROGRAM store moved 0x107E -> 0x1090 (costs 18 bytes program RAM)
+;     - New error ?5 = RETURN without GOSUB
+;     - GOSUB: saves RUN_NEXT on GOSUB_STK, then behaves like GOTO
+;     - RETURN: restores RUN_NEXT from GOSUB_STK, resumes after GOSUB line
 ;   v1.1.0 (2026-04-17)  Bug fixes and do_new improvement:
 ;     - expr: add xor ax,ax before test ah,dl so rel_t (dec ax) yields
 ;       0xFFFF; AX held right operand, giving wrong relational results.
@@ -104,7 +112,9 @@ CURLN:          equ 0x1036      ; word:  current line number (error reports)
 IBUF:           equ 0x1038      ; 64 bytes: input line buffer (max 62 chars+CR)
 RUN_NEXT:       equ 0x107A      ; word:  next-line pointer for run loop
 INS_TMP:        equ 0x107C      ; word:  insline end-marker temp
-PROGRAM:        equ 0x107E      ; program store starts here
+GOSUB_SP:       equ 0x107E      ; word: gosub stack depth (0..7)
+GOSUB_STK:      equ 0x1080      ; 8 words: gosub return addresses
+PROGRAM:        equ 0x1090      ; program store starts here (was 0x107E)
 PROG_END:       equ 0x1078      ; word:  one past last program byte
 PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
@@ -114,7 +124,8 @@ ERR_SN:         equ 0x30
 ERR_UL:         equ 0x31  
 ERR_OV:         equ 0x32   
 ERR_OM:         equ 0x33  
-ERR_UK:         equ 0x34  
+ERR_UK:         equ 0x34
+ERR_RT:         equ 0x35  ; RETURN without GOSUB
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -129,6 +140,7 @@ T_K:            equ 0xCB        ; 'K'  PEEK
 T_R:            equ 0xD2        ; 'R'  USR
 T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
+T_B:            equ 0xC2        ; 'B'  GOSUB
 
 ; =============================================================================
 ; INIT  cold start; entered at 0x0000:0x7E00 by boot sector
@@ -150,7 +162,7 @@ start:
         ; Zero all RAM control area: VARS through end of Program
         mov di, VARS
         xor ax, ax
-        mov cx, 63	; this should include program RAM if no demo
+        mov cx, 72      ; covers VARS..GOSUB_STK (0x1000..0x108F)
 	rep stosw	; clear memory
         
 %ifdef __YASM_MAJOR__
@@ -587,7 +599,8 @@ expr:
 .check: xor     ah, ah          ; zero AH (doesn't affect SF/OF/ZF from branches - already past them)
         test    al, dl          ; does result bit match operator mask?
         jz      rel_f           ; no: false
-	mov ax, 0xffff		; 0xFFFF = true
+        xor     ax, ax          ; yes: zero AX (AL had 1/2/4; AH already 0)
+        dec     ax              ; 0xFFFF = true
 ea_ret:
 e1_ret:
         ret
@@ -1073,6 +1086,60 @@ deline:
         sub [PROG_END], bx
         ret
 
+
+; =============================================================================
+; DO_GOSUB  GOSUB <linenum>
+;   Saves current RUN_NEXT on the GOSUB stack, then jumps to target line.
+;   Uses a dedicated 8-entry stack at GOSUB_STK to avoid hardware stack
+;   conflicts with the interpreter's own call chain.
+; Inputs : SI -> expression (line number)
+; Clobbers: AX, BX, DI
+; =============================================================================
+do_gosub:
+        call    expr            ; AX = target line number
+        call    find_line       ; DI -> line entry >= AX
+        cmp     [di], ax        ; exact match?
+        jne     gs_noline       ; no -> undefined line error
+        mov     bx, [GOSUB_SP]  ; BX = current stack depth
+        cmp     bx, 8           ; stack full? (max 8 levels)
+        jb      gs_push         ; room: go push
+        mov     al, ERR_SN      ; stack overflow -> syntax error
+        jmp     do_error
+gs_noline:
+        mov     al, ERR_UL
+        jmp     do_error
+gs_push:
+        inc     word [GOSUB_SP] ; bump depth first (BX still = old depth)
+        add     bx, bx          ; BX = byte offset = old_depth * 2
+        mov     si, GOSUB_STK
+        add     si, bx          ; SI -> save slot
+        mov     ax, [RUN_NEXT]
+        mov     [si], ax        ; push RUN_NEXT onto gosub stack
+        mov     [RUN_NEXT], di  ; set PC to GOSUB target line
+        ret
+
+; =============================================================================
+; DO_RETURN  RETURN
+;   Pops a return address from the GOSUB stack and resumes execution there.
+; Clobbers: AX, BX
+; =============================================================================
+do_return:
+        mov     bx, [GOSUB_SP]  ; BX = current stack depth
+        or      bx, bx          ; stack empty?
+        jz      gs_underflow    ; yes -> error ?5
+        dec     bx              ; pre-decrement
+        mov     [GOSUB_SP], bx  ; store new depth
+        add     bx, bx          ; BX = byte offset (depth * 2)
+        mov     si, GOSUB_STK   ; SI -> base of gosub stack
+        add     si, bx          ; SI -> this slot
+        mov     ax, [si]        ; pop return address
+        mov     [RUN_NEXT], ax  ; restore PC to line after GOSUB
+        ret
+
+gs_underflow:
+        mov     al, ERR_RT      ; ?5 return without gosub
+        jmp     do_error
+
 ; =============================================================================
 ; Keyword strings (bit-7 terminated; 0x00 sentinel ends do_help table)
 ; =============================================================================
@@ -1090,6 +1157,8 @@ kw_let:     db 0x4c,0x45,T_T
 kw_poke:    db 0x50,0x4f,0x4b,T_E
 kw_free:    db 0x46,0x52,0x45,T_E
 kw_help:    db 0x48,0x45,0x4c,T_P
+kw_gosub:   db 0x47,0x4f,0x53,0x55,T_B   ; GOSUB
+kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N  ; RETURN
 ; not commands but still want to print in help
 kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
@@ -1101,7 +1170,7 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.1.0"
+str_banner: db "uBASIC 8088 v1.2.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1119,6 +1188,8 @@ st_tab:
         dw kw_poke,     do_poke
         dw kw_free,     do_free
         dw kw_help,     do_help
+        dw kw_gosub,    do_gosub
+        dw kw_return,   do_return
         dw 0
         ; non commands but still match
 peek_tab:       dw kw_peek
