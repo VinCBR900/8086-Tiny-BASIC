@@ -5,7 +5,7 @@
 ; Tiny BASIC for single-segment 8088/8086 systems.
 ; Target: <=2048 bytes code ROM, 4096 bytes RAM.
 ;
-; Re-engineered from uBASIC 65c02 v17.0 (same initial feature set, changes below).
+; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
 ; Statements : PRINT IF..THEN GOTO GOSUB RETURN LET INPUT REM END RUN LIST NEW POKE FREE HELP
@@ -509,11 +509,7 @@ dl_body:
         push si
         mov si, bx
 dl_kw_lp:
-        lodsb
-        and al, 0x7f            ; strip bit-7 terminator flag
-        call output
-        test byte [si-1], 0x80  ; was that the last char?
-        jz  dl_kw_lp
+        call dp_str
         mov al, ' '
         call output
         pop si
@@ -522,11 +518,7 @@ dl_raw:
         call output
         jmp dl_body
 dl_eol:
-        mov al, 0x0d        ; CR
-        call output
-        mov al, 0x0a        ; LF
-        call output
-
+        call new_line
         call next_line_ptr
         jmp dl_lp
 
