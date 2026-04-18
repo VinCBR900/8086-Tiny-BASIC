@@ -3,7 +3,7 @@ Tiny BASIC for 8086/88 Embedded systems
 
 **WORK in PROGRESS** Mostly working but imrpovements being made each week.
 
-Inspired by the 1980's BYTE magazine article "Ease into 16 bit Computing" by Steve Ciarca. Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC) which is leveraged here. 
+Inspired by the 1980's BYTE magazine article "Ease into 16 bit Computing" by Steve Ciarcia. Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC) which is leveraged here. 
 
 ##  Notes
 
