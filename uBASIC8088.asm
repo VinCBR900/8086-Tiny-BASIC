@@ -758,6 +758,9 @@ e1_zero:
 ; =============================================================================
 ; EXPR2  atom level
 ; =============================================================================
+e2_pos:
+        inc si
+	; drop through
 expr2:
         call spaces
         mov al, [si]
@@ -771,8 +774,22 @@ expr2:
         mov bx, chrs_tab
         call kw_match
         jc e2_nchrs
-        jmp short eat_paren_expr	; tail call
+	; drop through
         
+; eat_paren_expr: '(' expr ')' -> AX
+eat_paren_expr:
+        call spaces
+        cmp byte [si], '('
+        jne epe_err
+e2_par:
+	inc si
+        call expr
+        call spaces
+        cmp byte [si], ')'
+        jne epe_err
+        inc si
+        ret 
+
 e2_nchrs:
         ; PEEK
         mov bx, peek_tab
@@ -793,16 +810,6 @@ e2_npeek:
         call ax
         ret
         
-e2_nusr:
-        ; Reload AL from [si] - kw_match may have clobbered it
-        mov al, [si]
-        ; decimal literal?
-        cmp al, '0'
-        jb e2_var
-        cmp al, '9'
-        ja e2_var
-        jmp short input_number	; tail call
-        
 e2_var:
         ; variable A-Z?
         call uc_al
@@ -815,35 +822,16 @@ e2_var:
         ret
 e2_bad:
         xor ax, ax
-        ret
-        
-; eat_paren_expr: '(' expr ')' -> AX
-eat_paren_expr:
-        call spaces
-        cmp byte [si], '('
-        jne epe_err
-e2_par:
-	inc si
-        call expr
-        call spaces
-        cmp byte [si], ')'
-        jne epe_err
-        inc si
-        ret        
+        ret      
         
 e2_neg:
         inc si
         call expr2
         neg ax
         ret
-e2_pos:
-        inc si
-        jmp expr2
 
 epe_err:
-        mov al, ERR_SN
-        jmp do_error
-
+        jmp JERRSN
 
 ; =============================================================================
 ; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
@@ -867,6 +855,16 @@ spaces:
         inc si
         jmp short spaces
 
+e2_nusr:
+        ; Reload AL from [si] - kw_match may have clobbered it
+        mov al, [si]
+        ; decimal literal?
+        cmp al, '0'
+        jb e2_var
+        cmp al, '9'
+        ja e2_var
+	; drop through
+        
 ; =============================================================================
 ; INPUT_NUMBER  parse unsigned decimal from [SI] -> AX; SI past digits
 ; =============================================================================
@@ -1022,6 +1020,7 @@ do_error:
 do_error_nl:
         call new_line
         jmp main_loop    
+        
 ; =============================================================================
 ; INPUT_KEY  -> AL  (BIOS INT 16h)
 ; =============================================================================
@@ -1031,7 +1030,7 @@ input_key:
         ret
 
 ; =============================================================================
-; LINE EDITOR  (from uBASIC8088 v2.1.0)
+; LINE EDITOR  
 ; =============================================================================
 find_program_end:
         mov ax, 0xffff
@@ -1059,6 +1058,7 @@ nlp_done:
         inc di
 wl_done:
 el_done:
+editln_done:
 	ret
 
 ; EDITLN  AX=linenum, SI->body text (raw, from IBUF)
@@ -1079,6 +1079,7 @@ el_len:
         je el_ldone
         inc si
         jmp el_len
+        
 el_ldone:
         ; CX = length including CR; SI points to the CR
         ; Find insertion point (push BX: find_line/walk_lines clobbers BX)
@@ -1095,9 +1096,7 @@ el_noex:
         mov si, bx              ; SI = body start
         mov ax, dx              ; AX = line number
         ; CX = body+CR len; insline will add 2 for linenum
-        call insline
-editln_done:
-        ret
+        jmp insline
         
 ; INSLINE  insert a line into the program store.
 ; Inputs:  AX = line number (word)
@@ -1196,11 +1195,9 @@ do_gosub:
         mov     bx, [GOSUB_SP]  ; BX = current stack depth
         cmp     bx, 8           ; stack full? (max 8 levels)
         jb      gs_push         ; room: go push
-        mov     al, ERR_SN      ; stack overflow -> syntax error
-        jmp     do_error
+        jmp     JERRSN		; stack overflow -> syntax error
 gs_noline:
-        mov     al, ERR_UL
-        jmp     do_error
+        jmp     JERRUL
 gs_push:
         inc     word [GOSUB_SP] ; bump depth first (BX still = old depth)
         add     bx, bx          ; BX = byte offset = old_depth * 2
