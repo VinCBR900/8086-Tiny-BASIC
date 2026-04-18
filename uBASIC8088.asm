@@ -1,11 +1,11 @@
 ; =============================================================================
-; uBASIC 8088  v1.2.0
+; uBASIC 8088  v1.3.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
 ; Target: <=2048 bytes code ROM, 4096 bytes RAM.
 ;
-; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
+; Re-engineered from uBASIC 65c02 v17.0 (same initial feature set, changes below).
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
 ; Statements : PRINT IF..THEN GOTO GOSUB RETURN LET INPUT REM END RUN LIST NEW POKE FREE HELP
@@ -20,7 +20,9 @@
 ;
 ; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
 ;
-; Line store: <linenum_lo> <linenum_hi> <raw ASCII body> <CR>  (no tokenization)
+; Line store: <linenum_lo> <linenum_hi> <tokenized body> <CR>
+;   Token bytes 0x80..0x8F replace keywords; printable ASCII and CR pass through.
+;   String literals (between quotes) and REM bodies stored verbatim.
 ;
 ; RAM layout (0x1000..0x1FFF, segment 0):
 ;   0x1000  vars[26]   52 bytes   A-Z word variables (2 bytes each)
@@ -38,6 +40,14 @@
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.3.0 (2026-04-17)  Tokenizer + line-editor refactor:
+;     - Lines stored tokenized: keywords -> 0x80..0x8F (saves ~19% program store)
+;     - LIST detokenizes on output (keywords printed uppercase)
+;     - stmt: token fast-path (0x80+ -> direct dispatch, no kw_match loop)
+;     - tokenize(): in-place scan of IBUF, string/REM passthrough
+;     - insline refactored: drop second find_line call and BP stack frame
+;     - deline refactored: use PROG_END directly, not find_program_end
+;     - editln: tokenize IBUF before insline
 ;   v1.2.0 (2026-04-17)  Add GOSUB/RETURN:
 ;     - Dedicated 8-entry GOSUB stack at 0x107E (GOSUB_SP) + 0x1080 (GOSUB_STK)
 ;     - PROGRAM store moved 0x107E -> 0x1090 (costs 18 bytes program RAM)
@@ -142,6 +152,27 @@ T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
 T_B:            equ 0xC2        ; 'B'  GOSUB
 
+; --- Token bytes (0x80..0x8F = keyword in stored program) ---
+; Order matches st_tab: PRINT IF GOTO LIST RUN NEW INPUT REM END
+;                       LET POKE FREE HELP GOSUB RETURN THEN
+TK_PRINT:       equ 0x80
+TK_IF:          equ 0x81
+TK_GOTO:        equ 0x82
+TK_LIST:        equ 0x83
+TK_RUN:         equ 0x84
+TK_NEW:         equ 0x85
+TK_INPUT:       equ 0x86
+TK_REM:         equ 0x87
+TK_END:         equ 0x88
+TK_LET:         equ 0x89
+TK_POKE:        equ 0x8A
+TK_FREE:        equ 0x8B
+TK_HELP:        equ 0x8C
+TK_GOSUB:       equ 0x8D
+TK_RETURN:      equ 0x8E
+TK_THEN:        equ 0x8F
+NUM_TOKENS:     equ 16          ; TK_PRINT..TK_THEN
+
 ; =============================================================================
 ; INIT  cold start; entered at 0x0000:0x7E00 by boot sector
 ; Clobbers: everything
@@ -227,32 +258,57 @@ do_if_false:
         
 ; =============================================================================
 ; DO_IF  IF <expr> [THEN] <stmt>
+; Handles both tokenized THEN (0x8F) and plain-text THEN.
 ; =============================================================================
 do_if:
         call expr
         or ax, ax
         je do_if_false
-        mov bx,then_tab
-        call kw_match
+        call spaces
+        cmp byte [si], TK_THEN  ; tokenized THEN?
+        jne di_kw_then
+        inc si                  ; consume token
+        jmp stmt                ; drop through into stmt
+di_kw_then:
+        mov bx, then_tab
+        call kw_match           ; try plain-text THEN (direct mode)
         ; drop through
         
 ; =============================================================================
 ; STMT  execute one statement from SI
+; Token fast-path: stored programs have keyword tokens (0x80..0x8F);
+; direct-mode input falls through to the kw_match loop as before.
 ; =============================================================================
 stmt:
         call peek_line
         je stmt_ret
+        ; --- Token fast-path (stored programs) ---
+        mov al, [si]
+        cmp al, TK_PRINT        ; first token?
+        jb  stmt_text           ; < 0x80: plain text -> kw_match loop
+        cmp al, TK_PRINT + NUM_TOKENS
+        jnb stmt_text           ; >= 0x90: not a token
+        inc si                  ; consume token byte
+        sub al, TK_PRINT        ; AL = 0..15 (index into st_tab)
+        xor ah, ah
+        add ax, ax              ; AX = index * 2
+        add ax, ax              ; AX = index * 4 (each st_tab entry = 4 bytes)
+        mov bx, st_tab
+        add bx, ax              ; BX -> correct st_tab entry
+        jmp [bx+2]              ; dispatch directly (saves kw_match loop)
+        ; --- Text fall-through (direct mode) ---
+stmt_text:
         mov bx, st_tab
 stmt_lp:
         mov ax, [bx]
         or ax, ax
-        je do_let             ; sentinel -> implicit LET/assignment
+        je do_let               ; sentinel -> implicit LET/assignment
         call kw_match
         jnc stmt_call
         add bx, 4
         jmp short stmt_lp
 stmt_call:
-        jmp [bx+2]             ; indirect call to handler
+        jmp [bx+2]              ; indirect call to handler
         
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
@@ -431,10 +487,36 @@ dl_lp:
 
 dl_body:
         lodsb
+        cmp al, 0x0d            ; CR = end of line
+        je  dl_eol
+        cmp al, TK_PRINT        ; token? (0x80..0x8F)
+        jb  dl_raw              ; < 0x80: plain char
+        cmp al, TK_PRINT + NUM_TOKENS
+        jnb dl_raw              ; >= 0x90: not a token
+        ; detokenize: look up keyword string and print it
+        sub al, TK_PRINT        ; index 0..15
+        xor ah, ah
+        add ax, ax              ; word offset
+        mov bx, tk_kw_tab
+        add bx, ax
+        mov bx, [bx]            ; BX -> keyword string
+        ; print keyword chars (bit-7 terminated), followed by space
+        push si
+        mov si, bx
+dl_kw_lp:
+        lodsb
+        and al, 0x7f            ; strip bit-7 terminator flag
         call output
-        cmp al, 0x0d        ; Check for CR
-        jne dl_body
-
+        test byte [si-1], 0x80  ; was that the last char?
+        jz  dl_kw_lp
+        mov al, ' '
+        call output
+        pop si
+        jmp dl_body
+dl_raw:
+        call output
+        jmp dl_body
+dl_eol:
         mov al, 0x0a
         call output
 
@@ -980,80 +1062,88 @@ wl_done:
 el_done:
 	ret
 
-; EDITLN  AX=linenum, SI->body+CR
+; EDITLN  AX=linenum, SI->body text (raw, from IBUF)
+; Tokenizes the body in-place, finds insertion point, deletes existing
+; line if present, inserts new line (unless body is empty = delete only).
 editln:
-        push ax
-        call spaces
+        push ax                 ; save line number
+        call spaces             ; skip any leading spaces
+        ; tokenize body in-place in IBUF (writes back tokenized form)
+        call tokenize           ; SI->body unchanged; tokenized in-place
         pop dx                  ; DX = line number
-        mov bx, si              ; BX = body pointer
-        mov cx, 1
+        ; measure tokenized body length (including CR)
+        mov bx, si              ; BX = body start
+        mov cx, 0
 el_len:
+        inc cx
         cmp byte [si], 0x0d
         je el_ldone
         inc si
-        inc cx
         jmp el_len
 el_ldone:
-        push cx                 ; preserve new body length across find/delete
-        push bx                 ; save body ptr: find_line/deline clobber BX
+        ; CX = length including CR; SI points to the CR
+        ; Find insertion point (push BX: find_line/walk_lines clobbers BX)
+        push bx
         mov ax, dx
-        call find_line          ; walk_lines clobbers BX
-        cmp [di], dx
+        call find_line          ; DI = insertion point (first line >= AX)
+        cmp [di], dx            ; exact match = line already exists?
         jne el_noex
-        push di                 ; preserve insertion point for replacement
-        call deline             ; also clobbers BX/CX/DI
-        pop di
+        call deline             ; delete it; DI unchanged (still insert point)
 el_noex:
         pop bx                  ; restore body pointer
-        pop cx                  ; restore new body length
-        cmp byte [bx], 0x0d     ; empty body = delete only
-        je el_done
-        mov si, bx              ; SI = body pointer
+        cmp byte [bx], 0x0d     ; empty body = delete-only
+        je editln_done
+        mov si, bx              ; SI = body start
         mov ax, dx              ; AX = line number
-        add cx, 2               ; +2 for linenum word
-	; drop through
+        ; CX = body+CR len; insline will add 2 for linenum
+        call insline
+editln_done:
+        ret
         
-; INSLINE  AX=linenum, DI=insert-pt, SI->body, CX=total-size
+; INSLINE  insert a line into the program store.
+; Inputs:  AX = line number (word)
+;          DI = insertion point (from editln's find_line - no second walk)
+;          SI -> tokenized body including CR
+;          CX = body+CR length
+; Clobbers: AX, BX, CX, DX, SI, DI
 insline:
-        push ax                 ; [BP+6] line number
-        push cx                 ; [BP+4] total size
-        push si                 ; [BP+2] body pointer
-        push di                 ; [BP+0] insertion point
-
-        call find_program_end
-        mov [INS_TMP], di
-
-        mov bp, sp
-        mov cx, [bp+4]
-        mov ax, [bp+6]
-
-        mov bx, [INS_TMP]
-        add bx, 2
+        ; Overflow check: need CX + 2 (linenum) + 2 (sentinel) more bytes
+        mov bx, [PROG_END]
         add bx, cx
+        add bx, 4               ; +2 linenum +2 sentinel
         cmp bx, PROGRAM_TOP
-        ja ins_oom
+        jnb ins_oom
 
-        mov di, [INS_TMP]
-        mov si, di
-        inc si
-        add di, cx
-        inc di
-        mov bx, [INS_TMP]
-        add bx, 2
-        sub bx, [bp+0]
-        push bx
-        mov cx, bx
+        ; DX = gap size = body+CR + linenum word
+        mov dx, cx
+        add dx, 2
+
+        ; Shift existing data [DI..PROG_END+1] up by DX bytes (backward copy)
+        ; bytes_to_shift = PROG_END + 2 - DI
+        push di                 ; save insertion point
+        push si                 ; save body pointer
+        push cx                 ; save body+CR length
+
+        mov bx, [PROG_END]
+        add bx, 2               ; BX = one past last sentinel byte
+        sub bx, di              ; BX = bytes to shift up
+        jz  ins_shift_done      ; inserting at end: no shift needed
+
+        ; SI = last source byte, DI = last destination byte
+        mov si, [PROG_END]
+        inc si                  ; last src = PROG_END + 1
+        mov di, si
+        add di, dx              ; last dst = last_src + gap
+        mov cx, bx              ; CX = bytes to shift
         std
         rep movsb
         cld
+ins_shift_done:
+        pop cx                  ; body+CR length
+        pop si                  ; body pointer
+        pop di                  ; insertion point
 
-        pop bx                  ; discard move count
-        mov ax, [bp+6]
-        mov si, [bp+2]
-        mov cx, [bp+4]
-        add sp, 8               ; discard 4 original saves
-
-        call find_line          ; DI -> insertion slot
+        ; Write line number, then body+CR
         mov [di], ax
         add di, 2
 ins_copy:
@@ -1062,28 +1152,32 @@ ins_copy:
         cmp al, 0x0d
         jne ins_copy
 
-        add [PROG_END], cx
+        ; PROG_END += linenum_word + body+CR = DX
+        add [PROG_END], dx
         ret
 
 ins_oom:
-        add sp, 8
-        mov ax, ERR_OM
+        mov al, ERR_OM
         jmp do_error
 
 ; DELINE  delete line at DI
+; Inputs:  DI -> line to delete
+; Outputs: DI = unchanged insertion point (rep movsb advances DI; we restore)
+; Uses PROG_END directly (no find_program_end walk needed).
 deline:
-        push di
-        call next_line_ptr
-        mov si, di
-        call find_program_end
-        mov cx, di
-        add cx, 2
-        pop di
+        push di                 ; save insertion point
+        call next_line_ptr      ; DI -> first byte of next line (src of slide)
+        mov si, di              ; SI = source (data to move down)
+        mov cx, [PROG_END]
+        add cx, 2               ; CX = one past end (+2 for sentinel word)
+        pop di                  ; DI = insertion point (dest of slide)
+        push di                 ; save again: rep movsb will advance DI
+        sub cx, si              ; CX = bytes to move
         mov bx, si
-        sub bx, di
-        sub cx, si
-        rep movsb
+        sub bx, di              ; BX = bytes deleted (to subtract from PROG_END)
+        rep movsb               ; slide data down (DI advances by CX)
         sub [PROG_END], bx
+        pop di                  ; restore DI to original insertion point
         ret
 
 
@@ -1140,6 +1234,106 @@ gs_underflow:
         mov     al, ERR_RT      ; ?5 return without gosub
         jmp     do_error
 
+
+; =============================================================================
+; TOKENIZE  Convert keyword text -> token bytes in-place in IBUF.
+; Input:  SI -> start of body text in IBUF (after line number was parsed)
+; Output: body in IBUF replaced with tokenized form; SI unchanged.
+; String literals (between quotes) and REM bodies passed through verbatim.
+; Token bytes 0x80..0x8F replace keywords; all other chars copied as-is.
+; Since tokenized form is always <= original, in-place is safe.
+; Clobbers: AX, BX, CX, DX, DI (not SI - caller needs it)
+; =============================================================================
+tokenize:
+        push si                 ; preserve SI for caller
+        mov di, si              ; DI = write ptr (same as read ptr initially)
+tk_lp:
+        mov al, [si]
+        cmp al, 0x0d            ; end of line?
+        je  tk_done
+        cmp al, '"'             ; start of string literal?
+        jne tk_kw_scan
+        ; copy opening quote, then fall into string verbatim copy
+        lodsb                   ; consume the '"' (al still = '"')
+        stosb
+        jmp tk_str_body         ; enter string loop past the quote
+tk_kw_scan:
+        ; Only try keyword match if current char is a letter (A-Z/a-z).
+        ; Non-letters (spaces, digits, operators) cannot start a keyword:
+        ; copy verbatim without kw_match attempts. Also preserves spaces exactly.
+        cmp al, 'A'
+        jb  tk_char
+        cmp al, 'Z'
+        jbe tk_kw_try
+        cmp al, 'a'
+        jb  tk_char
+        cmp al, 'z'
+        ja  tk_char
+tk_kw_try:
+        ; try each keyword in token order
+        ; BX walks tk_kw_tab one word at a time; index computed from BX offset on match
+        mov bx, tk_kw_tab
+tk_try:
+        cmp word [bx], 0        ; end of table?
+        je  tk_char             ; no keyword matched: copy char
+        push di                 ; kw_match clobbers DI (keyword scan ptr)
+        push bx                 ; kw_match may use BX indirectly; save for index calc
+        call kw_match           ; CF=0 if matched (SI advanced past keyword)
+        pop bx                  ; restore table pointer
+        pop di                  ; restore write pointer
+        jnc tk_emit             ; matched! BX still points to matched entry
+        add bx, 2               ; next table entry
+        jmp tk_try
+tk_emit:
+        ; compute token byte from table offset: index = (BX - tk_kw_tab) / 2
+        mov ax, bx
+        sub ax, tk_kw_tab       ; AX = byte offset into table
+        shr ax, 1               ; AX = token index (0..15)
+        add al, TK_PRINT        ; token byte = 0x80 + index
+        stosb                   ; write to DI
+        push ax                 ; save token byte
+        call spaces             ; consume trailing whitespace after keyword
+        pop ax                  ; restore token byte
+        cmp al, TK_REM          ; was it REM? (REM body must pass through verbatim)
+        jne tk_lp
+        ; REM: copy rest of line verbatim
+tk_rem_lp:
+        lodsb                   ; read from SI
+        stosb                   ; write to DI
+        cmp al, 0x0d
+        jne tk_rem_lp
+        jmp tk_finish
+tk_char:
+        ; no keyword matched: copy one char literally and advance both ptrs
+        lodsb                   ; al = [si], si++
+        stosb                   ; [di] = al, di++
+        jmp tk_lp
+tk_str:
+        ; inside string: copy verbatim until closing quote or CR
+        lodsb                   ; read opening quote (first entry)
+        stosb
+tk_str_body:
+        lodsb
+        stosb
+        cmp al, '"'
+        je  tk_lp               ; closing quote: resume keyword scanning
+        cmp al, 0x0d
+        jne tk_str_body
+        jmp tk_finish           ; CR inside string (malformed)
+tk_done:
+        stosb                   ; write the CR
+tk_finish:
+        pop si                  ; restore SI to body start
+        ret
+
+; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
+; 16 entries: PRINT IF GOTO LIST RUN NEW INPUT REM END LET POKE FREE HELP GOSUB RETURN THEN
+tk_kw_tab:
+        dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
+        dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
+        dw kw_help, kw_gosub, kw_return, kw_then
+        dw 0                    ; sentinel
+
 ; =============================================================================
 ; Keyword strings (bit-7 terminated; 0x00 sentinel ends do_help table)
 ; =============================================================================
@@ -1170,7 +1364,7 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.2.0"
+str_banner: db "uBASIC 8088 v1.3.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
