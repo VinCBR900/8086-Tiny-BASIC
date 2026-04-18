@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.3.0
+; uBASIC 8088  v1.3.1
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -40,6 +40,11 @@
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.3.1 (2026-04-18)  Bugfix release:
+;     - LIST: dl_eol now outputs CR+LF (was LF only)
+;     - Showcase (8bitworkshop): db data converted to tokenised form;
+;       saves 195 bytes of program store and makes LIST correct
+;     - Version string updated to v1.3.1
 ;   v1.3.0 (2026-04-17)  Tokenizer + line-editor refactor:
 ;     - Lines stored tokenized: keywords -> 0x80..0x8F (saves ~19% program store)
 ;     - LIST detokenizes on output (keywords printed uppercase)
@@ -517,10 +522,12 @@ dl_raw:
         call output
         jmp dl_body
 dl_eol:
-        mov al, 0x0a
+        mov al, 0x0d        ; CR
+        call output
+        mov al, 0x0a        ; LF
         call output
 
-        call next_line_ptr  ; Assuming this updates DI to the next record
+        call next_line_ptr
         jmp dl_lp
 
 ; =============================================================================
@@ -1364,7 +1371,7 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.3.0"
+str_banner: db "uBASIC 8088 v1.3.1"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1402,42 +1409,44 @@ ROM_END:
 %ifdef __YASM_MAJOR__
 	times PROGRAM - ($-$$) nop
 SHOWCASE_DATA:
-        db 0x0A,0x00,"REM uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
-        db 0x14,0x00,"PRINT ",0x22,"-- uBASIC 8088 v1.0.9 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.0.9 --"
-        db 0x1E,0x00,"PRINT ",0x22,"--- ARITHMETIC ---",0x22,0x0D  ; 30 PRINT "--- ARITHMETIC ---"
-        db 0x28,0x00,"PRINT ",0x22,"3+4=",0x22,";3+4;",0x22,"  6*7=",0x22,";6*7",0x0D  ; 40 PRINT "3+4=";3+4;"  6*7=";6*7
-        db 0x32,0x00,"PRINT ",0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 50 PRINT "20/4=";20/4;"  17%5=";17%5
-        db 0x3C,0x00,"PRINT ",0x22,"--- COMPARISONS ---",0x22,0x0D  ; 60 PRINT "--- COMPARISONS ---"
-        db 0x46,0x00,"IF 5>3 THEN PRINT ",0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
-        db 0x50,0x00,"IF 3<5 THEN PRINT ",0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
-        db 0x5A,0x00,"IF 3>=3 THEN PRINT ",0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
-        db 0x64,0x00,"IF 4<>3 THEN PRINT ",0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
-        db 0x6E,0x00,"PRINT ",0x22,"--- LOOP ---",0x22,0x0D  ; 110 PRINT "--- LOOP ---"
+; Tokenised showcase: keywords replaced by token bytes 0x80..0x8F.
+; REM=0x87 PRINT=0x80 IF=0x81 GOTO=0x82 THEN=0x8F END=0x88
+        db 0x0A,0x00,0x87,"uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
+        db 0x14,0x00,0x80,0x22,"-- uBASIC 8088 v1.3.1 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.3.1 --"
+        db 0x1E,0x00,0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D  ; 30 PRINT "--- ARITHMETIC ---"
+        db 0x28,0x00,0x80,0x22,"3+4=",0x22,";3+4;",0x22,"  6*7=",0x22,";6*7",0x0D  ; 40 PRINT "3+4=";3+4;"  6*7=";6*7
+        db 0x32,0x00,0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 50 PRINT "20/4=";20/4;"  17%5=";17%5
+        db 0x3C,0x00,0x80,0x22,"--- COMPARISONS ---",0x22,0x0D  ; 60 PRINT "--- COMPARISONS ---"
+        db 0x46,0x00,0x81,"5>3 ",0x8F,0x80,0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
+        db 0x50,0x00,0x81,"3<5 ",0x8F,0x80,0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
+        db 0x5A,0x00,0x81,"3>=3 ",0x8F,0x80,0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
+        db 0x64,0x00,0x81,"4<>3 ",0x8F,0x80,0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
+        db 0x6E,0x00,0x80,0x22,"--- LOOP ---",0x22,0x0D  ; 110 PRINT "--- LOOP ---"
         db 0x78,0x00,"I=1",0x0D  ; 120 I=1
-        db 0x82,0x00,"IF I>5 THEN GOTO 160",0x0D  ; 130 IF I>5 THEN GOTO 160
-        db 0x8C,0x00,"PRINT I;",0x0D  ; 140 PRINT I;
-        db 0x96,0x00,"I=I+1:GOTO 130",0x0D  ; 150 I=I+1:GOTO 130
-        db 0xA0,0x00,"PRINT ",0x22,0x22,0x0D  ; 160 PRINT ""
-        db 0xAA,0x00,"PRINT ",0x22,"--- MANDELBROT ---",0x22,0x0D  ; 170 PRINT "--- MANDELBROT ---"
+        db 0x82,0x00,0x81,"I>5 ",0x8F,0x82,"160",0x0D  ; 130 IF I>5 THEN GOTO 160
+        db 0x8C,0x00,0x80,"I;",0x0D  ; 140 PRINT I;
+        db 0x96,0x00,"I=I+1:",0x82,"130",0x0D  ; 150 I=I+1:GOTO 130
+        db 0xA0,0x00,0x80,0x22,0x22,0x0D  ; 160 PRINT ""
+        db 0xAA,0x00,0x80,0x22,"--- MANDELBROT ---",0x22,0x0D  ; 170 PRINT "--- MANDELBROT ---"
         db 0xB4,0x00,"I=-64",0x0D  ; 180 I=-64
-        db 0xBE,0x00,"IF I>56 THEN GOTO 400",0x0D  ; 190 IF I>56 THEN GOTO 400
+        db 0xBE,0x00,0x81,"I>56 ",0x8F,0x82,"400",0x0D  ; 190 IF I>56 THEN GOTO 400
         db 0xC8,0x00,"D=I",0x0D  ; 200 D=I
         db 0xD2,0x00,"C=-128",0x0D  ; 210 C=-128
-        db 0xDC,0x00,"IF C>16 THEN GOTO 370",0x0D  ; 220 IF C>16 THEN GOTO 370
+        db 0xDC,0x00,0x81,"C>16 ",0x8F,0x82,"370",0x0D  ; 220 IF C>16 THEN GOTO 370
         db 0xE6,0x00,"A=C:B=D:E=0:N=1",0x0D  ; 230 A=C:B=D:E=0:N=1
-        db 0xF0,0x00,"IF N>16 THEN GOTO 310",0x0D  ; 240 IF N>16 THEN GOTO 310
+        db 0xF0,0x00,0x81,"N>16 ",0x8F,0x82,"310",0x0D  ; 240 IF N>16 THEN GOTO 310
         db 0xFA,0x00,"T=A*A/64-B*B/64+C",0x0D  ; 250 T=A*A/64-B*B/64+C
         db 0x04,0x01,"B=2*A*B/64+D:A=T",0x0D  ; 260 B=2*A*B/64+D:A=T
-        db 0x0E,0x01,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-        db 0x18,0x01,"N=N+1:IF N<=16 THEN GOTO 240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
-        db 0x36,0x01,"IF E>0 THEN PRINT CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
-        db 0x40,0x01,"IF E=0 THEN PRINT CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
+        db 0x0E,0x01,0x81,"A*A/64+B*B/64>256 ",0x8F,0x81,"E=0 ",0x8F,"E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+        db 0x18,0x01,"N=N+1:",0x81,"N<=16 ",0x8F,0x82,"240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
+        db 0x36,0x01,0x81,"E>0 ",0x8F,0x80,"CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
+        db 0x40,0x01,0x81,"E=0 ",0x8F,0x80,"CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
         db 0x4A,0x01,"C=C+4",0x0D  ; 330 C=C+4
-        db 0x54,0x01,"GOTO 220",0x0D  ; 340 GOTO 220
-        db 0x72,0x01,"PRINT ",0x22,0x22,0x0D  ; 370 PRINT ""
+        db 0x54,0x01,0x82,"220",0x0D  ; 340 GOTO 220
+        db 0x72,0x01,0x80,0x22,0x22,0x0D  ; 370 PRINT ""
         db 0x7C,0x01,"I=I+6",0x0D  ; 380 I=I+6
-        db 0x86,0x01,"GOTO 190",0x0D  ; 390 GOTO 190
-        db 0x90,0x01,"END",0x0D  ; 400 END
+        db 0x86,0x01,0x82,"190",0x0D  ; 390 GOTO 190
+        db 0x90,0x01,0x88,0x0D  ; 400 END
         dw 0
 SHOWCASE_END:
 %endif
