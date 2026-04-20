@@ -1,14 +1,14 @@
 ; =============================================================================
-; uBASIC 8088  v1.3.1
+; uBASIC 8088  v1.4.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
 ; Target: <=2048 bytes code ROM, 4096 bytes RAM.
 ;
-; Re-engineered from uBASIC 65c02 v17.0 (same features, no tokenizer).
+; Re-engineered from uBASIC 65c02 v17.0, extended with tokenizer and FOR/NEXT.
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
-; Statements : PRINT IF..THEN GOTO GOSUB RETURN LET INPUT REM END RUN LIST NEW POKE FREE HELP
+; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM END RUN LIST NEW POKE FREE HELP
 ; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
 ; Numbers    : signed 16-bit (-32768..32767)
 ; Multi-stmt : colon separator ':'
@@ -21,7 +21,10 @@
 ; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
 ;
 ; Line store: <linenum_lo> <linenum_hi> <tokenized body> <CR>
-;   Token bytes 0x80..0x8F replace keywords; printable ASCII and CR pass through.
+;   Token bytes 0x80..0x93 replace keywords; printable ASCII and CR pass through.
+;   Stmt tokens 0x80..0x90 (NUM_TOKENS=17): PRINT IF GOTO LIST RUN NEW INPUT
+;     REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
+;   Sub-keyword tokens 0x91..0x93: THEN TO STEP
 ;   String literals (between quotes) and REM bodies stored verbatim.
 ;
 ; RAM layout (0x1000..0x1FFF, segment 0):
@@ -35,11 +38,25 @@
 ;   0x107C  ins_tmp     2 bytes   temp word for insline end-marker address
 ;   0x107E  gosub_sp    2 bytes   gosub stack depth counter (0..7)
 ;   0x1080  gosub_stk  16 bytes   gosub return-address stack (8 entries)
-;   0x1090  program     ...       program store (grows toward 0x1E00)
+;   0x1090  for_sp      2 bytes   FOR stack depth (0..3)
+;   0x1092  for_stk    32 bytes   FOR stack: 4 x {var_ptr,limit,step,loop_ptr}
+;   0x10B2  program     ...       program store (grows toward 0x1E00)
 ;   0x1E00  PROGRAM_TOP           top of program store / base of stack
 ;   0x1E00..0x1FFF                stack (512 bytes, SP init = 0x2000)
 ;
 ; History:
+;   v1.4.0 (2026-04-19)  FOR/NEXT with optional STEP:
+;     - FOR <var>=<start> TO <end> [STEP <step>]
+;     - NEXT <var>: increments var, loops if condition holds, unwinds nesting
+;     - Dedicated 4-entry FOR stack at FOR_SP(0x1090)/FOR_STK(0x1092)
+;     - PROGRAM moved 0x1090->0x10B2; costs 34 bytes of program store
+;     - Tokens: stmt TK_FOR=0x8F TK_NEXT=0x90; sub-kw TK_THEN=0x91 TK_TO=0x92 TK_STEP=0x93
+;     - Bugs fixed: kw_match clobbers DI->save var_ptr in INS_TMP; kw_match
+;       clobbers AX(AH)->set default step AFTER kw_match; input_number clobbers
+;       CX->push/pop CX around STEP expr; kw_next had wrong terminator T_X->T_T
+;     - do_poke: push/pop DI around value expr (same kw_match/DI issue)
+;     - Error ?6 = NEXT without FOR
+;     - Incorporates uploaded tweaks: dp_str in dl_kw_lp, new_line tail-call
 ;   v1.3.1 (2026-04-18)  Bugfix release:
 ;     - LIST: dl_eol now outputs CR+LF (was LF only)
 ;     - Showcase (8bitworkshop): db data converted to tokenised form;
@@ -129,7 +146,9 @@ RUN_NEXT:       equ 0x107A      ; word:  next-line pointer for run loop
 INS_TMP:        equ 0x107C      ; word:  insline end-marker temp
 GOSUB_SP:       equ 0x107E      ; word: gosub stack depth (0..7)
 GOSUB_STK:      equ 0x1080      ; 8 words: gosub return addresses
-PROGRAM:        equ 0x1090      ; program store starts here (was 0x107E)
+FOR_SP:         equ 0x1090      ; word: FOR stack depth (0..3)
+FOR_STK:        equ 0x1092      ; 4 x 8-byte frames: {var_ptr,limit,step,loop_ptr}
+PROGRAM:        equ 0x10B2      ; program store (was 0x1090, -34 bytes)
 PROG_END:       equ 0x1078      ; word:  one past last program byte
 PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
 STACK_TOP:      equ 0x2000      ; initial SP
@@ -141,6 +160,7 @@ ERR_OV:         equ 0x32
 ERR_OM:         equ 0x33  
 ERR_UK:         equ 0x34
 ERR_RT:         equ 0x35  ; RETURN without GOSUB
+ERR_NF:         equ 0x36  ; NEXT without FOR
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -175,8 +195,14 @@ TK_FREE:        equ 0x8B
 TK_HELP:        equ 0x8C
 TK_GOSUB:       equ 0x8D
 TK_RETURN:      equ 0x8E
-TK_THEN:        equ 0x8F
-NUM_TOKENS:     equ 16          ; TK_PRINT..TK_THEN
+; stmt dispatch range: TK_PRINT(0x80)..TK_NEXT(0x90), NUM_TOKENS=17 entries
+; sub-keywords TK_THEN/TK_TO/TK_STEP are >= 0x91 (not dispatched by stmt)
+TK_FOR:         equ 0x8F        ; st_tab index 15
+TK_NEXT:        equ 0x90        ; st_tab index 16
+NUM_TOKENS:     equ 17          ; stmt-dispatch tokens: TK_PRINT..TK_NEXT
+TK_THEN:        equ 0x91        ; sub-keyword (not in st_tab, outside dispatch)
+TK_TO:          equ 0x92        ; sub-keyword (FOR..TO)
+TK_STEP:        equ 0x93        ; sub-keyword (FOR..STEP)
 
 ; =============================================================================
 ; INIT  cold start; entered at 0x0000:0x7E00 by boot sector
@@ -198,7 +224,7 @@ start:
         ; Zero all RAM control area: VARS through end of Program
         mov di, VARS
         xor ax, ax
-        mov cx, 72      ; covers VARS..GOSUB_STK (0x1000..0x108F)
+        mov cx, 89      ; covers VARS..FOR_STK (0x1000..0x10B1)
 	rep stosw	; clear memory
         
 %ifdef __YASM_MAJOR__
@@ -496,8 +522,8 @@ dl_body:
         je  dl_eol
         cmp al, TK_PRINT        ; token? (0x80..0x8F)
         jb  dl_raw              ; < 0x80: plain char
-        cmp al, TK_PRINT + NUM_TOKENS
-        jnb dl_raw              ; >= 0x90: not a token
+        cmp al, TK_PRINT + NUM_TOKENS + 3  ; cover TK_FOR..TK_STEP (0x8F..0x93)
+        jnb dl_raw              ; >= 0x94: not a token
         ; detokenize: look up keyword string and print it
         sub al, TK_PRINT        ; index 0..15
         xor ah, ah
@@ -613,12 +639,14 @@ di_err:
 ; =============================================================================
 do_poke:
         call expr
-        mov di, ax
+        mov di, ax              ; DI = destination address
+        push di                 ; save: second expr's kw_match clobbers DI
         call spaces
         cmp byte [si], ','
         jne JERRSN
         inc si
-        call expr
+        call expr               ; AX = value to poke
+        pop di                  ; restore destination address
         mov [di], al
         ret
 JERRSN:
@@ -1323,12 +1351,160 @@ tk_finish:
         ret
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
-; 16 entries: PRINT IF GOTO LIST RUN NEW INPUT REM END LET POKE FREE HELP GOSUB RETURN THEN
+; 17 stmt entries + 3 sub-keyword entries
+; Stmt (0x80-0x90): PRINT IF GOTO LIST RUN NEW INPUT REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
+; Sub-kw (0x91-0x93): THEN TO STEP (not dispatched by stmt)
 tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
-        dw kw_help, kw_gosub, kw_return, kw_then
+        dw kw_help, kw_gosub, kw_return
+        dw kw_for, kw_next      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
+        dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
         dw 0                    ; sentinel
+
+
+; =============================================================================
+; DO_FOR  FOR <var> = <start> TO <end> [STEP <step>]
+; Frame layout in FOR_STK: var_ptr(w), limit(w), step(w), loop_ptr(w)
+; Inputs : SI -> line body after FOR token
+; Clobbers: AX, BX, CX, DX, DI
+; =============================================================================
+do_for:
+        call    spaces
+        call    get_var_addr    ; DI = &var (address in VARS array)
+        mov     [INS_TMP], di   ; save var_ptr: kw_match inside expr clobbers DI
+        ; parse '='
+        call    spaces
+        cmp     byte [si], '='
+        jne     df_syn
+        inc     si
+        call    expr            ; AX = start value (DI clobbered by kw_match)
+        mov     di, [INS_TMP]   ; restore &var
+        mov     [di], ax        ; initialise loop variable
+
+        ; parse TO (token or plain keyword)
+        call    spaces
+        cmp     byte [si], TK_TO
+        jne     df_to_kw
+        inc     si
+        jmp     df_parse_limit
+df_to_kw:
+        mov     bx, to_tab
+        call    kw_match
+        jc      df_syn          ; TO is mandatory
+df_parse_limit:
+        call    expr            ; AX = limit
+        mov     cx, ax          ; CX = limit (save while parsing STEP)
+
+        ; parse optional STEP (token or plain keyword); default = 1
+        call    spaces
+        push    cx              ; save limit: input_number (inside expr) clobbers CX
+        cmp     byte [si], TK_STEP
+        jne     df_step_kw
+        inc     si
+        jmp     df_parse_step
+df_step_kw:
+        mov     bx, step_tab
+        call    kw_match        ; CF=1 if no STEP keyword present
+        jc      df_default_step ; no STEP: use default 1
+df_parse_step:
+        call    expr            ; AX = explicit step value
+        jmp     df_have_step
+df_default_step:
+        mov     ax, 1           ; default step (set AFTER kw_match so AH is safe)
+df_have_step:
+        pop     cx              ; restore limit (was clobbered by input_number in expr)
+        ; DI=var_ptr  CX=limit  AX=step
+        ; Check stack depth
+        mov     dx, [FOR_SP]
+        cmp     dx, 4
+        jnb     df_syn          ; FOR stack overflow -> syntax error
+
+        ; frame offset = FOR_SP * 8
+        mov     bx, dx
+        add     bx, bx          ; *2
+        add     bx, bx          ; *4
+        add     bx, bx          ; *8
+        add     bx, FOR_STK     ; BX -> frame slot
+
+        ; write frame: var_ptr, limit, step, loop_ptr
+        mov     di, [INS_TMP]   ; reload var_ptr (kw_match clobbered DI)
+        mov     [bx],   di      ; var_ptr
+        mov     [bx+2], cx      ; limit
+        mov     [bx+4], ax      ; step
+        mov     ax, [RUN_NEXT]
+        mov     [bx+6], ax      ; loop_ptr = address of line AFTER FOR
+
+        inc     dx
+        mov     [FOR_SP], dx    ; bump depth
+        ret
+
+df_syn:
+        mov     al, ERR_SN
+        jmp     do_error
+
+; =============================================================================
+; DO_NEXT  NEXT <var>
+; Increments loop var, tests condition, loops or unwinds.
+; Inputs : SI -> line body after NEXT token
+; Clobbers: AX, BX, CX, DX, DI
+; =============================================================================
+do_next:
+        call    spaces
+        call    get_var_addr    ; DI = &var
+
+        ; search FOR_STK for frame matching this var_ptr (scan top-down)
+        mov     cx, [FOR_SP]
+        or      cx, cx
+        jz      dn_no_for       ; stack empty -> NEXT without FOR
+dn_search:
+        dec     cx
+        mov     bx, cx
+        add     bx, bx          ; *2
+        add     bx, bx          ; *4
+        add     bx, bx          ; *8
+        add     bx, FOR_STK     ; BX -> candidate frame
+        cmp     [bx], di        ; var_ptr match?
+        je      dn_found
+        or      cx, cx
+        jnz     dn_search
+        ; fell through without match
+dn_no_for:
+        mov     al, ERR_NF
+        jmp     do_error
+
+dn_found:
+        ; BX -> matched frame. CX = frame index.
+        ; step var
+        mov     ax, [bx+4]      ; AX = step
+        add     [di], ax        ; var += step
+        mov     ax, [di]        ; AX = new var value
+        mov     dx, [bx+2]      ; DX = limit
+
+        ; test: if step >= 0 then continue while var <= limit
+        ;       if step <  0 then continue while var >= limit
+        cmp     word [bx+4], 0
+        jl      dn_neg_step
+        ; positive step: var <= limit ?
+        cmp     ax, dx
+        jle     dn_loop
+        jmp     dn_done
+dn_neg_step:
+        ; negative step: var >= limit ?
+        cmp     ax, dx
+        jge     dn_loop
+        ; fall through to dn_done
+
+dn_done:
+        ; loop ended: unwind stack down to and including this frame
+        mov     [FOR_SP], cx    ; FOR_SP = matched frame index (pops this + any nested)
+        ret                     ; continue past NEXT line
+
+dn_loop:
+        ; loop continues: jump back to saved loop_ptr
+        mov     ax, [bx+6]      ; loop_ptr = address of line after FOR
+        mov     [RUN_NEXT], ax
+        ret
 
 ; =============================================================================
 ; Keyword strings (bit-7 terminated; 0x00 sentinel ends do_help table)
@@ -1349,6 +1525,10 @@ kw_free:    db 0x46,0x52,0x45,T_E
 kw_help:    db 0x48,0x45,0x4c,T_P
 kw_gosub:   db 0x47,0x4f,0x53,0x55,T_B   ; GOSUB
 kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N  ; RETURN
+kw_for:     db 0x46,0x4F,T_R                  ; FOR  (F,O,R+0x80)
+kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT (N,E,X,T+0x80)
+kw_to:      db 0x54,T_O                       ; TO   (T,O+0x80)
+kw_step:    db 0x53,0x54,0x45,T_P             ; STEP (S,T,E,P+0x80)
 ; not commands but still want to print in help
 kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
@@ -1360,7 +1540,7 @@ kw_usr:     db 0x55,0x53,T_R
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.3.1"
+str_banner: db "uBASIC 8088 v1.4.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1380,12 +1560,16 @@ st_tab:
         dw kw_help,     do_help
         dw kw_gosub,    do_gosub
         dw kw_return,   do_return
+        dw kw_for,      do_for
+        dw kw_next,     do_next
         dw 0
         ; non commands but still match
 peek_tab:       dw kw_peek
 usr_tab:        dw kw_usr
 then_tab:       dw kw_then
 chrs_tab:       dw kw_chrs
+to_tab:         dw kw_to
+step_tab:       dw kw_step
 
 ROM_END:	
 
@@ -1399,37 +1583,43 @@ ROM_END:
 	times PROGRAM - ($-$$) nop
 SHOWCASE_DATA:
 ; Tokenised showcase: keywords replaced by token bytes 0x80..0x8F.
-; REM=0x87 PRINT=0x80 IF=0x81 GOTO=0x82 THEN=0x8F END=0x88
+; REM=0x87 PRINT=0x80 IF=0x81 GOTO=0x82 THEN=0x91 END=0x88
+; FOR=0x8F NEXT=0x90 TO=0x92
         db 0x0A,0x00,0x87,"uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
-        db 0x14,0x00,0x80,0x22,"-- uBASIC 8088 v1.3.1 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.3.1 --"
+        db 0x14,0x00,0x80,0x22,"-- uBASIC 8088 v1.4.0 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.4.0 --"
         db 0x1E,0x00,0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D  ; 30 PRINT "--- ARITHMETIC ---"
         db 0x28,0x00,0x80,0x22,"3+4=",0x22,";3+4;",0x22,"  6*7=",0x22,";6*7",0x0D  ; 40 PRINT "3+4=";3+4;"  6*7=";6*7
         db 0x32,0x00,0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 50 PRINT "20/4=";20/4;"  17%5=";17%5
         db 0x3C,0x00,0x80,0x22,"--- COMPARISONS ---",0x22,0x0D  ; 60 PRINT "--- COMPARISONS ---"
-        db 0x46,0x00,0x81,"5>3 ",0x8F,0x80,0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
-        db 0x50,0x00,0x81,"3<5 ",0x8F,0x80,0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
-        db 0x5A,0x00,0x81,"3>=3 ",0x8F,0x80,0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
-        db 0x64,0x00,0x81,"4<>3 ",0x8F,0x80,0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
+        db 0x46,0x00,0x81,"5>3 ",0x91,0x80,0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
+        db 0x50,0x00,0x81,"3<5 ",0x91,0x80,0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
+        db 0x5A,0x00,0x81,"3>=3 ",0x91,0x80,0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
+        db 0x64,0x00,0x81,"4<>3 ",0x91,0x80,0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
         db 0x6E,0x00,0x80,0x22,"--- LOOP ---",0x22,0x0D  ; 110 PRINT "--- LOOP ---"
         db 0x78,0x00,"I=1",0x0D  ; 120 I=1
-        db 0x82,0x00,0x81,"I>5 ",0x8F,0x82,"160",0x0D  ; 130 IF I>5 THEN GOTO 160
+        db 0x82,0x00,0x81,"I>5 ",0x91,0x82,"160",0x0D  ; 130 IF I>5 THEN GOTO 160
         db 0x8C,0x00,0x80,"I;",0x0D  ; 140 PRINT I;
         db 0x96,0x00,"I=I+1:",0x82,"130",0x0D  ; 150 I=I+1:GOTO 130
         db 0xA0,0x00,0x80,0x22,0x22,0x0D  ; 160 PRINT ""
+        db 0xA1,0x00,0x80,0x22,"--- FOR/NEXT ---",0x22,0x0D  ; 161 PRINT "--- FOR/NEXT ---"
+        db 0xA2,0x00,0x8F,"I=1 ",0x92,"5",0x0D  ; 162 FOR I=1 TO 5
+        db 0xA3,0x00,0x80,"I;",0x0D  ; 163 PRINT I;
+        db 0xA4,0x00,0x90,"I",0x0D  ; 164 NEXT I
+        db 0xA5,0x00,0x80,0x22,0x22,0x0D  ; 165 PRINT ""
         db 0xAA,0x00,0x80,0x22,"--- MANDELBROT ---",0x22,0x0D  ; 170 PRINT "--- MANDELBROT ---"
         db 0xB4,0x00,"I=-64",0x0D  ; 180 I=-64
-        db 0xBE,0x00,0x81,"I>56 ",0x8F,0x82,"400",0x0D  ; 190 IF I>56 THEN GOTO 400
+        db 0xBE,0x00,0x81,"I>56 ",0x91,0x82,"400",0x0D  ; 190 IF I>56 THEN GOTO 400
         db 0xC8,0x00,"D=I",0x0D  ; 200 D=I
         db 0xD2,0x00,"C=-128",0x0D  ; 210 C=-128
-        db 0xDC,0x00,0x81,"C>16 ",0x8F,0x82,"370",0x0D  ; 220 IF C>16 THEN GOTO 370
+        db 0xDC,0x00,0x81,"C>16 ",0x91,0x82,"370",0x0D  ; 220 IF C>16 THEN GOTO 370
         db 0xE6,0x00,"A=C:B=D:E=0:N=1",0x0D  ; 230 A=C:B=D:E=0:N=1
-        db 0xF0,0x00,0x81,"N>16 ",0x8F,0x82,"310",0x0D  ; 240 IF N>16 THEN GOTO 310
+        db 0xF0,0x00,0x81,"N>16 ",0x91,0x82,"310",0x0D  ; 240 IF N>16 THEN GOTO 310
         db 0xFA,0x00,"T=A*A/64-B*B/64+C",0x0D  ; 250 T=A*A/64-B*B/64+C
         db 0x04,0x01,"B=2*A*B/64+D:A=T",0x0D  ; 260 B=2*A*B/64+D:A=T
-        db 0x0E,0x01,0x81,"A*A/64+B*B/64>256 ",0x8F,0x81,"E=0 ",0x8F,"E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-        db 0x18,0x01,"N=N+1:",0x81,"N<=16 ",0x8F,0x82,"240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
-        db 0x36,0x01,0x81,"E>0 ",0x8F,0x80,"CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
-        db 0x40,0x01,0x81,"E=0 ",0x8F,0x80,"CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
+        db 0x0E,0x01,0x81,"A*A/64+B*B/64>256 ",0x91,0x81,"E=0 ",0x8F,"E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+        db 0x18,0x01,"N=N+1:",0x81,"N<=16 ",0x91,0x82,"240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
+        db 0x36,0x01,0x81,"E>0 ",0x91,0x80,"CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
+        db 0x40,0x01,0x81,"E=0 ",0x91,0x80,"CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
         db 0x4A,0x01,"C=C+4",0x0D  ; 330 C=C+4
         db 0x54,0x01,0x82,"220",0x0D  ; 340 GOTO 220
         db 0x72,0x01,0x80,0x22,0x22,0x0D  ; 370 PRINT ""
