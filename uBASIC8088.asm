@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.4.0
+; uBASIC 8088  v1.5.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -83,10 +83,6 @@
 ;       prevents stale data confusing walk_lines after future LOAD/SAVE.
 ;     - equ "0".."4" changed to equ 0x30..0x34 (tinyasm compatibility).
 ;     - dp_str_eol dead label removed.
-;   v1.0.9+ COM_BUILD: %ifdef COM_BUILD assembles as DOS .COM (ORG 0x0100)
-;            for cross-checking in 8bitworkshop/DOSBox. I/O unchanged
-;            (INT 10h display, INT 16h keyboard). RAM 0x1000-0x1FFF
-;            stays well above PSP. Build: tinyasm -f com ... (uses -DCOM_BUILD).
 ;   v1.0.9 (2026-04-12)  Expand IBUF 34->64 bytes; input limit 32->62 chars.
 ;                         Fixes silent truncation of long lines (e.g. nested
 ;                         IF with multi-digit numbers). Embed Mandelbrot
@@ -124,34 +120,41 @@
 
         	cpu 8086
                 
-	; configure Program origin based on Target Platform                
+	; Configure origin and RAM base for target platform
 %ifdef __YASM_MAJOR__
-    		SECTION .text	; running under 8 bit workshop
-ORIGIN:		equ 0    
+        SECTION .text           ; 8bitworkshop: origin=0, segment 0
+ORIGIN:         equ 0
+RAM_BASE:       equ 0x1000
 
-%elifdef	COM_BUILD	; testing with freedos
-ORIGIN: 	equ 0x0100      ; DOS COM file: PSP at 0x0000, code at 0x0100
+%elifdef ROM                    ; Standalone ROM: 2KB at 0xF800, RAM at 0x0000
+ORIGIN:         equ 0xF800
+RAM_BASE:       equ 0x0000
 
-%else
-ORIGIN:  	equ 0x7E00      ; ROM: boot sector loads to 0x0000:0x7E00
+%else                           ; 8086tiny batch test: boot sector loads to 0x7E00
+ORIGIN:         equ 0x7E00
+RAM_BASE:       equ 0x1000
+
 %endif
-		org ORIGIN
+        org ORIGIN
         
-; --- RAM addresses (segment 0 offsets) ---------------------------------------
-VARS:           equ 0x1000      ; 52 bytes: A-Z variables (word each)
-RUNNING:        equ 0x1034      ; byte:  0=immediate, 1=running
-CURLN:          equ 0x1036      ; word:  current line number (error reports)
-IBUF:           equ 0x1038      ; 64 bytes: input line buffer (max 62 chars+CR)
-RUN_NEXT:       equ 0x107A      ; word:  next-line pointer for run loop
-INS_TMP:        equ 0x107C      ; word:  insline end-marker temp
-GOSUB_SP:       equ 0x107E      ; word: gosub stack depth (0..7)
-GOSUB_STK:      equ 0x1080      ; 8 words: gosub return addresses
-FOR_SP:         equ 0x1090      ; word: FOR stack depth (0..3)
-FOR_STK:        equ 0x1092      ; 4 x 8-byte frames: {var_ptr,limit,step,loop_ptr}
-PROGRAM:        equ 0x10B2      ; program store (was 0x1090, -34 bytes)
-PROG_END:       equ 0x1078      ; word:  one past last program byte
-PROGRAM_TOP:    equ 0x1E00      ; top of program store / base of stack
-STACK_TOP:      equ 0x2000      ; initial SP
+; --- RAM layout (all relative to RAM_BASE) ----------------------------------
+RAM_SIZE:       equ 4096
+DIV0:           equ RAM_BASE + 0x000    ; 4 bytes: divide-by-zero vector (ROM)
+CURLN:          equ RAM_BASE + 0x004    ; word:  current line number (error reports)
+RUN_NEXT:       equ RAM_BASE + 0x006    ; word:  next-line pointer for run loop
+NMI:            equ RAM_BASE + 0x008    ; 4 bytes: NMI vector (ROM)
+IBUF:           equ RAM_BASE + 0x00C    ; 64 bytes: input line buffer
+INS_TMP:        equ RAM_BASE + 0x04C    ; word:  insline / do_for var_ptr scratch
+GOSUB_SP:       equ RAM_BASE + 0x04E    ; word: gosub stack depth (0..7)
+GOSUB_STK:      equ RAM_BASE + 0x050    ; 16 bytes: 8 gosub return addresses
+FOR_SP:         equ RAM_BASE + 0x060    ; word: FOR stack depth (0..3)
+FOR_STK:        equ RAM_BASE + 0x062    ; 32 bytes: 4 x 8-byte FOR frames
+VARS:           equ RAM_BASE + 0x082    ; 52 bytes: A-Z variables (word each)
+RUNNING:        equ RAM_BASE + 0x0B6    ; byte:  0=immediate, 1=running
+PROG_END:       equ RAM_BASE + 0x0B7    ; word:  one past last program byte
+PROGRAM:        equ RAM_BASE + 0x0B9    ; program store start
+STACK_TOP:      equ RAM_BASE + RAM_SIZE ; initial SP
+PROGRAM_TOP:    equ STACK_TOP - 0x100   ; 256-byte stack reserve
 
 ; --- Error codes -------------------------------------------------------------
 ERR_SN:         equ 0x30  
@@ -209,8 +212,21 @@ TK_STEP:        equ 0x93        ; sub-keyword (FOR..STEP)
 ; Clobbers: everything
 ; =============================================================================
 start:
-%ifndef COM_BUILD
-	; Ensure CS=DS=ES=SS since 8bitworkshop produces EXE file
+%ifdef ROM
+        ; ROM target: hardware vectors, no segment setup needed (CS already 0xF800)
+        ; Set up segment registers and stack in RAM
+        xor ax, ax
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, STACK_TOP
+        ; Install interrupt vectors in RAM
+        mov word [DIV0],   divide_error
+        mov word [DIV0+2], 0xF800
+        mov word [NMI],    nmi_handler
+        mov word [NMI+2],  0xF800
+%else
+        ; 8bitworkshop / 8086tiny: ensure CS=DS=ES=SS=0
         push cs
         pop ds
         push cs
@@ -219,14 +235,15 @@ start:
         pop ss
         mov sp, STACK_TOP
 %endif
-	cld
+        cld
 
-        ; Zero all RAM control area: VARS through end of Program
-        mov di, VARS
+        ; Zero RAM control area: DIV0 through PROG_END (stops before PROGRAM)
+        ; (PROGRAM - RAM_BASE)/2 = 0xB9/2 = 92 words: covers 0x000..0x0B7
+        mov di, RAM_BASE
         xor ax, ax
-        mov cx, 89      ; covers VARS..FOR_STK (0x1000..0x10B1)
-	rep stosw	; clear memory
-        
+        mov cx, (PROGRAM - RAM_BASE) / 2
+        rep stosw
+
 %ifdef __YASM_MAJOR__
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %else
@@ -1574,58 +1591,71 @@ step_tab:       dw kw_step
 ROM_END:	
 
 ; =============================================================================
-; Pre-loaded showcase + Mandelbrot program (8BitWorkshop Only)
-; Type RUN to execute, NEW to clear.
-; Lines 10-160: feature demos.  Lines 170-400: Mandelbrot renderer.
-; Fixed-point arithmetic (scale 1/64), 16 iterations, ASCII density display.
+; Pre-loaded showcase (8BitWorkshop only).  Type RUN to execute, NEW to clear.
+;
+; Feature demos   lines 10-190 : arithmetic, comparisons, FOR/NEXT, GOSUB
+; Mandelbrot      lines 200-340: FOR loops for rows/cols, GOSUB 600 for escape
+; Subroutines     500=sum1..10, 550=factorial5, 600=record-escape
+;
+; Fixed-point scale 1/64.  16 Mandelbrot iterations.  ASCII density chars.
+; Tokens: PRINT=0x80 IF=0x81 GOSUB=0x8D RETURN=0x8E END=0x88
+;         FOR=0x8F NEXT=0x90 THEN=0x91 TO=0x92 STEP=0x93 REM=0x87
 ; =============================================================================
 %ifdef __YASM_MAJOR__
-	times PROGRAM - ($-$$) nop
+        times PROGRAM - ($-$$) nop
 SHOWCASE_DATA:
-; Tokenised showcase: keywords replaced by token bytes 0x80..0x8F.
-; REM=0x87 PRINT=0x80 IF=0x81 GOTO=0x82 THEN=0x91 END=0x88
-; FOR=0x8F NEXT=0x90 TO=0x92
-        db 0x0A,0x00,0x87,"uBASIC 8088 - SHOWCASE",0x0D  ; 10 REM uBASIC 8088 - SHOWCASE
-        db 0x14,0x00,0x80,0x22,"-- uBASIC 8088 v1.4.0 --",0x22,0x0D  ; 20 PRINT "-- uBASIC 8088 v1.4.0 --"
-        db 0x1E,0x00,0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D  ; 30 PRINT "--- ARITHMETIC ---"
-        db 0x28,0x00,0x80,0x22,"3+4=",0x22,";3+4;",0x22,"  6*7=",0x22,";6*7",0x0D  ; 40 PRINT "3+4=";3+4;"  6*7=";6*7
-        db 0x32,0x00,0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 50 PRINT "20/4=";20/4;"  17%5=";17%5
-        db 0x3C,0x00,0x80,0x22,"--- COMPARISONS ---",0x22,0x0D  ; 60 PRINT "--- COMPARISONS ---"
-        db 0x46,0x00,0x81,"5>3 ",0x91,0x80,0x22,"5>3 ok",0x22,0x0D  ; 70 IF 5>3 THEN PRINT "5>3 ok"
-        db 0x50,0x00,0x81,"3<5 ",0x91,0x80,0x22,"3<5 ok",0x22,0x0D  ; 80 IF 3<5 THEN PRINT "3<5 ok"
-        db 0x5A,0x00,0x81,"3>=3 ",0x91,0x80,0x22,"3>=3 ok",0x22,0x0D  ; 90 IF 3>=3 THEN PRINT "3>=3 ok"
-        db 0x64,0x00,0x81,"4<>3 ",0x91,0x80,0x22,"4<>3 ok",0x22,0x0D  ; 100 IF 4<>3 THEN PRINT "4<>3 ok"
-        db 0x6E,0x00,0x80,0x22,"--- LOOP ---",0x22,0x0D  ; 110 PRINT "--- LOOP ---"
-        db 0x78,0x00,"I=1",0x0D  ; 120 I=1
-        db 0x82,0x00,0x81,"I>5 ",0x91,0x82,"160",0x0D  ; 130 IF I>5 THEN GOTO 160
-        db 0x8C,0x00,0x80,"I;",0x0D  ; 140 PRINT I;
-        db 0x96,0x00,"I=I+1:",0x82,"130",0x0D  ; 150 I=I+1:GOTO 130
-        db 0xA0,0x00,0x80,0x22,0x22,0x0D  ; 160 PRINT ""
-        db 0xA1,0x00,0x80,0x22,"--- FOR/NEXT ---",0x22,0x0D  ; 161 PRINT "--- FOR/NEXT ---"
-        db 0xA2,0x00,0x8F,"I=1 ",0x92,"5",0x0D  ; 162 FOR I=1 TO 5
-        db 0xA3,0x00,0x80,"I;",0x0D  ; 163 PRINT I;
-        db 0xA4,0x00,0x90,"I",0x0D  ; 164 NEXT I
-        db 0xA5,0x00,0x80,0x22,0x22,0x0D  ; 165 PRINT ""
-        db 0xAA,0x00,0x80,0x22,"--- MANDELBROT ---",0x22,0x0D  ; 170 PRINT "--- MANDELBROT ---"
-        db 0xB4,0x00,"I=-64",0x0D  ; 180 I=-64
-        db 0xBE,0x00,0x81,"I>56 ",0x91,0x82,"400",0x0D  ; 190 IF I>56 THEN GOTO 400
-        db 0xC8,0x00,"D=I",0x0D  ; 200 D=I
-        db 0xD2,0x00,"C=-128",0x0D  ; 210 C=-128
-        db 0xDC,0x00,0x81,"C>16 ",0x91,0x82,"370",0x0D  ; 220 IF C>16 THEN GOTO 370
-        db 0xE6,0x00,"A=C:B=D:E=0:N=1",0x0D  ; 230 A=C:B=D:E=0:N=1
-        db 0xF0,0x00,0x81,"N>16 ",0x91,0x82,"310",0x0D  ; 240 IF N>16 THEN GOTO 310
-        db 0xFA,0x00,"T=A*A/64-B*B/64+C",0x0D  ; 250 T=A*A/64-B*B/64+C
-        db 0x04,0x01,"B=2*A*B/64+D:A=T",0x0D  ; 260 B=2*A*B/64+D:A=T
-        db 0x0E,0x01,0x81,"A*A/64+B*B/64>256 ",0x91,0x81,"E=0 ",0x8F,"E=N",0x0D  ; 270 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-        db 0x18,0x01,"N=N+1:",0x81,"N<=16 ",0x91,0x82,"240",0x0D  ; 280 N=N+1:IF N<=16 THEN GOTO 240
-        db 0x36,0x01,0x81,"E>0 ",0x91,0x80,"CHR$(E+32);",0x0D  ; 310 IF E>0 THEN PRINT CHR$(E+32);
-        db 0x40,0x01,0x81,"E=0 ",0x91,0x80,"CHR$(32);",0x0D  ; 320 IF E=0 THEN PRINT CHR$(32);
-        db 0x4A,0x01,"C=C+4",0x0D  ; 330 C=C+4
-        db 0x54,0x01,0x82,"220",0x0D  ; 340 GOTO 220
-        db 0x72,0x01,0x80,0x22,0x22,0x0D  ; 370 PRINT ""
-        db 0x7C,0x01,"I=I+6",0x0D  ; 380 I=I+6
-        db 0x86,0x01,0x82,"190",0x0D  ; 390 GOTO 190
-        db 0x90,0x01,0x88,0x0D  ; 400 END
-        dw 0
+        ; ── Feature demos ────────────────────────────────────────────────────
+        db 0x0A,0x00,0x87,"uBASIC 8088 v1.5.0 showcase",0x0D         ; 10  REM ...
+        db 0x14,0x00,0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D         ; 20  PRINT
+        db 0x1E,0x00,0x80,0x22,"2+3=",0x22,";2+3;",0x22,"  6*7=",0x22,";6*7",0x0D   ; 30
+        db 0x28,0x00,0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D ; 40
+        db 0x32,0x00,0x80,0x22,"--- COMPARISONS ---",0x22,0x0D        ; 50
+        db 0x3C,0x00,0x81,"5>3 ",0x91,0x80,0x22,"5>3 ok",0x22,0x0D   ; 60  IF THEN PRINT
+        db 0x46,0x00,0x81,"3<5 ",0x91,0x80,0x22,"3<5 ok",0x22,0x0D   ; 70
+        db 0x50,0x00,0x81,"3>=3 ",0x91,0x80,0x22,"3>=3 ok",0x22,0x0D ; 80
+        db 0x5A,0x00,0x81,"4<>3 ",0x91,0x80,0x22,"4<>3 ok",0x22,0x0D ; 90
+        db 0x64,0x00,0x80,0x22,"--- FOR/NEXT ---",0x22,0x0D           ; 100
+        db 0x6E,0x00,0x8F,"I=1 ",0x92,"5",0x0D                       ; 110 FOR I=1 TO 5
+        db 0x78,0x00,0x80,"I;",0x0D                                   ; 120 PRINT I;
+        db 0x82,0x00,0x90,"I",0x0D                                    ; 130 NEXT I
+        db 0x8C,0x00,0x80,0x22,0x22,0x0D                              ; 140 PRINT ""
+        db 0x96,0x00,0x80,0x22,"--- GOSUB ---",0x22,0x0D              ; 150
+        db 0xA0,0x00,0x8D,"500",0x0D                                  ; 160 GOSUB 500 (sum)
+        db 0xA5,0x00,0x80,0x22,"sum 1..10=",0x22,";S",0x0D           ; 165 PRINT result
+        db 0xAA,0x00,0x8D,"550",0x0D                                  ; 170 GOSUB 550 (fact)
+        db 0xAF,0x00,0x80,0x22,"5!=",0x22,";F",0x0D                  ; 175 PRINT result
+        db 0xB4,0x00,0x80,0x22,0x22,0x0D                              ; 180 PRINT ""
+        ; ── Mandelbrot ───────────────────────────────────────────────────────
+        db 0xBE,0x00,0x80,0x22,"--- MANDELBROT ---",0x22,0x0D         ; 190
+        db 0xC8,0x00,0x8F,"I=-64 ",0x92,"56 ",0x93,"6",0x0D           ; 200 FOR I=-64 TO 56 STEP 6
+        db 0xD2,0x00,0x8F,"C=-128 ",0x92,"16 ",0x93,"4",0x0D          ; 210 FOR C=-128 TO 16 STEP 4
+        db 0xDC,0x00,"D=I:A=C:B=D:E=0",0x0D                           ; 220 init row
+        db 0xE6,0x00,0x8F,"N=1 ",0x92,"16",0x0D                       ; 230 FOR N=1 TO 16
+        db 0xF0,0x00,"T=A*A/64-B*B/64+C",0x0D                         ; 240 iterate
+        db 0xFA,0x00,"B=2*A*B/64+D:A=T",0x0D                          ; 250
+        db 0x04,0x01,0x81,"A*A/64+B*B/64>256 ",0x91,0x8D,"600",0x0D  ; 260 IF escaped GOSUB 600
+        db 0x0E,0x01,0x90,"N",0x0D                                     ; 270 NEXT N
+        db 0x18,0x01,0x81,"E>0 ",0x91,0x80,"CHR$(E+32);",0x0D         ; 280 print density
+        db 0x22,0x01,0x81,"E=0 ",0x91,0x80,"CHR$(32);",0x0D           ; 290 print space
+        db 0x2C,0x01,0x90,"C",0x0D                                     ; 300 NEXT C
+        db 0x36,0x01,0x80,0x22,0x22,0x0D                               ; 310 PRINT "" (newline)
+        db 0x40,0x01,0x90,"I",0x0D                                     ; 320 NEXT I
+        db 0x4A,0x01,0x88,0x0D                                         ; 330 END
+        ; ── Subroutine 500: sum 1..10 ─────────────────────────────────────────
+        db 0xF4,0x01,"S=0",0x0D                                        ; 500
+        db 0xFE,0x01,0x8F,"J=1 ",0x92,"10",0x0D                       ; 510 FOR J=1 TO 10
+        db 0x08,0x02,"S=S+J",0x0D                                      ; 520
+        db 0x12,0x02,0x90,"J",0x0D                                     ; 530 NEXT J
+        db 0x1C,0x02,0x8E,0x0D                                         ; 540 RETURN
+        ; ── Subroutine 550: factorial 5 ───────────────────────────────────────
+        db 0x26,0x02,"F=1",0x0D                                        ; 550
+        db 0x30,0x02,0x8F,"K=1 ",0x92,"5",0x0D                        ; 560 FOR K=1 TO 5
+        db 0x3A,0x02,"F=F*K",0x0D                                      ; 570
+        db 0x44,0x02,0x90,"K",0x0D                                     ; 580 NEXT K
+        db 0x4E,0x02,0x8E,0x0D                                         ; 590 RETURN
+        ; ── Subroutine 600: record escape iteration ───────────────────────────
+        db 0x58,0x02,0x81,"E=0 ",0x91,"E=N",0x0D                      ; 600 IF E=0 THEN E=N
+        db 0x62,0x02,0x8E,0x0D                                         ; 610 RETURN
+        dw 0                                                            ; end sentinel
 SHOWCASE_END:
 %endif
