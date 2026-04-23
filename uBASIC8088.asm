@@ -765,30 +765,35 @@ expr:
         ret
 
 .do_rel:
-        push    dx              ; save operator mask
-        call    expr_add        ; right operand -> AX
-        pop     dx              ; restore mask (DL)
+        push    dx              ; Save operator mask
+        call    expr_add        ; Right operand -> AX
+        pop     dx              ; Restore mask (DL)
         pop     bx              ; BX = left operand
 
-        cmp     bx, ax          ; compare left vs right (sets SF,OF,ZF,CF)
-        ; branch FIRST on cmp flags before any instruction clobbers them
-        jl      .is_lt          ; SF!=OF -> less-than
-        jg      .is_gt          ; ZF=0 and SF=OF -> greater-than
-        mov     al, 2           ; equal: EQ bit
-        jmp short .check
-.is_lt: mov     al, 1           ; less-than: LT bit
-        jmp short .check
-.is_gt: mov     al, 4           ; greater-than: GT bit
-        ; AL now has the result bit; AH has garbage from right operand
-.check: xor     ah, ah          ; zero AH (doesn't affect SF/OF/ZF from branches - already past them)
-        test    al, dl          ; does result bit match operator mask?
-        jz      rel_f           ; no: false
-        xor     ax, ax          ; yes: zero AX (AL had 1/2/4; AH already 0)
-        dec     ax              ; 0xFFFF = true
-ea_ret:
+        cmp     bx, ax          ; Compare left vs right
+        
+        ; 1. Generate 'Equal' bit (Bit 1 / value 2)
+        mov     ax, 2           ; Assume equal (2 bytes)
+        jz      .check          ; If ZF=1, we are done with AL=2 (2 bytes)
+
+        ; 2. Generate 'LT' (1) or 'GT' (4) bit
+        ; If we are here, ZF=0.
+        sbb     ax, ax          ; If BX < AX (signed), CF is often not enough for signed... 
+                                ; Better: use the actual signed flags.
+        jl      .set_lt
+        mov     al, 4           ; GT bit
+        jmp     short .check
+.set_lt:
+        mov     al, 1           ; LT bit
+
+.check:
+        test    al, dl
+        mov     ax, 0           ; Clear AX (shorter than xor/dec combo for logic)
+        jz      .done           ; If test fails, return 0
+        dec     ax              ; Result is -1 (0xFFFF)
+.done:
 e1_ret:
-        ret
-rel_f:  xor     ax, ax          ; false: AX = 0
+ea_ret:
         ret
 
 ; =============================================================================
