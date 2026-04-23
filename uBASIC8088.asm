@@ -1425,19 +1425,6 @@ tk_finish:
         pop si                  ; restore SI to body start
         ret
 
-; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
-; 17 stmt entries + 3 sub-keyword entries
-; Stmt (0x80-0x90): PRINT IF GOTO LIST RUN NEW INPUT REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
-; Sub-kw (0x91-0x93): THEN TO STEP (not dispatched by stmt)
-tk_kw_tab:
-        dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
-        dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
-        dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
-        dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
-        dw 0                    ; sentinel
-
-
 ; =============================================================================
 ; DO_FOR  FOR <var> = <start> TO <end> [STEP <step>]
 ; Frame layout in FOR_STK: var_ptr(w), limit(w), step(w), loop_ptr(w)
@@ -1488,7 +1475,6 @@ df_parse_step:
 df_default_step:
         mov     ax, 1           ; default step (set AFTER kw_match so AH is safe)
 df_have_step:
-        pop     cx              ; restore limit (was clobbered by input_number in expr)
         ; DI=var_ptr  CX=limit  AX=step
         ; Check stack depth
         mov     dx, [FOR_SP]
@@ -1497,10 +1483,11 @@ df_have_step:
 
         ; frame offset = FOR_SP * 8
         mov     bx, dx
-        add     bx, bx          ; *2
-        add     bx, bx          ; *4
-        add     bx, bx          ; *8
+	mov 	cl, 3
+	shl 	bx,cl      
         add     bx, FOR_STK     ; BX -> frame slot
+
+	pop     cx              ; restore limit (was clobbered by input_number in expr)
 
         ; write frame: var_ptr, limit, step, loop_ptr
         mov     di, [INS_TMP]   ; reload var_ptr (kw_match clobbered DI)
@@ -1612,6 +1599,19 @@ kw_usr:     db 0x55,0x53,T_R
 
             db 0
 
+; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
+; 17 stmt entries + 3 sub-keyword entries
+; Stmt (0x80-0x90): PRINT IF GOTO LIST RUN NEW INPUT REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
+; Sub-kw (0x91-0x93): THEN TO STEP (not dispatched by stmt)
+tk_kw_tab:
+        dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
+        dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
+        dw kw_help, kw_gosub, kw_return
+        dw kw_for, kw_next      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
+        dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
+        dw 0                    ; sentinel
+
+
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
@@ -1649,4 +1649,3 @@ step_tab:       dw kw_step
 %ifndef ROM
 ROM_END:	db 0	; so we can see the label
 %endif
-
