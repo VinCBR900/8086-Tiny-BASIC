@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.4.1
+; uBASIC 8088  v1.5.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -27,6 +27,20 @@
 ;   String literals (between quotes) and REM bodies stored verbatim.
 ;
 ; History:
+;   v1.5.0 (2026-04-23)  ROM target integration + showcase fixes:
+;     - %ifdef ordering: ROM first so -dROM=1 wins over __YASM_MAJOR__
+;     - RAM_SIZE conditional: 2KB for ROM (2KB RAM), 4KB for others
+;     - ROM serial init: 8755 DDR setup + TX idle before interpreter start
+;     - ROM interrupt vectors: CS=0xF800 written at init
+;     - divide_error: prints ?2 then re-enters interpreter (do_error_hw)
+;     - nmi_handler: prints ?B then re-enters interpreter (do_error_hw)
+;     - do_error_hw: resets SP then calls do_error (safe from any context)
+;     - bdly: bit-period delay routine for bitbang serial (BAUD=60@5MHz)
+;     - output/input_key: conditional on %ifdef ROM (bitbang vs BIOS)
+;     - Reset vector stub at 0xFFF0: near JMP to start, padded 0xFF
+;     - Showcase: rep stosw CX fixed to (PROGRAM-RAM_BASE)/2 -- stops
+;       exactly before PROGRAM so first showcase byte is not zeroed
+;     - 8bitworkshop PROG_END init points AT sentinel (consistent with do_new)
 ;   v1.4.1 (2026-04-23) No new features, Reorg prepping for ROM version
 ;   v1.4.0 (2026-04-19)  FOR/NEXT with optional STEP:
 ;     - FOR <var>=<start> TO <end> [STEP <step>]
@@ -103,24 +117,28 @@
 
         	cpu 8086
                 
-	; Configure origin and RAM base for target platform
-%ifdef __YASM_MAJOR__
-        SECTION .text           ; 8bitworkshop
-ORIGIN:         equ 0xf800
-RAM_BASE:       equ 0x0
-
-%elifdef ROM                    ; Standalone ROM: 2KB at 0xF800, RAM at 0x0000
+	; Configure origin and RAM base for target platform.
+	; ROM must be first: -dROM=1 must override yasm's __YASM_MAJOR__.
+%ifdef ROM                      ; Standalone 2KB ROM at 0xF800, 2KB RAM at 0x0000
 ORIGIN:         equ 0xF800
 RAM_BASE:       equ 0x0000
+RAM_SIZE:       equ 2048        ; 2KB RAM (A12=0 selects RAM, A12=1 selects ROM)
 
-%else                           ; 8086tiny batch test: boot sector loads to 0x7E00
+%elifdef __YASM_MAJOR__         ; 8bitworkshop: yasm defines __YASM_MAJOR__
+        SECTION .text
+ORIGIN:         equ 0xf800      ; showcase placed at PROGRAM offset from seg 0
+RAM_BASE:       equ 0x0
+
+%else                           ; 8086tiny: boot sector loads to 0x7E00
 ORIGIN:         equ 0x7E00
 RAM_BASE:       equ 0x1000
 
 %endif
         
 ; --- RAM layout (all relative to RAM_BASE) ----------------------------------
-RAM_SIZE:       equ 4096
+%ifndef RAM_SIZE
+RAM_SIZE:       equ 4096        ; 8bitworkshop / 8086tiny: 4KB RAM
+%endif
 DIV0:           equ RAM_BASE + 0x000    ; 4 bytes: divide-by-zero vector (ROM)
 CURLN:          equ RAM_BASE + 0x004    ; word:  current line number (error reports)
 RUN_NEXT:       equ RAM_BASE + 0x006    ; word:  next-line pointer for run loop
@@ -188,6 +206,14 @@ NUM_TOKENS:     equ 17          ; stmt-dispatch tokens: TK_PRINT..TK_NEXT
 TK_THEN:        equ 0x91        ; sub-keyword (not in st_tab, outside dispatch)
 TK_TO:          equ 0x92        ; sub-keyword (FOR..TO)
 TK_STEP:        equ 0x93        ; sub-keyword (FOR..STEP)
+
+; --- ROM bitbang serial: Intel 8755, 4800 baud @ 5MHz ----------------------
+PORT_A:         equ 0x00        ; 8755 Port A data register
+DDR_A:          equ 0x02        ; 8755 Port A direction register
+TX:             equ 0x01        ; Port A bit 0 = TX (output)
+RX:             equ 0x02        ; Port A bit 1 = RX (input)
+BAUD:           equ 60          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
+ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; =============================================================================
 ; Pre-loaded showcase (8BitWorkshop only).  Type RUN to execute, NEW to clear.
@@ -275,25 +301,35 @@ start:
         cld
 
 %ifdef ROM
-        ; ROM target: CS=DS=ES=SS=0
-        xor ax,ax
+        ; ROM cold start: segments, stack, serial, vectors
+        cli
+        xor ax, ax
 %else
-	; 8bitworkshop / 8086tiny: ensure CS=DS=ES=SS
-	mov ax, cs
+        ; 8bitworkshop / 8086tiny: CS=DS=ES=SS
+        mov ax, cs
 %endif
-	; setup segments
+        ; setup segments
         mov ds, ax
         mov es, ax
         mov ss, ax
-
-	mov sp, STACK_TOP
+        mov sp, STACK_TOP
+%ifdef ROM
+        ; 8755 serial: bit1=RX(in), rest=out; TX idle high
+        mov al, 0xFD
+        out DDR_A, al
+        mov al, TX
+        out PORT_A, al
+        sti
+%endif
 
 %ifdef __YASM_MAJOR__
         ; Zero VARs area: DIV0 through PROG_END (stops before PROGRAM)
-	mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
-	mov di, RAM_BASE         ; start of VARS
+        ; Zero RAM: covers DIV0..RUNNING, stops before PROGRAM
+        mov di, RAM_BASE
         mov cx, (PROGRAM - RAM_BASE) / 2
         call clr_mem
+        ; PROG_END points AT the sentinel (= PROGRAM + body bytes, excl sentinel)
+        mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %else
         ; clear all memory
         mov di, RAM_BASE
@@ -303,9 +339,11 @@ start:
 %endif
 
 %ifdef ROM
-        ; Install interrupt vectors in RAM - far calls already zero'd
-        mov word [DIV0],   divide_error	; To-DO: Implement handler
+        ; Install interrupt vectors (IP only; CS was zeroed above)
+        mov word [DIV0],   divide_error
+        mov word [DIV0+2], 0xF800
         mov word [NMI],    nmi_handler
+        mov word [NMI+2],  0xF800
 %endif
         ; signon
 	mov si, str_banner
@@ -1067,15 +1105,36 @@ new_line:
 	; drop through
 
 ; =============================================================================
-; OUTPUT  AL -> BIOS INT 10h TTY
+; OUTPUT  AL -> terminal
+; ROM: bitbang 8N1 via 8755 Port A.  Others: BIOS INT 10h.
 ; =============================================================================
 output:
+%ifdef ROM
+        ; bitbang TX: start bit, 8 data bits LSB-first, stop bit
+        mov ah, al              ; stash char
+        xor al, al
+        out PORT_A, al          ; start bit (TX=0)
+        call bdly
+        mov cx, 8
+.out_bit:
+        mov al, ah
+        and al, TX              ; LSB into bit0
+        out PORT_A, al
+        call bdly
+        shr ah, 1
+        loop .out_bit
+        mov al, TX
+        out PORT_A, al          ; stop bit (TX=1)
+        call bdly
+        ret
+%else
         push bx
         mov ah, 0x0e
         mov bx, 0x0007
         int 0x10
         pop bx
         ret
+%endif
         
 ; =============================================================================
 ; DO_FREE  print free program-store bytes
@@ -1130,12 +1189,37 @@ do_error_nl:
         jmp main_loop    
         
 ; =============================================================================
-; INPUT_KEY  -> AL  (BIOS INT 16h)
+; INPUT_KEY  -> AL
+; ROM: bitbang UART RX from 8755 Port A bit1.  Others: BIOS INT 16h.
 ; =============================================================================
 input_key:
+%ifdef ROM
+.ik_wait:
+        in al, PORT_A
+        test al, RX
+        jnz .ik_wait            ; wait for start bit (RX low)
+        mov cx, BAUD/2
+        loop $                  ; half-bit delay to centre of start bit
+        in al, PORT_A
+        test al, RX
+        jnz input_key           ; false start: retry
+        call bdly               ; align to mid-first-data-bit
+        mov cx, 8
+        xor ah, ah
+.ik_bit:
+        in al, PORT_A
+        shr al, 1               ; RX=bit1: shift right once -> into CF
+        rcr ah, 1               ; rotate CF into MSB of AH (LSB-first build)
+        call bdly
+        loop .ik_bit
+        call bdly               ; consume stop bit
+        mov al, ah
+        ret
+%else
         mov ah, 0x00
         int 0x16
         ret
+%endif
 
 ; =============================================================================
 ; LINE EDITOR  
@@ -1620,7 +1704,7 @@ tk_kw_tab:
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.4.1"
+str_banner: db "uBASIC 8088 v1.5.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1651,6 +1735,47 @@ chrs_tab:       dw kw_chrs
 to_tab:         dw kw_to
 step_tab:       dw kw_step
 
-%ifndef ROM
-ROM_END:	db 0	; so we can see the label
+; =============================================================================
+; ROM-only routines: bdly, divide_error, nmi_handler, do_error_hw
+; =============================================================================
+%ifdef ROM
+
+; BDLY  one bit-period delay for bitbang serial
+; Clobbers: nothing (saves/restores CX)
+bdly:
+        push cx
+        mov cx, BAUD            ; 60 iterations x 17cy = 1020cy @5MHz ~4800baud
+        loop $
+        pop cx
+        ret
+
+; DIVIDE_ERROR  INT 0 handler
+; 8086 divide-by-zero pushes flags+CS+IP; stack state unknown to BASIC.
+; Reset stack and re-enter interpreter with error code.
+divide_error:
+        mov al, ERR_OV          ; ?2 = divide/overflow error
+        jmp do_error_hw
+
+; NMI_HANDLER  INT 2 handler (NMI break key)
+nmi_handler:
+        mov al, ERR_BRK         ; ?B = break
+        ; fall through
+
+; DO_ERROR_HW  safe entry from hardware interrupt context
+; The hardware stack is abandoned; we reset SP before calling do_error.
+do_error_hw:
+        mov sp, STACK_TOP       ; abandon interrupt stack
+        jmp do_error
+
+; --- Reset vector stub at 0xFFF0 -------------------------------------------
+; 8086 resets to CS=0xFFFF IP=0x0000 -> physical 0xFFFF0.
+; With ROM at 0xF800-0xFFFF, 0xFFFF0 is at offset 0x07F0 within the 2KB ROM.
+        org 0xFFF0
+reset_vec:
+        jmp start               ; near jump (3 bytes) to cold start
+        times (0xFFFE - $) db 0xFF  ; pad to last 2 bytes
+        dw 0xFFFF               ; ROM end marker
+
+%else
+ROM_END:        db 0            ; size marker for non-ROM targets
 %endif
