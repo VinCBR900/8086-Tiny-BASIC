@@ -756,7 +756,7 @@ dp_after:
 do_poke:
 	call poke_out_hlpr
 	mov [di], al
-	rts
+	ret
 
 do_out:
 	call poke_out_hlpr
