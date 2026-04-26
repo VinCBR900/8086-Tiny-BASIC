@@ -2,12 +2,12 @@
 this folder contains Tool used in 8088 Tiny BASIC Development, copied here so CODEX can access them.  
 
 ### Assembler
-The Assembler is Oscar Toledo's tinyasm.c from 
+The Assembler is Oscar Toledo's **tinyasm.c** from 
 
 https://github.com/nanochess/tinyasm
 
 ### PC Simulator
-The PC Simulator is Adrian Cable's tiny8086 suite from 
+The PC Simulator is Adrian Cable's **tiny8086** suite from 
 
 https://github.com/adriancable/8086tiny
 
