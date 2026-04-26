@@ -296,7 +296,7 @@ PORT_A:         equ 0x00        ; 8755 Port A data register
 DDR_A:          equ 0x02        ; 8755 Port A direction register
 TX:             equ 0x01        ; Port A bit 0 = TX (output)
 RX:             equ 0x02        ; Port A bit 1 = RX (input)
-BAUD:           equ 60          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
+BAUD:           equ 57          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
 
 ; =============================================================================
 ; Pre-loaded showcase (8BitWorkshop only).  Type RUN to execute, NEW to clear.
@@ -1135,29 +1135,30 @@ new_line:
 ; =============================================================================
 output:
 %ifdef ROM
-        ; bitbang TX: start bit, 8 data bits LSB-first, stop bit
-        mov ah, al              ; stash char
-        xor al, al
-        out PORT_A, al          ; start bit (TX=0)
-        call bdly
-        mov cx, 8
+    mov ah, al          ; AH = character to send
+    mov al, 0           ; Start bit (Line goes low)
+    out PORT_A, al
+    call bdly
+    
+    mov bl, 9           ; 8 Data bits + 1 Stop bit = 9 total iterations
+    stc                 ; Carry=1: This will eventually shift out as our stop bit
 .out_bit:
-        mov al, ah
-        and al, TX              ; LSB into bit0
-        out PORT_A, al
-        call bdly
-        shr ah, 1
-        loop .out_bit
-        mov al, TX
-        out PORT_A, al          ; stop bit (TX=1, line idles high)
-        ret                     ; no stop-bit delay: next call handles gap
+    rcr ah, 1           ; Rotate LSB into Carry; previous Carry into AH bit 7
+    sbb al, al          ; If CF=1, AL=FF. If CF=0, AL=00.
+    and al, TX          ; Mask for the TX pin (e.g., bit 1)
+    out PORT_A, al      ; Send the bit
+    call bdly
+    stc                 ; Ensure Carry is 1 for the next shift-in
+    dec bx              ; Use BX (1-byte dec) instead of BL (2-byte dec)
+    jnz .out_bit
+    ret
 %else
-        push bx
-        mov ah, 0x0e
-        mov bx, 0x0007
-        int 0x10
-        pop bx
-        ret
+    push bx
+    mov ah, 0x0e
+    mov bx, 0x0007
+    int 0x10
+    pop bx
+    ret
 %endif
         
 ; =============================================================================
@@ -1213,46 +1214,43 @@ do_error_nl:
         jmp main_loop    
         
 ; =============================================================================
-; INPUT_KEY  -> AL
+; INPUT_KEY -> AL
 ; ROM: bitbang UART RX from 8755 Port A bit1.  Others: BIOS INT 16h.
 ; =============================================================================
 input_key:
 %ifdef ROM
-; Wait for start bit (RX goes low), then sample 8 data bits LSB-first.
 .ik_wait:
-        in al, PORT_A
-        test al, RX
-        jnz .ik_wait
-        call bdly               ; skip start bit, land mid-first-data-bit
-        mov cx, 8
-        xor ah, ah
+    in al, PORT_A           ; Read port
+    test al, RX             ; Check RX line (usually bit 1)
+    jnz .ik_wait            ; Loop until start bit (Low)
+    
+    call bdly               ; Center of start bit (or end, per original logic)
+    mov ah, 0x80             ; AH = Marker bit. When it shifts out, we're done.
 .ik_bit:
-        in al, PORT_A
-        shr al, 1               ; RX bit1 -> CF
-        rcr ah, 1               ; accumulate LSB-first into AH
-        call bdly
-        loop .ik_bit
-        mov al, ah              ; stop-bit delay omitted: .ik_wait handles it
-        ret
+    in al, PORT_A           ; Read data bit
+    shr al, 1               ; Move bit 1 into bit 0...
+    shr al, 1               ; ...and bit 0 into Carry Flag (CF)
+    rcr ah, 1               ; Rotate CF into AH, and AH's LSB into CF
+    call bdly               ; Wait for next bit period
+    jnc .ik_bit             ; If the marker '1' hasn't fallen into CF, loop
+    
+    mov al, ah              ; Move result to return register
+    ret
 %else
-        mov ah, 0x00
-        int 0x16
-        ret
+    mov ah, 0x00
+    int 0x16
+    ret
 %endif
 
 ; =============================================================================
-; ROM-only: bdly (bit-delay), divide_error, nmi_handler, do_error_hw
-; Placed here so they land well before the 0xFFF0 reset vector area.
+; bdly (bit-delay) - Optimized for size
+; Clobbers: CX (saved by Marker Bit logic above instead of push/pop)
 ; =============================================================================
 %ifdef ROM
 bdly:
-; BDLY  one bit-period delay: BAUD iterations of LOOP @ 17cy = ~4800 baud @5MHz
-; Clobbers: nothing (saves/restores CX)
-        push cx
-        mov cx, BAUD
-        loop $
-        pop cx
-        ret
+    mov cx, BAUD            ; 3 bytes
+    loop $                  ; 2 bytes - 17 cycles per iteration on 8088
+    ret                     ; 1 byte
 
 ; DIVIDE_ERROR  INT 0 handler: reset stack and show ?2
 divide_error:
