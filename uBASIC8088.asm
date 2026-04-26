@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.5.0
+; uBASIC 8088  v1.6.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -7,11 +7,13 @@
 ;
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
-; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM END RUN LIST NEW POKE FREE HELP
-; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
+; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM 
+; 		OUT END RUN LIST NEW POKE FREE HELP
+; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) IN(I/O) A-Z
 ; Numbers    : signed 16-bit (-32768..32767)
-; Multi-stmt : colon separator ':'
-; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable  ?5 return without gosub
+; Multi-stmt : colon separator ':' (dont use for/next or gosub/return on same line)
+; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  
+;		?4 bad variable  ?5 return without gosub ?B Break into Program (ROM only)
 ;
 ; =============================================================================
 ; BUILD INSTRUCTIONS
@@ -101,8 +103,6 @@
 ;   Boot sector (bootsect.asm) loads 5 sectors to 0x7E00 and jumps there.
 ;   All absolute addresses in RAM (VARS, PROGRAM, etc.) are segment-0 offsets.
 ;
-; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
-;
 ; Line store: <linenum_lo> <linenum_hi> <tokenized body> <CR>
 ;   Token bytes 0x80..0x93 replace keywords; printable ASCII and CR pass through.
 ;   Stmt tokens 0x80..0x90 (NUM_TOKENS=17): PRINT IF GOTO LIST RUN NEW INPUT
@@ -111,6 +111,7 @@
 ;   String literals (between quotes) and REM bodies stored verbatim.
 ;
 ; History:
+;   v1.6.0 (2026-04-26)  Added missing IN/OUT commands, refactored to make space.
 ;   v1.5.0 (2026-04-23)  ROM target integration + showcase fixes:
 ;     - %ifdef ordering: ROM first so -dROM=1 wins over __YASM_MAJOR__
 ;     - RAM_SIZE conditional: 2KB for ROM (2KB RAM), 4KB for others
@@ -247,6 +248,7 @@ ERR_OM:         equ 0x33
 ERR_UK:         equ 0x34
 ERR_RT:         equ 0x35  ; RETURN without GOSUB
 ERR_NF:         equ 0x36  ; NEXT without FOR
+ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -263,9 +265,8 @@ T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
 T_B:            equ 0xC2        ; 'B'  GOSUB
 
-; --- Token bytes (0x80..0x8F = keyword in stored program) ---
-; Order matches st_tab: PRINT IF GOTO LIST RUN NEW INPUT REM END
-;                       LET POKE FREE HELP GOSUB RETURN THEN
+; --- Token bytes (0x80.. = keyword in stored program) ---
+; Order matches st_tab
 TK_PRINT:       equ 0x80
 TK_IF:          equ 0x81
 TK_GOTO:        equ 0x82
@@ -281,14 +282,14 @@ TK_FREE:        equ 0x8B
 TK_HELP:        equ 0x8C
 TK_GOSUB:       equ 0x8D
 TK_RETURN:      equ 0x8E
-; stmt dispatch range: TK_PRINT(0x80)..TK_NEXT(0x90), NUM_TOKENS=17 entries
-; sub-keywords TK_THEN/TK_TO/TK_STEP are >= 0x91 (not dispatched by stmt)
 TK_FOR:         equ 0x8F        ; st_tab index 15
 TK_NEXT:        equ 0x90        ; st_tab index 16
-NUM_TOKENS:     equ 17          ; stmt-dispatch tokens: TK_PRINT..TK_NEXT
-TK_THEN:        equ 0x91        ; sub-keyword (not in st_tab, outside dispatch)
-TK_TO:          equ 0x92        ; sub-keyword (FOR..TO)
-TK_STEP:        equ 0x93        ; sub-keyword (FOR..STEP)
+TK_OUT:		equ 0x91
+NUM_TOKENS:     equ 18          ; stmt-dispatch tokens: TK_PRINT..TK_OUT
+; sub-keywords TK_THEN/TK_TO/TK_STEP are >= 0x91 (not dispatched by stmt)
+TK_THEN:        equ 0x92        ; sub-keyword (not in st_tab, outside dispatch)
+TK_TO:          equ 0x93        ; sub-keyword (FOR..TO)
+TK_STEP:        equ 0x94        ; sub-keyword (FOR..STEP)
 
 ; --- ROM bitbang serial: Intel 8755, 4800 baud @ 5MHz ----------------------
 PORT_A:         equ 0x00        ; 8755 Port A data register
@@ -296,7 +297,6 @@ DDR_A:          equ 0x02        ; 8755 Port A direction register
 TX:             equ 0x01        ; Port A bit 0 = TX (output)
 RX:             equ 0x02        ; Port A bit 1 = RX (input)
 BAUD:           equ 60          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
-ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; =============================================================================
 ; Pre-loaded showcase (8BitWorkshop only).  Type RUN to execute, NEW to clear.
@@ -311,7 +311,7 @@ ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; 8bitworkshop default org 0
 %ifdef __YASM_MAJOR__
-	mov ax, start 	; Trampoline for 8bitworkshop, overwritten when running
+	mov ax, reset_vec; Trampoline for 8bitworkshop, overwritten when running
 	jmp ax          ; One way to do a Near jump greater than 32768
 	times (PROGRAM - 5) nop  ;  Pad over program VARS/Equates (3byte mov, 2byte jump)
 
@@ -382,20 +382,6 @@ SHOWCASE_END:
 ; =============================================================================
 start:
         cld
-
-%ifdef ROM
-        ; ROM cold start: segments, stack, serial, vectors
-        cli
-        xor ax, ax
-%else
-        ; 8bitworkshop / 8086tiny: CS=DS=ES=SS
-        mov ax, cs
-%endif
-        ; setup segments
-        mov ds, ax
-        mov es, ax
-        mov ss, ax
-        mov sp, STACK_TOP
 %ifdef ROM
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
         mov al, 0xFD
@@ -426,10 +412,11 @@ start:
 
 %ifdef ROM
         ; Install interrupt vectors (IP only; CS was zeroed above)
+        mov ax, 0xf800
         mov word [DIV0],   divide_error
-        mov word [DIV0+2], 0xF800
+        mov word [DIV0+2], ax
         mov word [NMI],    nmi_handler
-        mov word [NMI+2],  0xF800
+        mov word [NMI+2],  ax
 %endif
         ; signon
 	mov si, str_banner
@@ -539,20 +526,27 @@ stmt_lp:
         jmp short stmt_lp
 stmt_call:
         jmp [bx+2]              ; indirect call to handler
+; =============================================================================
+; DO_INPUT  INPUT <var>
+; =============================================================================
+do_input:
+        ; Validate variable letter before proceeding
+	call let_input_hlpr            
+        mov al, '?'
+        call output
+        mov al, ' '
+        call output
+        call input_line
+        call expr
+        pop di
+        mov [di], ax
+        ret
         
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
-        call spaces
-        mov al, [si]
-        call uc_al
-        cmp al, 'A'
-        jb JERRUK
-        cmp al, 'Z'
-        ja JERRUK
-        call get_var_addr
-        push di
+	call let_input_hlpr     
         call spaces
         cmp byte [si], '='
         jne dl_err2
@@ -566,7 +560,20 @@ dl_err2:
 JERRUK:
         mov al, ERR_UK
         jmp do_error
-        
+
+; -- helper
+let_input_hlpr:
+        call spaces
+        mov al, [si]
+        call uc_al
+        cmp al, 'A'
+        jb JERRUK
+        cmp al, 'Z'
+        ja JERRUK
+        call get_var_addr
+        push di
+        ret
+
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ;
@@ -630,71 +637,6 @@ uc_al:
         ja uc_al_r
         and al, 0xdf
 uc_al_r:
-dg_ret:
-        ret
-
-; =============================================================================
-; DO_GOTO / DO_RUN
-; =============================================================================
-do_goto:
-        call    expr            ; AX = target line
-        call    find_line       ; DI = pointer to line >= AX
-        cmp     [di], ax        ; Does it exist exactly?
-        je      dg_common       ; Yes: proceed to run/resume
-JERRUL:
-        mov     al, ERR_UL      ; No: Undefined Line error
-        jmp     do_error
-
-do_run:
-        mov     di, PROGRAM     ; RUN always starts at the beginning
-dg_common:
-        mov     [RUN_NEXT], di  ; Update the program counter
-        cmp     byte [RUNNING], 0
-        jne     dg_ret          ; If already running (from a GOTO), just return
-        inc     byte [RUNNING]  ; Set RUNNING to 1
-        ; Fall through to run_loop
-
-; =============================================================================
-; RUN_LOOP
-; =============================================================================
-run_loop:
-        mov     di, [RUN_NEXT]  ; Get pointer to current line
-        mov     si, di
-        lodsw                   ; AX = Line Number, SI = points to body
-        test    ax, ax          ; Is it 0000 (End of Program)?
-        jz      run_end
-        
-        mov     [CURLN], ax     ; Update current line number for error reporting
-        call    next_line_ptr   ; This uses DI to find the START of the NEXT line
-        mov     [RUN_NEXT], di  ; Store it for the next iteration
-        
-        ; SI is already pointing to the body because of LODSW!
-        call    stmt_line       ; Execute the statement
-        jmp     short run_loop
-        
-; =============================================================================
-; DO_NEW  clear program store (PROGRAM..PROGRAM_TOP) and reset PROG_END
-; Uses rep stosw so the sentinel at PROG_END is always 0x0000.
-; Also eliminates stale data that could confuse walk_lines after LOAD/SAVE.
-; =============================================================================
-do_new:
-        mov word [PROG_END], PROGRAM
-        mov di, PROGRAM         ; start of program store
-        mov cx, (PROGRAM_TOP - PROGRAM) / 2   ; words to clear
-clr_mem:
-        xor ax, ax
-	rep stosw               ; zero entire program store
-        ; fall through to do_end (clears RUNNING via run_end)
-
-; =============================================================================
-; DO_END  END statement - stops program execution
-; =============================================================================
-do_end:
-        mov ax, [PROG_END]      ; Point RUN_NEXT at the sentinel (0x0000 word)
-        mov [RUN_NEXT], ax      ; run_loop will read 0 and exit cleanly
-        xor al, al              ; AL=0 for RUNNING clear below
-run_end:
-        mov byte [RUNNING], al  ; Clear running flag
 dl_done:
         ret
 
@@ -808,46 +750,29 @@ dp_after:
         jmp short dp_top
 
 ; =============================================================================
-; DO_INPUT  INPUT <var>
-; =============================================================================
-do_input:
-        ; Validate variable letter before proceeding
-        call spaces
-        mov al, [si]
-        call uc_al
-        cmp al, 'A'
-        jb di_err
-        cmp al, 'Z'
-        ja di_err
-        call get_var_addr       ; DI = &var; SI advanced
-        push di
-        mov al, '?'
-        call output
-        mov al, ' '
-        call output
-        call input_line
-        call expr
-        pop di
-        mov [di], ax
-        ret
-di_err:
-        mov al, ERR_UK
-        jmp do_error
-
-; =============================================================================
 ; DO_POKE  POKE <addr>, <val> - need to finagle addresses above 32768
+; DO_OUT  OUT <addr>, <val> 
 ; =============================================================================
 do_poke:
-        call expr
-        mov di, ax              ; DI = destination address
-        push di                 ; save: second expr's kw_match clobbers DI
+	call poke_out_hlpr
+	mov [di], al
+	rts
+
+do_out:
+	call poke_out_hlpr
+	mov dx,di
+        out dx, al
+	ret
+
+poke_out_hlpr:
+        call expr		; destination address
+        push ax			; save: second expr's kw_match clobbers DI
         call spaces
         cmp byte [si], ','
         jne JERRSN
         inc si
         call expr               ; AX = value to poke
-        pop di                  ; restore destination address
-        mov [di], al
+        pop di
         ret
 JERRSN:
         mov al, ERR_SN
@@ -1023,25 +948,38 @@ e2_par:
         inc si
         ret 
 
-e2_nchrs:
-        ; PEEK
-        mov bx, peek_tab
-        call kw_match
-        jc e2_npeek
+peek_in_hlp:
         call eat_paren_expr
         mov bx, ax
         xor ah, ah
-        mov al, [bx]
         ret
         
-e2_npeek:
+e2_nchrs:	; not chr$ is it PEEK 
+        ; PEEK
+        mov bx, peek_tab
+        call kw_match
+        jc e2_npeek	; not peek
+        call peek_in_hlp
+        mov al, [bx]
+        ret
+
+e2_npeek:	; not PEEK is it IN 
+        ; IN
+        mov bx, in_tab
+        call kw_match
+        jc e2_nin	; not peek
+        call peek_in_hlp
+        mov dx, bx
+        in al,dx
+        ret
+
+e2_nin:
         ; USR
         mov bx, usr_tab
         call kw_match
         jc e2_nusr
         call eat_paren_expr
-        call ax
-        ret
+        jmp ax ; tail call
         
 e2_var:
         ; variable A-Z?
@@ -1448,10 +1386,7 @@ ins_shift_done:
         mov [di], ax
         add di, 2
 ins_copy:
-        lodsb
-        stosb
-        cmp al, 0x0d
-        jne ins_copy
+        rep movsb                ; copy tokenized body+CR (CX bytes)
 
         ; PROG_END += linenum_word + body+CR = DX
         add [PROG_END], dx
@@ -1479,8 +1414,70 @@ deline:
         rep movsb               ; slide data down (DI advances by CX)
         sub [PROG_END], bx
         pop di                  ; restore DI to original insertion point
-        ret
+dg_ret:
+	ret
+; =============================================================================
+; DO_NEW  clear program store (PROGRAM..PROGRAM_TOP) and reset PROG_END
+; Uses rep stosw so the sentinel at PROG_END is always 0x0000.
+; Also eliminates stale data that could confuse walk_lines after LOAD/SAVE.
+; =============================================================================
+do_new:
+        mov word [PROG_END], PROGRAM
+        mov di, PROGRAM         ; start of program store
+        mov cx, (PROGRAM_TOP - PROGRAM) / 2   ; words to clear
+clr_mem:
+        xor ax, ax
+	rep stosw               ; zero entire program store
+        ; fall through to do_end (clears RUNNING via run_end)
 
+; =============================================================================
+; DO_END  END statement - stops program execution
+; =============================================================================
+do_end:
+        mov ax, [PROG_END]      ; Point RUN_NEXT at the sentinel (0x0000 word)
+        mov [RUN_NEXT], ax      ; run_loop will read 0 and exit cleanly
+        xor al, al              ; AL=0 for RUNNING clear below
+run_end:
+        mov byte [RUNNING], al  ; Clear running flag
+        ret
+; =============================================================================
+; DO_GOTO / DO_RUN
+; =============================================================================
+do_goto:
+        call    expr            ; AX = target line
+        call    find_line       ; DI = pointer to line >= AX
+        cmp     [di], ax        ; Does it exist exactly?
+        je      dg_common       ; Yes: proceed to run/resume
+JERRUL:
+        mov     al, ERR_UL      ; No: Undefined Line error
+        jmp     do_error
+
+do_run:
+        mov     di, PROGRAM     ; RUN always starts at the beginning
+dg_common:
+        mov     [RUN_NEXT], di  ; Update the program counter
+        cmp     byte [RUNNING], 0
+        jne     dg_ret          ; If already running (from a GOTO), just return
+        inc     byte [RUNNING]  ; Set RUNNING to 1
+        ; Fall through to run_loop
+
+; =============================================================================
+; RUN_LOOP
+; =============================================================================
+run_loop:
+        mov     di, [RUN_NEXT]  ; Get pointer to current line
+        mov     si, di
+        lodsw                   ; AX = Line Number, SI = points to body
+        test    ax, ax          ; Is it 0000 (End of Program)?
+        jz      run_end
+        
+        mov     [CURLN], ax     ; Update current line number for error reporting
+        call    next_line_ptr   ; This uses DI to find the START of the NEXT line
+        mov     [RUN_NEXT], di  ; Store it for the next iteration
+        
+        ; SI is already pointing to the body because of LODSW!
+        call    stmt_line       ; Execute the statement
+        jmp     short run_loop
 
 ; =============================================================================
 ; DO_GOSUB  GOSUB <linenum>
@@ -1789,6 +1786,7 @@ kw_gosub:   db 0x47,0x4f,0x53,0x55,T_B   ; GOSUB
 kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N  ; RETURN
 kw_for:     db 0x46,0x4F,T_R                  ; FOR  (F,O,R+0x80)
 kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT (N,E,X,T+0x80)
+kw_out:	    db 0xf4,0x55, T_T	
 kw_to:      db 0x54,T_O                       ; TO   (T,O+0x80)
 kw_step:    db 0x53,0x54,0x45,T_P             ; STEP (S,T,E,P+0x80)
 ; not commands but still want to print in help
@@ -1796,6 +1794,7 @@ kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
+kw_in:	    db 0x49, T_N
 
             db 0
 
@@ -1807,7 +1806,7 @@ tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
         dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
+        dw kw_for, kw_next, kw_out      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
         dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
         dw 0                    ; sentinel
 
@@ -1815,7 +1814,7 @@ tk_kw_tab:
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.5.0"
+str_banner: db "uBASIC 8088 v1.6.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
@@ -1837,6 +1836,7 @@ st_tab:
         dw kw_return,   do_return
         dw kw_for,      do_for
         dw kw_next,     do_next
+        dw kw_out,	do_out
         dw 0
         ; non commands but still match
 peek_tab:       dw kw_peek
@@ -1845,19 +1845,34 @@ then_tab:       dw kw_then
 chrs_tab:       dw kw_chrs
 to_tab:         dw kw_to
 step_tab:       dw kw_step
+in_tab:		dw kw_in
 
-%ifdef ROM
 ; --- Reset vector at 0xFFF0 -------------------------------------------
 ; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 ; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
 ; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
-        org 0xFFF0
+%ifdef ROM
+	org 0xFFF0
+%else	; 8bit workshop       
+        ; times 94 nop ; bytes free still?
+%endif
 reset_vec:
-        db 0xEA                 ; far JMP opcode
+%ifdef ROM
+        ; ROM cold start: segments, stack, serial, vectors
+        xor ax, ax
+%else
+        ; 8bitworkshop / 8086tiny: CS=DS=ES=SS
+        mov ax, cs
+%endif
+        ; setup segments
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, STACK_TOP
+%ifdef ROM
+	db 0xEA                 ; far JMP opcode
         dw 0x0000               ; IP = 0x0000
         dw 0xF800               ; CS = 0xF800 -> start
-        times (0xFFFE - $) db 0xFF
-        dw 0xFFFF               ; end marker
-%else
-ROM_END:        db 0
+%else	
+	jmp start
 %endif
