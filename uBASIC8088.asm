@@ -506,26 +506,28 @@ stmt:
         cmp al, TK_PRINT + NUM_TOKENS
         jnb stmt_text           ; >= 0x90: not a token
         inc si                  ; consume token byte
-        sub al, TK_PRINT        ; AL = 0..15 (index into st_tab)
+        sub al, TK_PRINT        ; AL = 0..17 (index into st_tab)
         xor ah, ah
-        add ax, ax              ; AX = index * 2
-        add ax, ax              ; AX = index * 4 (each st_tab entry = 4 bytes)
+        add ax, ax              ; AX = index * 2 (dw handler table)
         mov bx, st_tab
-        add bx, ax              ; BX -> correct st_tab entry
-        jmp [bx+2]              ; dispatch directly (saves kw_match loop)
+        add bx, ax              ; BX -> correct st_tab handler
+        jmp [bx]                ; dispatch directly (saves kw_match loop)
         ; --- Text fall-through (direct mode) ---
 stmt_text:
-        mov bx, st_tab
+        mov bx, tk_kw_tab
+        mov cx, NUM_TOKENS
 stmt_lp:
-        mov ax, [bx]
-        or ax, ax
-        je do_let               ; sentinel -> implicit LET/assignment
         call kw_match
         jnc stmt_call
-        add bx, 4
-        jmp short stmt_lp
+        add bx, 2
+        loop stmt_lp
+        jmp do_let              ; no keyword -> implicit LET/assignment
 stmt_call:
-        jmp [bx+2]              ; indirect call to handler
+        mov ax, bx
+        sub ax, tk_kw_tab
+        add ax, st_tab
+        mov bx, ax
+        jmp [bx]                ; indirect call to handler
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
 ; =============================================================================
@@ -654,9 +656,8 @@ dl_lp:
         mov al, ' '
         call output
 
-        mov si, di          ; SI = DI
-        inc si              ; SI = DI + 2 (using two INCs is 2 bytes, 
-        inc si              ; same as ADD SI, 2, but often cleaner)
+        mov si, di          ; SI = DI + 2
+        add si, 2
 
 dl_body:
         lodsb
@@ -1271,8 +1272,6 @@ do_error_hw:
 ; =============================================================================
 ; LINE EDITOR  
 ; =============================================================================
-find_program_end:
-        mov ax, 0xffff
 find_line:
 ;         
 walk_lines:
@@ -1815,27 +1814,11 @@ tk_kw_tab:
 str_banner: db "uBASIC 8088 v1.6.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
-; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
+; --- Dispatch table: statement handlers in TK_PRINT order --------------------
 st_tab:
-        dw kw_print,    do_print
-        dw kw_if,       do_if
-        dw kw_goto,     do_goto
-        dw kw_list,     do_list
-        dw kw_run,      do_run
-        dw kw_new,      do_new
-        dw kw_input,    do_input
-        dw kw_rem,      do_rem
-        dw kw_end,      do_end
-        dw kw_let,      do_let
-        dw kw_poke,     do_poke
-        dw kw_free,     do_free
-        dw kw_help,     do_help
-        dw kw_gosub,    do_gosub
-        dw kw_return,   do_return
-        dw kw_for,      do_for
-        dw kw_next,     do_next
-        dw kw_out,	do_out
-        dw 0
+        dw do_print, do_if, do_goto, do_list, do_run, do_new
+        dw do_input, do_rem, do_end, do_let, do_poke, do_free
+        dw do_help, do_gosub, do_return, do_for, do_next, do_out
         ; non commands but still match
 peek_tab:       dw kw_peek
 usr_tab:        dw kw_usr
