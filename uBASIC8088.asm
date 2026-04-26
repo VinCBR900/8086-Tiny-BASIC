@@ -13,6 +13,90 @@
 ; Multi-stmt : colon separator ':'
 ; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable  ?5 return without gosub
 ;
+; =============================================================================
+; BUILD INSTRUCTIONS
+; =============================================================================
+;
+; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
+;   or NASM (both produce identical output for this file).
+;
+; --- Variant 1: 8086tiny batch-test (boot sector, BIOS I/O) -----------------
+;
+;   Assemble:
+;     tinyasm -f bin uBASIC8088.asm -o uBASIC8088.bin
+;   or:
+;     nasm -f bin uBASIC8088.asm -o uBASIC8088.bin
+;
+;   Create floppy image (bootsect.asm loads 5 sectors to 0x0000:0x7E00):
+;     nasm -f bin bootsect.asm -o boot.bin
+;     python3 -c "
+;       boot  = open('boot.bin','rb').read()
+;       basic = open('uBASIC8088.bin','rb').read()
+;       img   = boot + basic + bytes(2560 - len(basic))
+;       open('floppy.img','wb').write(img)"
+;
+;   Run under 8086tiny (compile with -DNO_GRAPHICS for stdio):
+;     gcc -O2 -DNO_GRAPHICS -o 8086tiny 8086tiny.c
+;     ./8086tiny bios.bin floppy.img
+;
+;   Memory map:
+;     ORIGIN   = 0x7E00  (code loaded here by boot sector)
+;     RAM_BASE = 0x1000  (variables, program store)
+;     RAM_SIZE = 4096    (4KB)
+;     I/O      = BIOS INT 10h (display), INT 16h (keyboard)
+;
+; --- Variant 2: 8bitworkshop online IDE (YASM/yasm assembler) ----------------
+;
+;   Open the file directly in https://8bitworkshop.com (8086 mode).
+;   yasm defines __YASM_MAJOR__ which selects this variant automatically.
+;   A pre-loaded Mandelbrot showcase program is embedded in the image.
+;
+;   Memory map:
+;     ORIGIN   = 0xF800  (8bitworkshop segment base)
+;     RAM_BASE = 0x0000
+;     RAM_SIZE = 4096    (4KB)
+;     I/O      = BIOS INT 10h / INT 16h (emulated by 8bitworkshop)
+;
+; --- Variant 3: Standalone ROM target (real hardware) -----------------------
+;
+;   Assemble:
+;     tinyasm -f bin -dROM=1 uBASIC8088.asm -o uBASIC_rom.bin
+;
+;   The output is exactly 2048 bytes, ready to burn to a 2KB EPROM/EEPROM.
+;
+;   Hardware design:
+;     CPU    : Intel 8088 @ 5 MHz (or compatible)
+;     ROM    : 2KB at physical 0xF800-0xFFFF  (A12=1 selects ROM)
+;     RAM    : 2KB at physical 0x0000-0x07FF  (A12=0 selects RAM)
+;     Serial : Intel 8755 MMIO
+;                Port A (0x00) bit 0 = TX (output), bit 1 = RX (input)
+;                DDR A (0x02) configured in init: 0xFD = all outputs except RX
+;              Baud rate: 4800 baud @ 5 MHz (BAUD=60 loop constant)
+;     Reset  : 8086 reset vector at 0xFFFF0 -> FAR JMP to 0xF800:0x0000 (start)
+;     INT 0  : Divide-by-zero -> prints ?2 and re-enters interpreter
+;     INT 2  : NMI (break key) -> prints ?B and re-enters interpreter
+;
+;   Memory map:
+;     ORIGIN   = 0xF800  (ROM occupies 0xF800-0xFFFF, reset stub at 0xFFF0)
+;     RAM_BASE = 0x0000  (RAM 0x0000-0x07FF)
+;     RAM_SIZE = 2048    (2KB)
+;     STACK    = 0x0800  (top of RAM)
+;     I/O      = bitbang UART via 8755 Port A
+;
+;   Simulate (requires XTulator cpu.c by Mike Chambers + stubs):
+;     gcc -O2 -o sim_rom sim_rom.c cpu.c   # cpu.c, cpu.h, cpuconf.h from XTulator
+;     ./sim_rom uBASIC_rom.bin              # run ROM image
+;     ./sim_rom uBASIC_rom.bin --trace      # trace every instruction
+;     echo "PRINT 2+2" | ./sim_rom uBASIC_rom.bin --cycles 5000000
+;
+;   Simulator memory model (sim_rom.c):
+;     CS=DS=ES=SS=0x0000 (flat single-segment)
+;     addr >= 0xF800 -> ROM[addr & 0x7FF]   (top 2KB of address space)
+;     addr <  0xF800 -> RAM[addr & 0x7FF]   (bottom of address space)
+;     I/O: output/input_key intercepted at entry points; bitbang bypassed.
+;
+; =============================================================================
+;
 ; Segment model: CS=DS=ES=SS (single segment, flat).
 ;   Boot sector (bootsect.asm) loads 5 sectors to 0x7E00 and jumps there.
 ;   All absolute addresses in RAM (VARS, PROGRAM, etc.) are segment-0 offsets.
@@ -123,16 +207,15 @@
 ORIGIN:         equ 0xF800
 RAM_BASE:       equ 0x0000
 RAM_SIZE:       equ 2048        ; 2KB RAM (A12=0 selects RAM, A12=1 selects ROM)
-
-%elifdef __YASM_MAJOR__         ; 8bitworkshop: yasm defines __YASM_MAJOR__
+%else
+%ifdef __YASM_MAJOR__           ; 8bitworkshop: yasm defines __YASM_MAJOR__
         SECTION .text
 ORIGIN:         equ 0xf800      ; showcase placed at PROGRAM offset from seg 0
 RAM_BASE:       equ 0x0
-
 %else                           ; 8086tiny: boot sector loads to 0x7E00
 ORIGIN:         equ 0x7E00
 RAM_BASE:       equ 0x1000
-
+%endif
 %endif
         
 ; --- RAM layout (all relative to RAM_BASE) ----------------------------------
@@ -331,10 +414,13 @@ start:
         ; PROG_END points AT the sentinel (= PROGRAM + body bytes, excl sentinel)
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %else
-        ; clear all memory
+        ; Zero RAM inline (no CALL - avoids stack at top of RAM being clobbered).
+        ; CX = words to zero = (STACK_TOP-2)/2, leaving return-addr slot intact.
+        ; Then separately zero stack slot and set PROG_END.
+        xor ax, ax
         mov di, RAM_BASE
         mov cx, RAM_SIZE / 2
-        call clr_mem
+        rep stosw
 	mov word [PROG_END], PROGRAM
 %endif
 
@@ -604,10 +690,11 @@ clr_mem:
 ; DO_END  END statement - stops program execution
 ; =============================================================================
 do_end:
-	xor ax,ax
-        mov word [RUN_NEXT],ax
+        mov ax, [PROG_END]      ; Point RUN_NEXT at the sentinel (0x0000 word)
+        mov [RUN_NEXT], ax      ; run_loop will read 0 and exit cleanly
+        xor al, al              ; AL=0 for RUNNING clear below
 run_end:
-        mov byte [RUNNING], al	; ax is zero from do_run:
+        mov byte [RUNNING], al  ; Clear running flag
 dl_done:
         ret
 
@@ -1124,9 +1211,8 @@ output:
         shr ah, 1
         loop .out_bit
         mov al, TX
-        out PORT_A, al          ; stop bit (TX=1)
-        call bdly
-        ret
+        out PORT_A, al          ; stop bit (TX=1, line idles high)
+        ret                     ; no stop-bit delay: next call handles gap
 %else
         push bx
         mov ah, 0x0e
@@ -1194,31 +1280,56 @@ do_error_nl:
 ; =============================================================================
 input_key:
 %ifdef ROM
+; Wait for start bit (RX goes low), then sample 8 data bits LSB-first.
 .ik_wait:
         in al, PORT_A
         test al, RX
-        jnz .ik_wait            ; wait for start bit (RX low)
-        mov cx, BAUD/2
-        loop $                  ; half-bit delay to centre of start bit
-        in al, PORT_A
-        test al, RX
-        jnz input_key           ; false start: retry
-        call bdly               ; align to mid-first-data-bit
+        jnz .ik_wait
+        call bdly               ; skip start bit, land mid-first-data-bit
         mov cx, 8
         xor ah, ah
 .ik_bit:
         in al, PORT_A
-        shr al, 1               ; RX=bit1: shift right once -> into CF
-        rcr ah, 1               ; rotate CF into MSB of AH (LSB-first build)
+        shr al, 1               ; RX bit1 -> CF
+        rcr ah, 1               ; accumulate LSB-first into AH
         call bdly
         loop .ik_bit
-        call bdly               ; consume stop bit
-        mov al, ah
+        mov al, ah              ; stop-bit delay omitted: .ik_wait handles it
         ret
 %else
         mov ah, 0x00
         int 0x16
         ret
+%endif
+
+; =============================================================================
+; ROM-only: bdly (bit-delay), divide_error, nmi_handler, do_error_hw
+; Placed here so they land well before the 0xFFF0 reset vector area.
+; =============================================================================
+%ifdef ROM
+bdly:
+; BDLY  one bit-period delay: BAUD iterations of LOOP @ 17cy = ~4800 baud @5MHz
+; Clobbers: nothing (saves/restores CX)
+        push cx
+        mov cx, BAUD
+        loop $
+        pop cx
+        ret
+
+; DIVIDE_ERROR  INT 0 handler: reset stack and show ?2
+divide_error:
+        mov al, ERR_OV
+        jmp do_error_hw
+
+; NMI_HANDLER  INT 2 handler: reset stack and show ?B
+nmi_handler:
+        mov al, ERR_BRK
+        ; fall through to do_error_hw
+
+; DO_ERROR_HW: abandon corrupt interrupt stack, re-enter interpreter
+do_error_hw:
+        mov sp, STACK_TOP
+        jmp do_error
 %endif
 
 ; =============================================================================
@@ -1735,47 +1846,18 @@ chrs_tab:       dw kw_chrs
 to_tab:         dw kw_to
 step_tab:       dw kw_step
 
-; =============================================================================
-; ROM-only routines: bdly, divide_error, nmi_handler, do_error_hw
-; =============================================================================
 %ifdef ROM
-
-; BDLY  one bit-period delay for bitbang serial
-; Clobbers: nothing (saves/restores CX)
-bdly:
-        push cx
-        mov cx, BAUD            ; 60 iterations x 17cy = 1020cy @5MHz ~4800baud
-        loop $
-        pop cx
-        ret
-
-; DIVIDE_ERROR  INT 0 handler
-; 8086 divide-by-zero pushes flags+CS+IP; stack state unknown to BASIC.
-; Reset stack and re-enter interpreter with error code.
-divide_error:
-        mov al, ERR_OV          ; ?2 = divide/overflow error
-        jmp do_error_hw
-
-; NMI_HANDLER  INT 2 handler (NMI break key)
-nmi_handler:
-        mov al, ERR_BRK         ; ?B = break
-        ; fall through
-
-; DO_ERROR_HW  safe entry from hardware interrupt context
-; The hardware stack is abandoned; we reset SP before calling do_error.
-do_error_hw:
-        mov sp, STACK_TOP       ; abandon interrupt stack
-        jmp do_error
-
-; --- Reset vector stub at 0xFFF0 -------------------------------------------
-; 8086 resets to CS=0xFFFF IP=0x0000 -> physical 0xFFFF0.
-; With ROM at 0xF800-0xFFFF, 0xFFFF0 is at offset 0x07F0 within the 2KB ROM.
+; --- Reset vector at 0xFFF0 -------------------------------------------
+; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
+; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
+; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
         org 0xFFF0
 reset_vec:
-        jmp start               ; near jump (3 bytes) to cold start
-        times (0xFFFE - $) db 0xFF  ; pad to last 2 bytes
-        dw 0xFFFF               ; ROM end marker
-
+        db 0xEA                 ; far JMP opcode
+        dw 0x0000               ; IP = 0x0000
+        dw 0xF800               ; CS = 0xF800 -> start
+        times (0xFFFE - $) db 0xFF
+        dw 0xFFFF               ; end marker
 %else
-ROM_END:        db 0            ; size marker for non-ROM targets
+ROM_END:        db 0
 %endif
