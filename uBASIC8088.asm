@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.6.0
+; uBASIC 8088  v1.5.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC for single-segment 8088/8086 systems.
@@ -7,101 +7,17 @@
 ;
 ; Credit to Oscar Toledo for his bootBASIC inspiration
 ;
-; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM 
-; 		OUT END RUN LIST NEW POKE FREE HELP
-; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) IN(I/O) A-Z
+; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM END RUN LIST NEW POKE FREE HELP
+; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) A-Z
 ; Numbers    : signed 16-bit (-32768..32767)
-; Multi-stmt : colon separator ':' (dont use for/next or gosub/return on same line)
-; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  
-;		?4 bad variable  ?5 return without gosub ?B Break into Program (ROM only)
-;
-; =============================================================================
-; BUILD INSTRUCTIONS
-; =============================================================================
-;
-; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
-;   or NASM (both produce identical output for this file).
-;
-; --- Variant 1: 8086tiny batch-test (boot sector, BIOS I/O) -----------------
-;
-;   Assemble:
-;     tinyasm -f bin uBASIC8088.asm -o uBASIC8088.bin
-;   or:
-;     nasm -f bin uBASIC8088.asm -o uBASIC8088.bin
-;
-;   Create floppy image (bootsect.asm loads 5 sectors to 0x0000:0x7E00):
-;     nasm -f bin bootsect.asm -o boot.bin
-;     python3 -c "
-;       boot  = open('boot.bin','rb').read()
-;       basic = open('uBASIC8088.bin','rb').read()
-;       img   = boot + basic + bytes(2560 - len(basic))
-;       open('floppy.img','wb').write(img)"
-;
-;   Run under 8086tiny (compile with -DNO_GRAPHICS for stdio):
-;     gcc -O2 -DNO_GRAPHICS -o 8086tiny 8086tiny.c
-;     ./8086tiny bios.bin floppy.img
-;
-;   Memory map:
-;     ORIGIN   = 0x7E00  (code loaded here by boot sector)
-;     RAM_BASE = 0x1000  (variables, program store)
-;     RAM_SIZE = 4096    (4KB)
-;     I/O      = BIOS INT 10h (display), INT 16h (keyboard)
-;
-; --- Variant 2: 8bitworkshop online IDE (YASM/yasm assembler) ----------------
-;
-;   Open the file directly in https://8bitworkshop.com (8086 mode).
-;   yasm defines __YASM_MAJOR__ which selects this variant automatically.
-;   A pre-loaded Mandelbrot showcase program is embedded in the image.
-;
-;   Memory map:
-;     ORIGIN   = 0xF800  (8bitworkshop segment base)
-;     RAM_BASE = 0x0000
-;     RAM_SIZE = 4096    (4KB)
-;     I/O      = BIOS INT 10h / INT 16h (emulated by 8bitworkshop)
-;
-; --- Variant 3: Standalone ROM target (real hardware) -----------------------
-;
-;   Assemble:
-;     tinyasm -f bin -dROM=1 uBASIC8088.asm -o uBASIC_rom.bin
-;
-;   The output is exactly 2048 bytes, ready to burn to a 2KB EPROM/EEPROM.
-;
-;   Hardware design:
-;     CPU    : Intel 8088 @ 5 MHz (or compatible)
-;     ROM    : 2KB at physical 0xF800-0xFFFF  (A12=1 selects ROM)
-;     RAM    : 2KB at physical 0x0000-0x07FF  (A12=0 selects RAM)
-;     Serial : Intel 8755 MMIO
-;                Port A (0x00) bit 0 = TX (output), bit 1 = RX (input)
-;                DDR A (0x02) configured in init: 0xFD = all outputs except RX
-;              Baud rate: 4800 baud @ 5 MHz (BAUD=60 loop constant)
-;     Reset  : 8086 reset vector at 0xFFFF0 -> FAR JMP to 0xF800:0x0000 (start)
-;     INT 0  : Divide-by-zero -> prints ?2 and re-enters interpreter
-;     INT 2  : NMI (break key) -> prints ?B and re-enters interpreter
-;
-;   Memory map:
-;     ORIGIN   = 0xF800  (ROM occupies 0xF800-0xFFFF, reset stub at 0xFFF0)
-;     RAM_BASE = 0x0000  (RAM 0x0000-0x07FF)
-;     RAM_SIZE = 2048    (2KB)
-;     STACK    = 0x0800  (top of RAM)
-;     I/O      = bitbang UART via 8755 Port A
-;
-;   Simulate (requires XTulator cpu.c by Mike Chambers + stubs):
-;     gcc -O2 -o sim_rom sim_rom.c cpu.c   # cpu.c, cpu.h, cpuconf.h from XTulator
-;     ./sim_rom uBASIC_rom.bin              # run ROM image
-;     ./sim_rom uBASIC_rom.bin --trace      # trace every instruction
-;     echo "PRINT 2+2" | ./sim_rom uBASIC_rom.bin --cycles 5000000
-;
-;   Simulator memory model (sim_rom.c):
-;     CS=DS=ES=SS=0x0000 (flat single-segment)
-;     addr >= 0xF800 -> ROM[addr & 0x7FF]   (top 2KB of address space)
-;     addr <  0xF800 -> RAM[addr & 0x7FF]   (bottom of address space)
-;     I/O: output/input_key intercepted at entry points; bitbang bypassed.
-;
-; =============================================================================
+; Multi-stmt : colon separator ':'
+; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  ?4 bad variable  ?5 return without gosub
 ;
 ; Segment model: CS=DS=ES=SS (single segment, flat).
 ;   Boot sector (bootsect.asm) loads 5 sectors to 0x7E00 and jumps there.
 ;   All absolute addresses in RAM (VARS, PROGRAM, etc.) are segment-0 offsets.
+;
+; I/O: BIOS INT 10h/AH=0Eh display, INT 16h/AH=00h keyboard.
 ;
 ; Line store: <linenum_lo> <linenum_hi> <tokenized body> <CR>
 ;   Token bytes 0x80..0x93 replace keywords; printable ASCII and CR pass through.
@@ -111,7 +27,6 @@
 ;   String literals (between quotes) and REM bodies stored verbatim.
 ;
 ; History:
-;   v1.6.0 (2026-04-26)  Added missing IN/OUT commands, refactored to make space.
 ;   v1.5.0 (2026-04-23)  ROM target integration + showcase fixes:
 ;     - %ifdef ordering: ROM first so -dROM=1 wins over __YASM_MAJOR__
 ;     - RAM_SIZE conditional: 2KB for ROM (2KB RAM), 4KB for others
@@ -208,15 +123,16 @@
 ORIGIN:         equ 0xF800
 RAM_BASE:       equ 0x0000
 RAM_SIZE:       equ 2048        ; 2KB RAM (A12=0 selects RAM, A12=1 selects ROM)
-%else
-%ifdef __YASM_MAJOR__           ; 8bitworkshop: yasm defines __YASM_MAJOR__
+
+%elifdef __YASM_MAJOR__         ; 8bitworkshop: yasm defines __YASM_MAJOR__
         SECTION .text
 ORIGIN:         equ 0xf800      ; showcase placed at PROGRAM offset from seg 0
 RAM_BASE:       equ 0x0
+
 %else                           ; 8086tiny: boot sector loads to 0x7E00
 ORIGIN:         equ 0x7E00
 RAM_BASE:       equ 0x1000
-%endif
+
 %endif
         
 ; --- RAM layout (all relative to RAM_BASE) ----------------------------------
@@ -248,7 +164,6 @@ ERR_OM:         equ 0x33
 ERR_UK:         equ 0x34
 ERR_RT:         equ 0x35  ; RETURN without GOSUB
 ERR_NF:         equ 0x36  ; NEXT without FOR
-ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
 T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
@@ -265,8 +180,9 @@ T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
 T_B:            equ 0xC2        ; 'B'  GOSUB
 
-; --- Token bytes (0x80.. = keyword in stored program) ---
-; Order matches st_tab
+; --- Token bytes (0x80..0x8F = keyword in stored program) ---
+; Order matches st_tab: PRINT IF GOTO LIST RUN NEW INPUT REM END
+;                       LET POKE FREE HELP GOSUB RETURN THEN
 TK_PRINT:       equ 0x80
 TK_IF:          equ 0x81
 TK_GOTO:        equ 0x82
@@ -282,21 +198,22 @@ TK_FREE:        equ 0x8B
 TK_HELP:        equ 0x8C
 TK_GOSUB:       equ 0x8D
 TK_RETURN:      equ 0x8E
+; stmt dispatch range: TK_PRINT(0x80)..TK_NEXT(0x90), NUM_TOKENS=17 entries
+; sub-keywords TK_THEN/TK_TO/TK_STEP are >= 0x91 (not dispatched by stmt)
 TK_FOR:         equ 0x8F        ; st_tab index 15
 TK_NEXT:        equ 0x90        ; st_tab index 16
-TK_OUT:		equ 0x91
-NUM_TOKENS:     equ 18          ; stmt-dispatch tokens: TK_PRINT..TK_OUT
-; sub-keywords TK_THEN/TK_TO/TK_STEP are >= 0x91 (not dispatched by stmt)
-TK_THEN:        equ 0x92        ; sub-keyword (not in st_tab, outside dispatch)
-TK_TO:          equ 0x93        ; sub-keyword (FOR..TO)
-TK_STEP:        equ 0x94        ; sub-keyword (FOR..STEP)
+NUM_TOKENS:     equ 17          ; stmt-dispatch tokens: TK_PRINT..TK_NEXT
+TK_THEN:        equ 0x91        ; sub-keyword (not in st_tab, outside dispatch)
+TK_TO:          equ 0x92        ; sub-keyword (FOR..TO)
+TK_STEP:        equ 0x93        ; sub-keyword (FOR..STEP)
 
 ; --- ROM bitbang serial: Intel 8755, 4800 baud @ 5MHz ----------------------
 PORT_A:         equ 0x00        ; 8755 Port A data register
 DDR_A:          equ 0x02        ; 8755 Port A direction register
 TX:             equ 0x01        ; Port A bit 0 = TX (output)
 RX:             equ 0x02        ; Port A bit 1 = RX (input)
-BAUD:           equ 57          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
+BAUD:           equ 60          ; bit-period loop count: 17cy/iter @5MHz ~4800baud
+ERR_BRK:        equ 0x42        ; NMI break: prints "?B"
 
 ; =============================================================================
 ; Pre-loaded showcase (8BitWorkshop only).  Type RUN to execute, NEW to clear.
@@ -311,7 +228,7 @@ BAUD:           equ 57          ; bit-period loop count: 17cy/iter @5MHz ~4800ba
 
 ; 8bitworkshop default org 0
 %ifdef __YASM_MAJOR__
-	mov ax, reset_vec; Trampoline for 8bitworkshop, overwritten when running
+	mov ax, start 	; Trampoline for 8bitworkshop, overwritten when running
 	jmp ax          ; One way to do a Near jump greater than 32768
 	times (PROGRAM - 5) nop  ;  Pad over program VARS/Equates (3byte mov, 2byte jump)
 
@@ -382,6 +299,20 @@ SHOWCASE_END:
 ; =============================================================================
 start:
         cld
+
+%ifdef ROM
+        ; ROM cold start: segments, stack, serial, vectors
+        cli
+        xor ax, ax
+%else
+        ; 8bitworkshop / 8086tiny: CS=DS=ES=SS
+        mov ax, cs
+%endif
+        ; setup segments
+        mov ds, ax
+        mov es, ax
+        mov ss, ax
+        mov sp, STACK_TOP
 %ifdef ROM
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
         mov al, 0xFD
@@ -400,23 +331,19 @@ start:
         ; PROG_END points AT the sentinel (= PROGRAM + body bytes, excl sentinel)
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %else
-        ; Zero RAM inline (no CALL - avoids stack at top of RAM being clobbered).
-        ; CX = words to zero = (STACK_TOP-2)/2, leaving return-addr slot intact.
-        ; Then separately zero stack slot and set PROG_END.
-        xor ax, ax
+        ; clear all memory
         mov di, RAM_BASE
         mov cx, RAM_SIZE / 2
-        rep stosw
+        call clr_mem
 	mov word [PROG_END], PROGRAM
 %endif
 
 %ifdef ROM
         ; Install interrupt vectors (IP only; CS was zeroed above)
-        mov ax, 0xf800
         mov word [DIV0],   divide_error
-        mov word [DIV0+2], ax
+        mov word [DIV0+2], 0xF800
         mov word [NMI],    nmi_handler
-        mov word [NMI+2],  ax
+        mov word [NMI+2],  0xF800
 %endif
         ; signon
 	mov si, str_banner
@@ -506,49 +433,40 @@ stmt:
         cmp al, TK_PRINT + NUM_TOKENS
         jnb stmt_text           ; >= 0x90: not a token
         inc si                  ; consume token byte
-        sub al, TK_PRINT        ; AL = 0..17 (index into st_tab)
+        sub al, TK_PRINT        ; AL = 0..15 (index into st_tab)
         xor ah, ah
-        add ax, ax              ; AX = index * 2 (dw handler table)
+        add ax, ax              ; AX = index * 2
+        add ax, ax              ; AX = index * 4 (each st_tab entry = 4 bytes)
         mov bx, st_tab
-        add bx, ax              ; BX -> correct st_tab handler
-        jmp [bx]                ; dispatch directly (saves kw_match loop)
+        add bx, ax              ; BX -> correct st_tab entry
+        jmp [bx+2]              ; dispatch directly (saves kw_match loop)
         ; --- Text fall-through (direct mode) ---
 stmt_text:
-        mov bx, tk_kw_tab
-        mov cx, NUM_TOKENS
+        mov bx, st_tab
 stmt_lp:
+        mov ax, [bx]
+        or ax, ax
+        je do_let               ; sentinel -> implicit LET/assignment
         call kw_match
         jnc stmt_call
-        add bx, 2
-        loop stmt_lp
-        jmp do_let              ; no keyword -> implicit LET/assignment
+        add bx, 4
+        jmp short stmt_lp
 stmt_call:
-        mov ax, bx
-        sub ax, tk_kw_tab
-        add ax, st_tab
-        mov bx, ax
-        jmp [bx]                ; indirect call to handler
-; =============================================================================
-; DO_INPUT  INPUT <var>
-; =============================================================================
-do_input:
-        ; Validate variable letter before proceeding
-	call let_input_hlpr            
-        mov al, '?'
-        call output
-        mov al, ' '
-        call output
-        call input_line
-        call expr
-        pop di
-        mov [di], ax
-        ret
+        jmp [bx+2]              ; indirect call to handler
         
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
-	call let_input_hlpr     
+        call spaces
+        mov al, [si]
+        call uc_al
+        cmp al, 'A'
+        jb JERRUK
+        cmp al, 'Z'
+        ja JERRUK
+        call get_var_addr
+        push di
         call spaces
         cmp byte [si], '='
         jne dl_err2
@@ -562,20 +480,7 @@ dl_err2:
 JERRUK:
         mov al, ERR_UK
         jmp do_error
-
-; -- helper
-let_input_hlpr:
-        call spaces
-        mov al, [si]
-        call uc_al
-        cmp al, 'A'
-        jb JERRUK
-        cmp al, 'Z'
-        ja JERRUK
-        call get_var_addr
-        push di
-        ret
-
+        
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ;
@@ -639,6 +544,70 @@ uc_al:
         ja uc_al_r
         and al, 0xdf
 uc_al_r:
+dg_ret:
+        ret
+
+; =============================================================================
+; DO_GOTO / DO_RUN
+; =============================================================================
+do_goto:
+        call    expr            ; AX = target line
+        call    find_line       ; DI = pointer to line >= AX
+        cmp     [di], ax        ; Does it exist exactly?
+        je      dg_common       ; Yes: proceed to run/resume
+JERRUL:
+        mov     al, ERR_UL      ; No: Undefined Line error
+        jmp     do_error
+
+do_run:
+        mov     di, PROGRAM     ; RUN always starts at the beginning
+dg_common:
+        mov     [RUN_NEXT], di  ; Update the program counter
+        cmp     byte [RUNNING], 0
+        jne     dg_ret          ; If already running (from a GOTO), just return
+        inc     byte [RUNNING]  ; Set RUNNING to 1
+        ; Fall through to run_loop
+
+; =============================================================================
+; RUN_LOOP
+; =============================================================================
+run_loop:
+        mov     di, [RUN_NEXT]  ; Get pointer to current line
+        mov     si, di
+        lodsw                   ; AX = Line Number, SI = points to body
+        test    ax, ax          ; Is it 0000 (End of Program)?
+        jz      run_end
+        
+        mov     [CURLN], ax     ; Update current line number for error reporting
+        call    next_line_ptr   ; This uses DI to find the START of the NEXT line
+        mov     [RUN_NEXT], di  ; Store it for the next iteration
+        
+        ; SI is already pointing to the body because of LODSW!
+        call    stmt_line       ; Execute the statement
+        jmp     short run_loop
+        
+; =============================================================================
+; DO_NEW  clear program store (PROGRAM..PROGRAM_TOP) and reset PROG_END
+; Uses rep stosw so the sentinel at PROG_END is always 0x0000.
+; Also eliminates stale data that could confuse walk_lines after LOAD/SAVE.
+; =============================================================================
+do_new:
+        mov word [PROG_END], PROGRAM
+        mov di, PROGRAM         ; start of program store
+        mov cx, (PROGRAM_TOP - PROGRAM) / 2   ; words to clear
+clr_mem:
+        xor ax, ax
+	rep stosw               ; zero entire program store
+        ; fall through to do_end (clears RUNNING via run_end)
+
+; =============================================================================
+; DO_END  END statement - stops program execution
+; =============================================================================
+do_end:
+	xor ax,ax
+        mov word [RUN_NEXT],ax
+run_end:
+        mov byte [RUNNING], al	; ax is zero from do_run:
 dl_done:
         ret
 
@@ -656,8 +625,9 @@ dl_lp:
         mov al, ' '
         call output
 
-        mov si, di          ; SI = DI + 2
-        add si, 2
+        mov si, di          ; SI = DI
+        inc si              ; SI = DI + 2 (using two INCs is 2 bytes, 
+        inc si              ; same as ADD SI, 2, but often cleaner)
 
 dl_body:
         lodsb
@@ -751,29 +721,46 @@ dp_after:
         jmp short dp_top
 
 ; =============================================================================
+; DO_INPUT  INPUT <var>
+; =============================================================================
+do_input:
+        ; Validate variable letter before proceeding
+        call spaces
+        mov al, [si]
+        call uc_al
+        cmp al, 'A'
+        jb di_err
+        cmp al, 'Z'
+        ja di_err
+        call get_var_addr       ; DI = &var; SI advanced
+        push di
+        mov al, '?'
+        call output
+        mov al, ' '
+        call output
+        call input_line
+        call expr
+        pop di
+        mov [di], ax
+        ret
+di_err:
+        mov al, ERR_UK
+        jmp do_error
+
+; =============================================================================
 ; DO_POKE  POKE <addr>, <val> - need to finagle addresses above 32768
-; DO_OUT  OUT <addr>, <val> 
 ; =============================================================================
 do_poke:
-	call poke_out_hlpr
-	mov [di], al
-	ret
-
-do_out:
-	call poke_out_hlpr
-	mov dx,di
-        out dx, al
-	ret
-
-poke_out_hlpr:
-        call expr		; destination address
-        push ax			; save: second expr's kw_match clobbers DI
+        call expr
+        mov di, ax              ; DI = destination address
+        push di                 ; save: second expr's kw_match clobbers DI
         call spaces
         cmp byte [si], ','
         jne JERRSN
         inc si
         call expr               ; AX = value to poke
-        pop di
+        pop di                  ; restore destination address
+        mov [di], al
         ret
 JERRSN:
         mov al, ERR_SN
@@ -949,38 +936,25 @@ e2_par:
         inc si
         ret 
 
-peek_in_hlp:
-        call eat_paren_expr
-        mov bx, ax
-        xor ah, ah
-        ret
-        
-e2_nchrs:	; not chr$ is it PEEK 
+e2_nchrs:
         ; PEEK
         mov bx, peek_tab
         call kw_match
-        jc e2_npeek	; not peek
-        call peek_in_hlp
+        jc e2_npeek
+        call eat_paren_expr
+        mov bx, ax
+        xor ah, ah
         mov al, [bx]
         ret
-
-e2_npeek:	; not PEEK is it IN 
-        ; IN
-        mov bx, in_tab
-        call kw_match
-        jc e2_nin	; not peek
-        call peek_in_hlp
-        mov dx, bx
-        in al,dx
-        ret
-
-e2_nin:
+        
+e2_npeek:
         ; USR
         mov bx, usr_tab
         call kw_match
         jc e2_nusr
         call eat_paren_expr
-        jmp ax ; tail call
+        call ax
+        ret
         
 e2_var:
         ; variable A-Z?
@@ -1136,30 +1110,30 @@ new_line:
 ; =============================================================================
 output:
 %ifdef ROM
-    mov ah, al          ; AH = character to send
-    mov al, 0           ; Start bit (Line goes low)
-    out PORT_A, al
-    call bdly
-    
-    mov bl, 9           ; 8 Data bits + 1 Stop bit = 9 total iterations
-    stc                 ; Carry=1: This will eventually shift out as our stop bit
+        ; bitbang TX: start bit, 8 data bits LSB-first, stop bit
+        mov ah, al              ; stash char
+        xor al, al
+        out PORT_A, al          ; start bit (TX=0)
+        call bdly
+        mov cx, 8
 .out_bit:
-    rcr ah, 1           ; Rotate LSB into Carry; previous Carry into AH bit 7
-    sbb al, al          ; If CF=1, AL=FF. If CF=0, AL=00.
-    and al, TX          ; Mask for the TX pin (e.g., bit 1)
-    out PORT_A, al      ; Send the bit
-    call bdly
-    stc                 ; Ensure Carry is 1 for the next shift-in
-    dec bx              ; Use BX (1-byte dec) instead of BL (2-byte dec)
-    jnz .out_bit
-    ret
+        mov al, ah
+        and al, TX              ; LSB into bit0
+        out PORT_A, al
+        call bdly
+        shr ah, 1
+        loop .out_bit
+        mov al, TX
+        out PORT_A, al          ; stop bit (TX=1)
+        call bdly
+        ret
 %else
-    push bx
-    mov ah, 0x0e
-    mov bx, 0x0007
-    int 0x10
-    pop bx
-    ret
+        push bx
+        mov ah, 0x0e
+        mov bx, 0x0007
+        int 0x10
+        pop bx
+        ret
 %endif
         
 ; =============================================================================
@@ -1215,63 +1189,43 @@ do_error_nl:
         jmp main_loop    
         
 ; =============================================================================
-; INPUT_KEY -> AL
+; INPUT_KEY  -> AL
 ; ROM: bitbang UART RX from 8755 Port A bit1.  Others: BIOS INT 16h.
 ; =============================================================================
 input_key:
 %ifdef ROM
 .ik_wait:
-    in al, PORT_A           ; Read port
-    test al, RX             ; Check RX line (usually bit 1)
-    jnz .ik_wait            ; Loop until start bit (Low)
-    
-    call bdly               ; Center of start bit (or end, per original logic)
-    mov ah, 0x80             ; AH = Marker bit. When it shifts out, we're done.
+        in al, PORT_A
+        test al, RX
+        jnz .ik_wait            ; wait for start bit (RX low)
+        mov cx, BAUD/2
+        loop $                  ; half-bit delay to centre of start bit
+        in al, PORT_A
+        test al, RX
+        jnz input_key           ; false start: retry
+        call bdly               ; align to mid-first-data-bit
+        mov cx, 8
+        xor ah, ah
 .ik_bit:
-    in al, PORT_A           ; Read data bit
-    shr al, 1               ; Move bit 1 into bit 0...
-    shr al, 1               ; ...and bit 0 into Carry Flag (CF)
-    rcr ah, 1               ; Rotate CF into AH, and AH's LSB into CF
-    call bdly               ; Wait for next bit period
-    jnc .ik_bit             ; If the marker '1' hasn't fallen into CF, loop
-    
-    mov al, ah              ; Move result to return register
-    ret
+        in al, PORT_A
+        shr al, 1               ; RX=bit1: shift right once -> into CF
+        rcr ah, 1               ; rotate CF into MSB of AH (LSB-first build)
+        call bdly
+        loop .ik_bit
+        call bdly               ; consume stop bit
+        mov al, ah
+        ret
 %else
-    mov ah, 0x00
-    int 0x16
-    ret
-%endif
-
-; =============================================================================
-; bdly (bit-delay) - Optimized for size
-; Clobbers: CX (saved by Marker Bit logic above instead of push/pop)
-; =============================================================================
-%ifdef ROM
-bdly:
-    mov cx, BAUD            ; 3 bytes
-    loop $                  ; 2 bytes - 17 cycles per iteration on 8088
-    ret                     ; 1 byte
-
-; DIVIDE_ERROR  INT 0 handler: reset stack and show ?2
-divide_error:
-        mov al, ERR_OV
-        jmp do_error_hw
-
-; NMI_HANDLER  INT 2 handler: reset stack and show ?B
-nmi_handler:
-        mov al, ERR_BRK
-        ; fall through to do_error_hw
-
-; DO_ERROR_HW: abandon corrupt interrupt stack, re-enter interpreter
-do_error_hw:
-        mov sp, STACK_TOP
-        jmp do_error
+        mov ah, 0x00
+        int 0x16
+        ret
 %endif
 
 ; =============================================================================
 ; LINE EDITOR  
 ; =============================================================================
+find_program_end:
+        mov ax, 0xffff
 find_line:
 ;         
 walk_lines:
@@ -1383,7 +1337,10 @@ ins_shift_done:
         mov [di], ax
         add di, 2
 ins_copy:
-        rep movsb                ; copy tokenized body+CR (CX bytes)
+        lodsb
+        stosb
+        cmp al, 0x0d
+        jne ins_copy
 
         ; PROG_END += linenum_word + body+CR = DX
         add [PROG_END], dx
@@ -1411,70 +1368,8 @@ deline:
         rep movsb               ; slide data down (DI advances by CX)
         sub [PROG_END], bx
         pop di                  ; restore DI to original insertion point
-dg_ret:
-	ret
-; =============================================================================
-; DO_NEW  clear program store (PROGRAM..PROGRAM_TOP) and reset PROG_END
-; Uses rep stosw so the sentinel at PROG_END is always 0x0000.
-; Also eliminates stale data that could confuse walk_lines after LOAD/SAVE.
-; =============================================================================
-do_new:
-        mov word [PROG_END], PROGRAM
-        mov di, PROGRAM         ; start of program store
-        mov cx, (PROGRAM_TOP - PROGRAM) / 2   ; words to clear
-clr_mem:
-        xor ax, ax
-	rep stosw               ; zero entire program store
-        ; fall through to do_end (clears RUNNING via run_end)
-
-; =============================================================================
-; DO_END  END statement - stops program execution
-; =============================================================================
-do_end:
-        mov ax, [PROG_END]      ; Point RUN_NEXT at the sentinel (0x0000 word)
-        mov [RUN_NEXT], ax      ; run_loop will read 0 and exit cleanly
-        xor al, al              ; AL=0 for RUNNING clear below
-run_end:
-        mov byte [RUNNING], al  ; Clear running flag
         ret
-; =============================================================================
-; DO_GOTO / DO_RUN
-; =============================================================================
-do_goto:
-        call    expr            ; AX = target line
-        call    find_line       ; DI = pointer to line >= AX
-        cmp     [di], ax        ; Does it exist exactly?
-        je      dg_common       ; Yes: proceed to run/resume
-JERRUL:
-        mov     al, ERR_UL      ; No: Undefined Line error
-        jmp     do_error
 
-do_run:
-        mov     di, PROGRAM     ; RUN always starts at the beginning
-dg_common:
-        mov     [RUN_NEXT], di  ; Update the program counter
-        cmp     byte [RUNNING], 0
-        jne     dg_ret          ; If already running (from a GOTO), just return
-        inc     byte [RUNNING]  ; Set RUNNING to 1
-        ; Fall through to run_loop
-
-; =============================================================================
-; RUN_LOOP
-; =============================================================================
-run_loop:
-        mov     di, [RUN_NEXT]  ; Get pointer to current line
-        mov     si, di
-        lodsw                   ; AX = Line Number, SI = points to body
-        test    ax, ax          ; Is it 0000 (End of Program)?
-        jz      run_end
-        
-        mov     [CURLN], ax     ; Update current line number for error reporting
-        call    next_line_ptr   ; This uses DI to find the START of the NEXT line
-        mov     [RUN_NEXT], di  ; Store it for the next iteration
-        
-        ; SI is already pointing to the body because of LODSW!
-        call    stmt_line       ; Execute the statement
-        jmp     short run_loop
 
 ; =============================================================================
 ; DO_GOSUB  GOSUB <linenum>
@@ -1783,7 +1678,6 @@ kw_gosub:   db 0x47,0x4f,0x53,0x55,T_B   ; GOSUB
 kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N  ; RETURN
 kw_for:     db 0x46,0x4F,T_R                  ; FOR  (F,O,R+0x80)
 kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT (N,E,X,T+0x80)
-kw_out:	    db 0x4f,0x55, T_T	
 kw_to:      db 0x54,T_O                       ; TO   (T,O+0x80)
 kw_step:    db 0x53,0x54,0x45,T_P             ; STEP (S,T,E,P+0x80)
 ; not commands but still want to print in help
@@ -1791,7 +1685,6 @@ kw_then:    db 0x54,0x48,0x45,T_N
 kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
-kw_in:	    db 0x49, T_N
 
             db 0
 
@@ -1803,7 +1696,7 @@ tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
         dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next, kw_out      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
+        dw kw_for, kw_next      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
         dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
         dw 0                    ; sentinel
 
@@ -1811,14 +1704,29 @@ tk_kw_tab:
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.6.0"
+str_banner: db "uBASIC 8088 v1.5.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
-; --- Dispatch table: statement handlers in TK_PRINT order --------------------
+; --- Dispatch table: dw kw_ptr, dw handler; sentinel dw 0 -------------------
 st_tab:
-        dw do_print, do_if, do_goto, do_list, do_run, do_new
-        dw do_input, do_rem, do_end, do_let, do_poke, do_free
-        dw do_help, do_gosub, do_return, do_for, do_next, do_out
+        dw kw_print,    do_print
+        dw kw_if,       do_if
+        dw kw_goto,     do_goto
+        dw kw_list,     do_list
+        dw kw_run,      do_run
+        dw kw_new,      do_new
+        dw kw_input,    do_input
+        dw kw_rem,      do_rem
+        dw kw_end,      do_end
+        dw kw_let,      do_let
+        dw kw_poke,     do_poke
+        dw kw_free,     do_free
+        dw kw_help,     do_help
+        dw kw_gosub,    do_gosub
+        dw kw_return,   do_return
+        dw kw_for,      do_for
+        dw kw_next,     do_next
+        dw 0
         ; non commands but still match
 peek_tab:       dw kw_peek
 usr_tab:        dw kw_usr
@@ -1826,34 +1734,48 @@ then_tab:       dw kw_then
 chrs_tab:       dw kw_chrs
 to_tab:         dw kw_to
 step_tab:       dw kw_step
-in_tab:		dw kw_in
 
-; --- Reset vector at 0xFFF0 -------------------------------------------
-; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
-; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
-; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
+; =============================================================================
+; ROM-only routines: bdly, divide_error, nmi_handler, do_error_hw
+; =============================================================================
 %ifdef ROM
-	org 0xFFF0
-%else	; 8bit workshop       
-        ; times 94 nop ; bytes free still?
-%endif
+
+; BDLY  one bit-period delay for bitbang serial
+; Clobbers: nothing (saves/restores CX)
+bdly:
+        push cx
+        mov cx, BAUD            ; 60 iterations x 17cy = 1020cy @5MHz ~4800baud
+        loop $
+        pop cx
+        ret
+
+; DIVIDE_ERROR  INT 0 handler
+; 8086 divide-by-zero pushes flags+CS+IP; stack state unknown to BASIC.
+; Reset stack and re-enter interpreter with error code.
+divide_error:
+        mov al, ERR_OV          ; ?2 = divide/overflow error
+        jmp do_error_hw
+
+; NMI_HANDLER  INT 2 handler (NMI break key)
+nmi_handler:
+        mov al, ERR_BRK         ; ?B = break
+        ; fall through
+
+; DO_ERROR_HW  safe entry from hardware interrupt context
+; The hardware stack is abandoned; we reset SP before calling do_error.
+do_error_hw:
+        mov sp, STACK_TOP       ; abandon interrupt stack
+        jmp do_error
+
+; --- Reset vector stub at 0xFFF0 -------------------------------------------
+; 8086 resets to CS=0xFFFF IP=0x0000 -> physical 0xFFFF0.
+; With ROM at 0xF800-0xFFFF, 0xFFFF0 is at offset 0x07F0 within the 2KB ROM.
+        org 0xFFF0
 reset_vec:
-%ifdef ROM
-        ; ROM cold start: segments, stack, serial, vectors
-        xor ax, ax
+        jmp start               ; near jump (3 bytes) to cold start
+        times (0xFFFE - $) db 0xFF  ; pad to last 2 bytes
+        dw 0xFFFF               ; ROM end marker
+
 %else
-        ; 8bitworkshop / 8086tiny: CS=DS=ES=SS
-        mov ax, cs
-%endif
-        ; setup segments
-        mov ds, ax
-        mov es, ax
-        mov ss, ax
-        mov sp, STACK_TOP
-%ifdef ROM
-	db 0xEA                 ; far JMP opcode
-        dw 0x0000               ; IP = 0x0000
-        dw 0xF800               ; CS = 0xF800 -> start
-%else	
-	jmp start
+ROM_END:        db 0            ; size marker for non-ROM targets
 %endif
