@@ -346,32 +346,27 @@ SHOWCASE_END:
 ; =============================================================================
 start:
         cld
+        
 %ifdef __YASM_MAJOR__
-        ; In 8bitworkshop simulator: execution arrives via reset_vec which already
-        ; set DS=ES=SS=CS.  In FREEDOS EXE mode: the EXE header sets CS:IP=CS:0xF800
-        ; (ORIGIN) and jumps directly here, bypassing reset_vec entirely — so DS/ES/SS
-        ; still point at the PSP.  Normalise unconditionally: harmless if already set.
+        mov ax, cs	; setup EXE segment
+%else
+        ; ROM cold start: segments, stack, serial, vectors
+        xor ax, ax
+%endif
         mov ax, cs
         mov ds, ax
         mov es, ax
         mov ss, ax
         mov sp, STACK_TOP
-%endif
 
 %ifndef __YASM_MAJOR__
-        ; 8755 serial: bit1=RX(in), rest=out; TX idle high
-        mov al, 0xFD
-        out DDR_A, al
-        mov al, TX
-        out PORT_A, al
-        sti
-
         ; Install interrupt vectors
         mov ax, 0xf800
-        mov word [DIV0],   divide_error
-        mov word [DIV0+2], ax
-        mov word [NMI],    nmi_handler
-        mov word [NMI+2],  ax
+        xor di,di
+        mov word [di],   divide_error
+        mov word [di+2], ax
+        mov word [di+8],    nmi_handler
+        mov word [di+10],  ax
 
         ; Zero all RAM (variables, FOR stack, program store).
         mov cx, RAM_SIZE / 2
@@ -1794,31 +1789,26 @@ in_tab:		dw kw_in
 
 ; --- Reset vector at 0xFFF0 -------------------------------------------
 ; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
-; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
-; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
-reset_vec:
 %ifdef __YASM_MAJOR__
-	; 8 bit workshp rejects any times quantity more than 0x7fff
-        ; and does not allow multiple ORGs
-	;times (0xFFF0 - ORIGIN) - ($ - $$) db 0xFF   ; pad to reset vector offset
-        times  117 db 0xff
-        ; 8bitworkshop: CS=DS=ES=SS
-        mov ax, cs
-%else
+	times 115 db 0xff
+%else        
 	org 0xfff0
-        ; ROM cold start: segments, stack, serial, vectors
-        xor ax, ax
 %endif
-        ; setup segmentst
-        mov ds, ax
-        mov es, ax
-        mov ss, ax
-        mov sp, STACK_TOP
+reset_vec:
+        ; 8755 serial: bit1=RX(in), rest=out; TX idle high
+        mov al, 0xFD
+        out DDR_A, al
+        mov al, TX
+        out PORT_A, al
+
 %ifdef __YASM_MAJOR__
         jmp start
-        dw 0xffff
 %else
+        nop
+; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
+; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
         db 0xEA                 ; far JMP opcode
         dw 0x0000               ; IP = 0x0000
         dw 0xF800               ; CS = 0xF800 -> start
 %endif
+	times 2048-($-start) db 0xff	; pad
