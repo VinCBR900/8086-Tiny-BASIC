@@ -16,19 +16,21 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
 
 **Numbers**: signed 16-bit (`-32768..32767`)
 
-**Multi-Statement**: colon separator `:`
+**Multi-Statement**: colon separator `:` (Does not support `GOSUB`/`RETURN` or `FOR`/`NEXT` on same line)
 
 **Errors**: `?0` syntax, `?1` undef line, `?2` div/zero, `?3` out of memory, `?4` bad variable, `?5` `RETURN` without `GOSUB`, `?6` `NEXT` without `FOR`, `?B` break into program (ROM version)
 
-## Build instructions (Variant 3 only)
+## Build instructions 
 
-This repository now supports **only Variant 3** (standalone ROM target).
+Standalone ROM target is built with makefile, otherwise copy/paste into 8bitworkshop to run the embedded demo program.
+
+http://8bitworkshop.com/v3.12.1/?redir.html?platform=x86&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2F8086-Tiny-BASIC&file=uBASIC8088.asm
 
 ### Prerequisites
 - C compiler (`cc`/`gcc`/`clang`)
 - `make`
 
-The build uses the bundled `tools/tinyasm.c` assembler and no longer depends on NASM/YASM.
+The build uses the bundled `tools/tinyasm.c` assembler which is a subset clone of NASM.
 
 ### Build ROM image
 ```bash
@@ -52,7 +54,7 @@ make rom-run
 make clean
 ```
 
-## Variant 3 memory/hardware notes
+## Memory/hardware notes
 - ORIGIN   = `0xF800` (ROM occupies `0xF800-0xFFFF`, reset stub at `0xFFF0`)
 - RAM_BASE = `0x0000` (RAM `0x0000-0x07FF`)
 - RAM_SIZE = `2048` (2KB)
