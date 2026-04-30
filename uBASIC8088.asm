@@ -459,13 +459,10 @@ do_input:
         push di                 ; save var addr: input_line/expr clobber DI
         mov al, '?'
         call output
-        mov al, ' '
-        call output
+        call output_space
         call input_line
         call expr
-        pop di
-        mov [di], ax
-        ret
+        jmp short let_store_ax
         
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
@@ -478,6 +475,7 @@ do_let:
         jne dl_err2
         inc si
         call expr
+let_store_ax:
         pop di
         mov [di], ax
         ret
@@ -576,8 +574,7 @@ dl_lp:
         jz dl_done          ; Exit if 0
 
         call output_number
-        mov al, ' '
-        call output
+        call output_space
 
         mov si, di          ; SI = DI + 2
         add si, 2
@@ -602,8 +599,7 @@ dl_body:
         mov si, bx
 dl_kw_lp:
         call dp_str
-        mov al, ' '
-        call output
+        call output_space
         pop si
         jmp dl_body
 dl_raw:
@@ -1089,8 +1085,7 @@ do_free:
         mov ax, PROGRAM_TOP
         sub ax, [PROG_END]
         call output_number
-        mov al, ' '
-        call output
+        call output_space
         mov si, kw_free
         call dp_str
 	jmp new_line     ; Tail-call: new_line will RET for us
@@ -1102,8 +1097,7 @@ do_help:
     mov si, kw_tab_start
 dh_lp:
     call dp_str
-    mov al, ' '
-    call output
+    call output_space
     cmp byte [si], 0 ; Check for sentinel
     jne dh_lp        ; Loop back if not zero
 
@@ -1133,6 +1127,10 @@ do_error:
 do_error_nl:
         call new_line
         jmp main_loop    
+
+output_space:
+        mov al, ' '
+        jmp output
         
 ; =============================================================================
 ; INPUT_KEY -> AL
@@ -1614,8 +1612,7 @@ df_have_step:
         ret
 
 df_syn:
-        mov     al, ERR_SN
-        jmp     do_error
+        jmp     JERRSN
 
 ; =============================================================================
 ; DO_NEXT  NEXT <var>
