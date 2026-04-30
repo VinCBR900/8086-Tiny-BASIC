@@ -1,176 +1,133 @@
 ; =============================================================================
-; uBASIC 8088  v1.6.0
+; uBASIC 8088  v1.6.1
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
-; Tiny BASIC for single-segment 8088 embedded system.
-; Target: <=2048 bytes code ROM, 4096 bytes RAM.
-; You can play with it in 8bitWorkshop too in x86 mode
+; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
+; Targets a 2 KB code ROM + 2 KB RAM embedded system; also runs in
+; 8bitworkshop (x86 mode) with a pre-loaded Mandelbrot showcase.
 ;
-; Credit to Oscar Toledo for his bootBASIC inspiration
+; Credit: Oscar Toledo G. for bootBASIC inspiration and tinyasm assembler.
 ;
-; Statements : PRINT IF..THEN GOTO GOSUB RETURN FOR..TO..STEP NEXT LET INPUT REM 
-; 		OUT END RUN LIST NEW POKE FREE HELP
-; Expressions: + - * / %  = < > <= >= <>  unary-  CHR$(n) PEEK(addr) USR(addr) IN(I/O) A-Z
-; Numbers    : signed 16-bit (-32768..32767)
-; Multi-stmt : colon separator ':' (dont use for/next or gosub/return on same line)
-; Errors     : ?0 syntax  ?1 undef line  ?2 div/zero  ?3 out of mem  
-;		?4 bad variable  ?5 return without gosub ?B Break into Program (ROM only)
+; ---------------------------------------------------------------------------
+; LANGUAGE REFERENCE
+; ---------------------------------------------------------------------------
+;
+; Statements  : PRINT  IF..THEN  GOTO  GOSUB  RETURN  FOR..TO[..STEP]  NEXT
+;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
+; Expressions : + - * / %   = < > <= >= <>   unary-
+;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr)   variables A..Z
+; Numbers     : signed 16-bit  (-32768 .. 32767)
+; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
+; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
+;               ?4 bad variable   ?5 RETURN without GOSUB   ?B break (ROM only)
+;
+; Line store  : <lo> <hi> <tokenised body> <CR>
+;   Keyword tokens 0x80..0x90 (17 stmt tokens): PRINT IF GOTO LIST RUN NEW
+;     INPUT REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
+;   Sub-keyword tokens 0x91..0x93: THEN  TO  STEP
+;   String literals and REM bodies stored verbatim.
 ;
 ; =============================================================================
 ; BUILD INSTRUCTIONS
 ; =============================================================================
 ;
 ; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
+;            tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
 ;
-; --- Variant 1: 8bitworkshop online IDE (YASM/yasm assembler) ----------------
+; ---------------------------------------------------------------------------
+; Variant 1: Standalone 2 KB ROM  (real hardware or `sim_rom.c` simulator)
+; ---------------------------------------------------------------------------
 ;
-;   Open the file directly in https://8bitworkshop.com (8086 mode).
-;   yasm defines __YASM_MAJOR__ which selects this variant automatically.
-;   A pre-loaded Mandelbrot showcase program is embedded in the image.
-;
-;   Memory map:
-;     ORIGIN   = 0xF800  (8bitworkshop segment base)
-;     RAM_BASE = 0x0000
-;     RAM_SIZE = 4096    (4KB)
-;     I/O      = BIOS INT 10h / INT 16h (emulated by 8bitworkshop)
-;
-; --- Variant 2: Standalone ROM target (real hardware) -----------------------
-;
-;   Assemble:
-;     tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
-;
-;   The output is exactly 2048 bytes, ready to burn to a 2KB EPROM/EEPROM.
-;
-;   Hardware design:
+;   Hardware:
 ;     CPU    : Intel 8088 @ 5 MHz (or compatible)
-;     ROM    : 2KB at physical 0xF800-0xFFFF  (A12=1 selects ROM)
-;     RAM    : 2KB at physical 0x0000-0x07FF  (A12=0 selects RAM)
+;     ROM    : 2 KB  phys 0xF800-0xFFFF  (address line A12=1 selects ROM)
+;     RAM    : 2 KB  phys 0x0000-0x07FF  (address line A12=0 selects RAM)
 ;     Serial : Intel 8755 MMIO
-;                Port A (0x00) bit 0 = TX (output), bit 1 = RX (input)
-;                DDR A (0x02) configured in init: 0xFD = all outputs except RX
-;              Baud rate: 4800 baud @ 5 MHz (BAUD=60 loop constant)
-;     Reset  : 8086 reset vector at 0xFFFF0 -> FAR JMP to 0xF800:0x0000 (start)
-;     INT 0  : Divide-by-zero -> prints ?2 and re-enters interpreter
-;     INT 2  : NMI (break key) -> prints ?B and re-enters interpreter
+;                Port A (0x00)  bit 0 = TX (output)   bit 1 = RX (input)
+;                DDR A  (0x02)  init: 0xFD  (all outputs except RX)
+;              Baud rate: 4800 baud @ 5 MHz  (BAUD = 60 loop constant)
+;     Reset  : 8086 reset -> phys 0xFFFF0 -> FAR JMP to 0xF800:0x0000
+;     INT 0  : divide-by-zero  -> print ?2, re-enter interpreter
+;     INT 2  : NMI / break key -> print ?B, re-enter interpreter
 ;
 ;   Memory map:
-;     ORIGIN   = 0xF800  (ROM occupies 0xF800-0xFFFF, reset stub at 0xFFF0)
-;     RAM_BASE = 0x0000  (RAM 0x0000-0x07FF)
-;     RAM_SIZE = 2048    (2KB)
-;     STACK    = 0x0800  (top of RAM)
+;     ORIGIN   = 0xF800       ROM: 0xF800-0xFFFF, reset stub at 0xFFF0
+;     RAM_BASE = 0x0000       RAM: 0x0000-0x07FF
+;     RAM_SIZE = 2048
+;     STACK    = 0x0800       top of RAM, grows downward
 ;     I/O      = bitbang UART via 8755 Port A
 ;
-;   Simulate (requires XTulator cpu.c by Mike Chambers + stubs):
-;     gcc -O2 -o sim_rom sim_rom.c cpu.c   # cpu.c, cpu.h, cpuconf.h from XTulator
-;     ./sim_rom uBASIC_rom.bin              # run ROM image
-;     ./sim_rom uBASIC_rom.bin --trace      # trace every instruction
-;     echo "PRINT 2+2" | ./sim_rom uBASIC_rom.bin --cycles 5000000
+;   Simulate:
+;     gcc -O2 -o sim_rom sim_rom.c cpu.c    # XTulator cpu core by Mike Chambers
+;     ./sim_rom uBASIC_rom.bin
+;     ./sim_rom uBASIC_rom.bin --trace
+;     ./sim_rom uBASIC_rom.bin --cycles 5000000
 ;
 ;   Simulator memory model (sim_rom.c):
-;     CS=DS=ES=SS=0x0000 (flat single-segment)
-;     addr >= 0xF800 -> ROM[addr & 0x7FF]   (top 2KB of address space)
-;     addr <  0xF800 -> RAM[addr & 0x7FF]   (bottom of address space)
-;     I/O: output/input_key intercepted at entry points; bitbang bypassed.
+;     CS=DS=ES=SS = 0x0000  (flat single-segment)
+;     addr >= 0xF800  ->  ROM[addr & 0x7FF]
+;     addr <  0xF800  ->  RAM[addr & 0x7FF]
+;     I/O: output/input_key intercepted at assembled entry points
+;
+; ---------------------------------------------------------------------------
+; Variant 2: 8bitworkshop online IDE  (YASM assembler, FREEDOS EXE)
+; ---------------------------------------------------------------------------
+;
+;   Open directly at https://8bitworkshop.com in 8086 mode.
+;   YASM defines __YASM_MAJOR__ which selects this variant automatically.
+;   Assembled as a FREEDOS EXE; press RUN to execute the Mandelbrot showcase.
+;
+;   Memory map:
+;     ORIGIN   = 0xF800       (8bitworkshop segment base)
+;     RAM_BASE = 0x0000
+;     RAM_SIZE = 4096         (4 KB)
+;     I/O      = BIOS INT 10h / INT 16h
 ;
 ; =============================================================================
+; CHANGE HISTORY
+; =============================================================================
 ;
-; Line store: <linenum_lo> <linenum_hi> <tokenized body> <CR>
-;   Token bytes 0x80..0x93 replace keywords; printable ASCII and CR pass through.
-;   Stmt tokens 0x80..0x90 (NUM_TOKENS=17): PRINT IF GOTO LIST RUN NEW INPUT
-;     REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
-;   Sub-keyword tokens 0x91..0x93: THEN TO STEP
-;   String literals (between quotes) and REM bodies stored verbatim.
+;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom assisted debugging):
+;     - start: normalise DS/ES/SS=CS under __YASM_MAJOR__: FREEDOS EXE entry
+;       jumps directly to start: (CS:ORIGIN), bypassing reset_vec; without
+;       this DS/ES/SS still point at the PSP -> no banner, ?4 on LIST.
+;     - ROM init ordering: rep stosw now runs BEFORE vector install and
+;       PROG_END init; previously the zero sweep overwrote both.
+;     - ROM init segment regs: removed unconditional mov ax,cs after ROM-path
+;       xor ax,ax; on real hardware CS=0xF800 so mov ax,cs gave DS=0xF800.
+;     - let_input_hlpr: removed push di before ret (ret returned to variable's
+;       RAM address); added push di in do_let/do_input after the call instead.
+;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
+;       all signed < / > comparisons were wrong.  Removed sbb.
+;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
+;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
+;     - sim_rom: added --yasm flag; output/input_key intercept addresses now
+;       runtime-selected (ROM bitbang vs YASM BIOS-INT build).
 ;
-; History:
-;   v1.6.0 (2026-04-26)  Added missing IN/OUT commands
-;     - Refactored statement dispatch table to make space
-;     - Other size optimizations 
-;   v1.5.0 (2026-04-23)  ROM target integration + showcase fixes:
-;     - %ifdef ordering: ROM first so -dROM=1 wins over __YASM_MAJOR__
-;     - RAM_SIZE conditional: 2KB for ROM (2KB RAM), 4KB for others
-;     - ROM serial init: 8755 DDR setup + TX idle before interpreter start
-;     - ROM interrupt vectors: CS=0xF800 written at init
-;     - divide_error: prints ?2 then re-enters interpreter (do_error_hw)
-;     - nmi_handler: prints ?B then re-enters interpreter (do_error_hw)
-;     - do_error_hw: resets SP then calls do_error (safe from any context)
-;     - bdly: bit-period delay routine for bitbang serial (BAUD=60@5MHz)
-;     - output/input_key: conditional on %ifdef ROM (bitbang vs BIOS)
-;     - Reset vector stub at 0xFFF0: near JMP to start, padded 0xFF
-;     - Showcase: rep stosw CX fixed to (PROGRAM-RAM_BASE)/2 -- stops
-;       exactly before PROGRAM so first showcase byte is not zeroed
-;     - 8bitworkshop PROG_END init points AT sentinel (consistent with do_new)
-;   v1.4.1 (2026-04-23) No new features, Reorg prepping for ROM version
-;   v1.4.0 (2026-04-19)  FOR/NEXT with optional STEP:
-;     - FOR <var>=<start> TO <end> [STEP <step>]
-;     - NEXT <var>: increments var, loops if condition holds, unwinds nesting
-;     - Dedicated 4-entry FOR stack at FOR_SP(0x1090)/FOR_STK(0x1092)
-;     - PROGRAM moved 0x1090->0x10B2; costs 34 bytes of program store
-;     - Tokens: stmt TK_FOR=0x8F TK_NEXT=0x90; sub-kw TK_THEN=0x91 TK_TO=0x92 TK_STEP=0x93
-;     - Bugs fixed: kw_match clobbers DI->save var_ptr in INS_TMP; kw_match
-;       clobbers AX(AH)->set default step AFTER kw_match; input_number clobbers
-;       CX->push/pop CX around STEP expr; kw_next had wrong terminator T_X->T_T
-;     - do_poke: push/pop DI around value expr (same kw_match/DI issue)
-;     - Error ?6 = NEXT without FOR
-;     - Incorporates uploaded tweaks: dp_str in dl_kw_lp, new_line tail-call
-;   v1.3.1 (2026-04-18)  Bugfix release:
-;     - LIST: dl_eol now outputs CR+LF (was LF only)
-;     - Showcase (8bitworkshop): db data converted to tokenised form;
-;       saves 195 bytes of program store and makes LIST correct
-;     - Version string updated to v1.3.1
-;   v1.3.0 (2026-04-17)  Tokenizer + line-editor refactor:
-;     - Lines stored tokenized: keywords -> 0x80..0x8F (saves ~19% program store)
-;     - LIST detokenizes on output (keywords printed uppercase)
-;     - stmt: token fast-path (0x80+ -> direct dispatch, no kw_match loop)
-;     - tokenize(): in-place scan of IBUF, string/REM passthrough
-;     - insline refactored: drop second find_line call and BP stack frame
-;     - deline refactored: use PROG_END directly, not find_program_end
-;     - editln: tokenize IBUF before insline
-;   v1.2.0 (2026-04-17)  Add GOSUB/RETURN:
-;     - Dedicated 8-entry GOSUB stack at 0x107E (GOSUB_SP) + 0x1080 (GOSUB_STK)
-;     - PROGRAM store moved 0x107E -> 0x1090 (costs 18 bytes program RAM)
-;     - New error ?5 = RETURN without GOSUB
-;     - GOSUB: saves RUN_NEXT on GOSUB_STK, then behaves like GOTO
-;     - RETURN: restores RUN_NEXT from GOSUB_STK, resumes after GOSUB line
-;   v1.1.0 (2026-04-17)  Bug fixes and do_new improvement:
-;     - expr: add xor ax,ax before test ah,dl so rel_t (dec ax) yields
-;       0xFFFF; AX held right operand, giving wrong relational results.
-;     - do_new: rep stosw to clear entire program store, not just sentinel;
-;       prevents stale data confusing walk_lines after future LOAD/SAVE.
-;     - equ "0".."4" changed to equ 0x30..0x34 (tinyasm compatibility).
-;     - dp_str_eol dead label removed.
-;   v1.0.9 (2026-04-12)  Expand IBUF 34->64 bytes; input limit 32->62 chars.
-;                         Fixes silent truncation of long lines (e.g. nested
-;                         IF with multi-digit numbers). Embed Mandelbrot
-;                         showcase as pre-loaded ROM program (COM build).
-;   v1.0.8 (2026-04-10)  Fix editln: push/pop BX around find_line+deline;
-;                         walk_lines clobbered BX (body pointer), causing
-;                         ins_copy to read from 0x0000 (IVT) instead of IBUF.
-;   v1.0.7 (2026-04-10)  Fix modulo: IDIV clobbers DX (DL=operator) with
-;                         remainder; save DL to BL before IDIV, compare BL.
-;   v1.0.6 (2026-04-10)  Fix rel_lt and rel_gt plain-op paths: pop ax before
-;                         call rel_setup was missing (stack imbalance + wrong BX).
-;   v1.0.5 (2026-04-10)  Fix expression register preservation:
-;     expr: push/pop AX (not BX) to save left operand across peek;
-;     rel_xx: pop AX (restore left) before call rel_setup;
-;     rel_setup: reverted to push ax/call expr_add/pop bx;
-;     ea_do: push/pop DX to preserve operator DL across call expr1.
-;   v1.0.4 (2026-04-10)  Fix expr: save expr_add result in BX before relational
-;                         peek; mov al,[si] was overwriting AL (low byte of AX),
-;                         corrupting all expression results to 0x0D (CR).
-;   v1.0.3 (2026-04-10)  Fix expr2: reload AL from [si] after kw_match chain
-;                         (kw_match clobbers AL; stale value used for digit/var test)
-;   v1.0.2 (2026-04-10)  Fix for 8086tiny / boot sector execution:
-;     - ORG changed from 0x0100 to 0x7E00 to match boot sector load address.
-;       All dw pointers in st_tab and kw tables now resolve correctly.
-;     - Init: CX increased from 26 to 48 words so rep stosw zeroes all RAM
-;       control variables (RUNNING, CURLN, IBUF, PROG_END, RUN_NEXT, INS_TMP).
-;     - Segment setup: push cs / pop ds/es/ss added to ensure CS=DS=ES=SS=0.
-;       Boot sector leaves DS=ES=SS=0 already; this is defensive.
-;     - expr: fixed dead 'je rel_gt' (was 'cmp al,<' / 'je rel_lt' / 'je rel_gt').
-;       Now correctly: 'cmp al,>' / 'je rel_gt' so '>' operators work.
-;     - do_input: added variable-letter validation before get_var_addr (was absent).
-;   v1.0.1 (2026-04-09)  Added push cs/pop ds; changed string routine to dp_str.
-;   v1.0.0 (2026-04-09)  First release. Clean 8088 port from uBASIC 65c02 v17.0.
+;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
+;     Refactored statement dispatch table to create space; misc size savings.
+;   v1.5.0 (2026-04-23)  ROM target.
+;     Bitbang UART (8755 Port A), interrupt vectors (DIV0/NMI), reset stub at
+;     0xFFF0, bdly delay routine, ROM/YASM conditional I/O paths, showcase
+;     PROG_END init, rep stosw range fix.
+;   v1.4.0 (2026-04-19)  FOR / NEXT with optional STEP.
+;     4-entry FOR stack; TK_FOR=0x8F TK_NEXT=0x90 TK_THEN=0x91 TK_TO=0x92
+;     TK_STEP=0x93; several kw_match/DI/CX clobber fixes; error ?6 NEXT
+;     without FOR; dp_str/new_line tail-call optimisation.
+;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
+;     Keywords stored as 0x80-0x8F tokens (~19% program-store saving); LIST
+;     detokenises; stmt fast-path dispatch; insline/deline/editln refactored.
+;     v1.3.1: LIST CR+LF fix; showcase re-encoded in tokenised form (195 B saved).
+;   v1.2.0 (2026-04-17)  GOSUB / RETURN.
+;     8-entry GOSUB stack; error ?5 RETURN without GOSUB.
+;   v1.1.0 (2026-04-17)  Bug fixes.
+;     Relational xor ax,ax; do_new clears full program store; tinyasm equ
+;     compatibility; dp_str_eol dead label removed.
+;   v1.0.0 (2026-04-09)  First release.
+;     Clean 8088 port of uBASIC 65c02 v17.0.  Numerous expression, segment,
+;     and editor bug fixes through v1.0.9 (see git log for detail).
+;     IBUF expanded to 64 bytes; Mandelbrot showcase embedded (v1.0.9).
+;
 ; =============================================================================
 
         	cpu 8086
@@ -346,41 +303,49 @@ SHOWCASE_END:
 ; =============================================================================
 start:
         cld
-        
+	
 %ifdef __YASM_MAJOR__
-        mov ax, cs	; setup EXE segment
+        mov ax, cs      ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves them at PSP)
 %else
-        ; ROM cold start: segments, stack, serial, vectors
-        xor ax, ax
+        ; ROM cold start: CS=0xF800 after far JMP. RAM is at segment 0.
+        xor ax, ax      ; AX=0 -> DS=ES=SS=0 (RAM segment)
 %endif
-        mov ax, cs
         mov ds, ax
         mov es, ax
         mov ss, ax
         mov sp, STACK_TOP
 
 %ifndef __YASM_MAJOR__
-        ; Install interrupt vectors
-        mov ax, 0xf800
-        xor di,di
-        mov word [di],   divide_error
-        mov word [di+2], ax
-        mov word [di+8],    nmi_handler
-        mov word [di+10],  ax
-
-        ; Zero all RAM (variables, FOR stack, program store).
+        ; Zero ALL RAM first (variables, FOR stack, program store, vector area).
+        ; Must do this BEFORE installing vectors or setting PROG_END.
+        mov di, RAM_BASE
         mov cx, RAM_SIZE / 2
-        ; PROG_END = empty program
+        xor ax, ax
+        rep stosw
+
+        ; Install interrupt vectors into the now-zeroed IVT.
+        xor di, di              ; DI -> [0x0000] = INT 0 (divide error)
+        mov ax, divide_error
+        stosw                   ; [0x0000] = IP of divide_error
+        mov ax, 0xf800
+        push ax			; save 0xf800
+        stosw                   ; [0x0002] = CS = 0xF800
+        mov di, 8               ; DI -> [0x0008] = INT 2 (NMI)
+        mov ax, nmi_handler
+        stosw                   ; [0x0008] = IP of nmi_handler
+        pop ax
+        stosw                   ; [0x000A] = CS = 0xF800
+        ; PROG_END = empty program (set after rep stosw so it isn't wiped)
         mov word [PROG_END], PROGRAM
-%else   
-        ; Zero vars not program
-        mov     cx, PROGRAM / 2         ; words to zero = 0xB9/2 = 92 words
+%else
+        ; Zero vars area (not program store - showcase lives there).
+        mov di, RAM_BASE
+        mov cx, PROGRAM / 2     ; words to zero = 0xB9/2 = 92 words
+        xor ax, ax
+        rep stosw
         ; PROG_END points past last showcase byte (excl sentinel)
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
-        mov di, RAM_BASE
-        xor ax, ax
-        rep stosw
 
         ; signon
 	mov si, str_banner
@@ -1097,6 +1062,7 @@ new_line:
 ; OUTPUT  AL -> terminal
 ; ROM: bitbang 8N1 via 8755 Port A.  Others: BIOS INT 10h.
 ; =============================================================================
+putchar:
 output:
 %ifdef __YASM_MAJOR__
     push bx
@@ -1180,6 +1146,7 @@ do_error_nl:
 ; INPUT_KEY -> AL
 ; ROM: bitbang UART RX from 8755 Port A bit1.  Others: BIOS INT 16h.
 ; =============================================================================
+getchar:
 input_key:
 %ifdef __YASM_MAJOR__
     mov ah, 0x00
@@ -1770,7 +1737,7 @@ tk_kw_tab:
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.6.0"
+str_banner: db "uBASIC 8088 v1.6.1"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Dispatch table: statement handlers in TK_PRINT order --------------------
@@ -1786,11 +1753,12 @@ chrs_tab:       dw kw_chrs
 to_tab:         dw kw_to
 step_tab:       dw kw_step
 in_tab:		dw kw_in
+ROM_END:
 
 ; --- Reset vector at 0xFFF0 -------------------------------------------
 ; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 %ifdef __YASM_MAJOR__
-	times 115 db 0xff
+	times 117 db 0xff
 %else        
 	org 0xfff0
 %endif
@@ -1804,7 +1772,6 @@ reset_vec:
 %ifdef __YASM_MAJOR__
         jmp start
 %else
-        nop
 ; We need a FAR JMP to set CS=0xF800 and IP=0x0000.
 ; JMP FAR 0xF800:0x0000 = EA 00 00 00 F8 (5 bytes)
         db 0xEA                 ; far JMP opcode
