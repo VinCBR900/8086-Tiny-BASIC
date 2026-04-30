@@ -33,7 +33,6 @@
 ;
 ; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
 ;            tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
-;
 ; ---------------------------------------------------------------------------
 ; Variant 1: Standalone 2 KB ROM  (real hardware or `sim_rom.c` simulator)
 ; ---------------------------------------------------------------------------
@@ -86,9 +85,11 @@
 ; =============================================================================
 ;
 ;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom assisted debugging):
-;     Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
-;     shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
-;     LIST supports optional LIST start,end range otherwise full
+;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
+;       all signed < / > comparisons were wrong.  Removed sbb.
+;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
+;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
+;     - Added optional <start,end> Line range after LIST command
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
@@ -556,27 +557,24 @@ dl_done:
 ; DO_LIST - LIST <start,end> note range optional but both must be provided
 ; =============================================================================
 do_list:
+        mov di, PROGRAM		; Default first line memory
+        mov bp, 0x7fff 		; default last line number	
         call peek_line		; just LIST?
-        je list_all		; show every line
-        call poke_out_hlpr  	; di = arg1, ax = arg2    
-        mov word [INS_TMP],ax	; save last line
+        je dl_lp		; Yes, show every line
+        call poke_out_hlpr  	; No - get di = arg1, ax = arg2    
+        mov bp,ax		; save last line
         mov ax,di		; get arg1
-        call find_line		; start line
-        jmp dl_lp
-
-list_all:
-        mov di, PROGRAM
-        mov word [INS_TMP], 0x7fff ; default last line	
+        call find_line		; start line in DI
 dl_lp:
-        mov ax, [di]        	; Load line number word at DI
+        mov ax, [di]        	; Get line number word at DI
         test ax, ax         	; Shortest way to check for NULL sentinel
         jz dl_done          	; Exit if 0
-	cmp word [INS_TMP],ax 	; are we at at last line
+	cmp bp,ax 		; are we at at last line
         jl dl_done
         call output_number
         call output_space
 
-        mov si, di          ; SI = DI + 2
+        mov si, di          	; SI = DI + 2
         add si, 2
 
 dl_body:
