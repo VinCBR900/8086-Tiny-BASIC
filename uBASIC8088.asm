@@ -137,7 +137,6 @@
 ORIGIN:         equ 0xF800
 RAM_BASE:       equ 0x0000
 %ifdef __YASM_MAJOR__           ; 8bitworkshop: yasm defines __YASM_MAJOR__
-        SECTION .text
 RAM_SIZE:       equ 4096        ; 8bitworkshop: 4KB address space
 %else
 RAM_SIZE:       equ 2048        ; 2KB RAM (A12=0 selects RAM, A12=1 selects ROM)
@@ -291,8 +290,7 @@ SHOWCASE_DATA:
         db 0x62,0x02,0x8E,0x0D                                         ; 610 RETURN
         dw 0                                                            ; end sentinel
 SHOWCASE_END:
-        TIMES 0x7cce db 0        ; pad to 0xF800 (NASM limit: two chunks)
-        TIMES 0x7800 db 0
+        times ORIGIN-($-$$) db 0
 %else
         org ORIGIN
 %endif
@@ -303,7 +301,6 @@ SHOWCASE_END:
 ; =============================================================================
 start:
         cld
-	
 %ifdef __YASM_MAJOR__
         mov ax, cs      ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves them at PSP)
 %else
@@ -1758,7 +1755,7 @@ ROM_END:
 ; --- Reset vector at 0xFFF0 -------------------------------------------
 ; 8086 resets CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 %ifdef __YASM_MAJOR__
-	times 117 db 0xff
+        times 0x7f0-($-start) db 0xff	; pad
 %else        
 	org 0xfff0
 %endif
@@ -1768,7 +1765,6 @@ reset_vec:
         out DDR_A, al
         mov al, TX
         out PORT_A, al
-
 %ifdef __YASM_MAJOR__
         jmp start
 %else
