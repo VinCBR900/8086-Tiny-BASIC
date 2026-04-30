@@ -1321,8 +1321,8 @@ deline:
         mov si, di              ; SI = source (data to move down)
         mov cx, [PROG_END]
         add cx, 2               ; CX = one past end (+2 for sentinel word)
-;        pop di                  ; DI = insertion point (dest of slide)
-;        push di                 ; save again: rep movsb will advance DI
+        pop di                  ; DI = insertion point (dest of slide)
+        push di                 ; save again: rep movsb will advance DI
         sub cx, si              ; CX = bytes to move
         mov bx, si
         sub bx, di              ; BX = bytes deleted (to subtract from PROG_END)
