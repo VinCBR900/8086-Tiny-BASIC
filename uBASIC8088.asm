@@ -461,7 +461,6 @@ do_input:
         call output
         call output_space
         call input_line
-        call expr
         jmp short let_store_ax
         
 ; =============================================================================
@@ -474,8 +473,8 @@ do_let:
         cmp byte [si], '='
         jne dl_err2
         inc si
-        call expr
 let_store_ax:
+        call expr
         pop di
         mov [di], ax
         ret
