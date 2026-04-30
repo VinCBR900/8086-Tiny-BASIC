@@ -86,22 +86,9 @@
 ; =============================================================================
 ;
 ;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom assisted debugging):
-;     - start: normalise DS/ES/SS=CS under __YASM_MAJOR__: FREEDOS EXE entry
-;       jumps directly to start: (CS:ORIGIN), bypassing reset_vec; without
-;       this DS/ES/SS still point at the PSP -> no banner, ?4 on LIST.
-;     - ROM init ordering: rep stosw now runs BEFORE vector install and
-;       PROG_END init; previously the zero sweep overwrote both.
-;     - ROM init segment regs: removed unconditional mov ax,cs after ROM-path
-;       xor ax,ax; on real hardware CS=0xF800 so mov ax,cs gave DS=0xF800.
-;     - let_input_hlpr: removed push di before ret (ret returned to variable's
-;       RAM address); added push di in do_let/do_input after the call instead.
-;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
-;       all signed < / > comparisons were wrong.  Removed sbb.
-;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
-;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
-;     - sim_rom: added --yasm flag; output/input_key intercept addresses now
-;       runtime-selected (ROM bitbang vs YASM BIOS-INT build).
-;
+;     Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
+;     shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
+;     LIST supports optional LIST start,end range otherwise full
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
@@ -297,9 +284,9 @@ SHOWCASE_END:
 ; Clobbers: everything
 ; =============================================================================
 start:
-        cld
 %ifdef __YASM_MAJOR__
-        mov ax, cs      ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves them at PSP)
+	cld
+	mov ax, cs      ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves them at PSP)
 %else
         ; ROM cold start: CS=0xF800 after far JMP. RAM is at segment 0.
         xor ax, ax      ; AX=0 -> DS=ES=SS=0 (RAM segment)
@@ -321,9 +308,10 @@ start:
 %endif
         rep stosw
 
-%ifndef __YASM_MAJOR__
         ; Install interrupt vectors into the now-zeroed IVT.
+        ; meaningless for 8bitworkshop
         xor di, di              ; DI -> [0x0000] = INT 0 (divide error)
+        xchg ax,di
         mov ax, divide_error
         stosw                   ; [0x0000] = IP of divide_error
         mov ax, 0xf800
@@ -334,6 +322,8 @@ start:
         stosw                   ; [0x0008] = IP of nmi_handler
         pop ax
         stosw                   ; [0x000A] = CS = 0xF800
+
+%ifndef __YASM_MAJOR__
         ; PROG_END = empty program (set after rep stosw so it isn't wiped)
         mov word [PROG_END], PROGRAM
 %else
@@ -563,15 +553,26 @@ dl_done:
         ret
 
 ; =============================================================================
-; DO_LIST
+; DO_LIST - LIST <start,end> note range optional but both must be provided
 ; =============================================================================
 do_list:
-        mov di, PROGRAM
-dl_lp:
-        mov ax, [di]        ; Load word at DI
-        test ax, ax         ; Shortest way to check for NULL sentinel
-        jz dl_done          ; Exit if 0
+        call peek_line		; just LIST?
+        je list_all		; show every line
+        call poke_out_hlpr  	; di = arg1, ax = arg2    
+        mov word [INS_TMP],ax	; save last line
+        mov ax,di		; get arg1
+        call find_line		; start line
+        jmp dl_lp
 
+list_all:
+        mov di, PROGRAM
+        mov word [INS_TMP], 0x7fff ; default last line	
+dl_lp:
+        mov ax, [di]        	; Load line number word at DI
+        test ax, ax         	; Shortest way to check for NULL sentinel
+        jz dl_done          	; Exit if 0
+	cmp word [INS_TMP],ax 	; are we at at last line
+        jl dl_done
         call output_number
         call output_space
 
@@ -1167,6 +1168,7 @@ bdly:
     mov cx, BAUD            ; 3 bytes
     loop $                  ; 2 bytes - 17 cycles per iteration on 8088
     ret                     ; 1 byte
+%endif
 
 ; DIVIDE_ERROR  INT 0 handler: reset stack and show ?2
 divide_error:
@@ -1182,7 +1184,6 @@ nmi_handler:
 do_error_hw:
         mov sp, STACK_TOP
         jmp do_error
-%endif
 
 ; =============================================================================
 ; LINE EDITOR  
@@ -1749,6 +1750,7 @@ ROM_END:
         times 0x7f0-($-start) db 0xff	; pad
 %else        
 	org 0xfff0
+	cld
 %endif
 reset_vec:
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
@@ -1756,6 +1758,7 @@ reset_vec:
         out DDR_A, al
         mov al, TX
         out PORT_A, al
+        
 %ifdef __YASM_MAJOR__
         jmp start
 %else
@@ -1765,4 +1768,4 @@ reset_vec:
         dw 0x0000               ; IP = 0x0000
         dw 0xF800               ; CS = 0xF800 -> start
 %endif
-	times 2048-($-start) db 0xff	; pad
+	times 2048-($-start) db 0xff	; pad 
