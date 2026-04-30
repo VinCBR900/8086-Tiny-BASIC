@@ -53,7 +53,6 @@
 ;   Memory map:
 ;     ORIGIN   = 0xF800       ROM: 0xF800-0xFFFF, reset stub at 0xFFF0
 ;     RAM_BASE = 0x0000       RAM: 0x0000-0x07FF
-;     RAM_SIZE = 2048
 ;     STACK    = 0x0800       top of RAM, grows downward
 ;     I/O      = bitbang UART via 8755 Port A
 ;
@@ -79,8 +78,7 @@
 ;
 ;   Memory map:
 ;     ORIGIN   = 0xF800       (8bitworkshop segment base)
-;     RAM_BASE = 0x0000
-;     RAM_SIZE = 4096         (4 KB)
+;     RAM_BASE = 0x0000,      RAM: 0x0000-0x0FFF, 4Kbyte
 ;     I/O      = BIOS INT 10h / INT 16h
 ;
 ; =============================================================================
@@ -127,7 +125,6 @@
 ;     Clean 8088 port of uBASIC 65c02 v17.0.  Numerous expression, segment,
 ;     and editor bug fixes through v1.0.9 (see git log for detail).
 ;     IBUF expanded to 64 bytes; Mandelbrot showcase embedded (v1.0.9).
-;
 ; =============================================================================
 
         	cpu 8086
@@ -233,7 +230,7 @@ BAUD:           equ 57          ; bit-period loop count: 17cy/iter @5MHz ~4800ba
 %ifdef __YASM_MAJOR__
 	mov ax, reset_vec; Trampoline for 8bitworkshop, overwritten when running
 	jmp ax          ; One way to do a Near jump greater than 32768
-	times (PROGRAM - 5) db 0  ;  Pad over program VARS/Equates (3byte mov, 2byte jump)
+	times PROGRAM - ($-$$) db 0  ;  Pad over program VARS/Equates (3byte mov, 2byte jump)
 
 SHOWCASE_DATA:
         ; ── Feature demos ────────────────────────────────────────────────────
@@ -311,15 +308,20 @@ start:
         mov es, ax
         mov ss, ax
         mov sp, STACK_TOP
+        mov di, RAM_BASE
 
 %ifndef __YASM_MAJOR__
         ; Zero ALL RAM first (variables, FOR stack, program store, vector area).
         ; Must do this BEFORE installing vectors or setting PROG_END.
-        mov di, RAM_BASE
         mov cx, RAM_SIZE / 2
-        xor ax, ax
+%else
+        ; Zero vars area (not program store - showcase lives there).
+        mov cx, PROGRAM / 2     ; words to zero = 0xB9/2 = 92 words
+        xor ax, ax              ; AX=0 -> DS=ES=SS=0 (RAM segment)
+%endif
         rep stosw
 
+%ifndef __YASM_MAJOR__
         ; Install interrupt vectors into the now-zeroed IVT.
         xor di, di              ; DI -> [0x0000] = INT 0 (divide error)
         mov ax, divide_error
@@ -335,15 +337,9 @@ start:
         ; PROG_END = empty program (set after rep stosw so it isn't wiped)
         mov word [PROG_END], PROGRAM
 %else
-        ; Zero vars area (not program store - showcase lives there).
-        mov di, RAM_BASE
-        mov cx, PROGRAM / 2     ; words to zero = 0xB9/2 = 92 words
-        xor ax, ax
-        rep stosw
         ; PROG_END points past last showcase byte (excl sentinel)
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
-
         ; signon
 	mov si, str_banner
         call dp_str
@@ -1029,8 +1025,7 @@ ipl_lp:
         jmp ipl_lp
 backsp:
         mov al, 0x08
-        call output
-	ret
+        jmp output	; tail call
         
 ipl_nbs:
         cmp al, 0x0d
@@ -1326,8 +1321,8 @@ deline:
         mov si, di              ; SI = source (data to move down)
         mov cx, [PROG_END]
         add cx, 2               ; CX = one past end (+2 for sentinel word)
-        pop di                  ; DI = insertion point (dest of slide)
-        push di                 ; save again: rep movsb will advance DI
+;        pop di                  ; DI = insertion point (dest of slide)
+;        push di                 ; save again: rep movsb will advance DI
         sub cx, si              ; CX = bytes to move
         mov bx, si
         sub bx, di              ; BX = bytes deleted (to subtract from PROG_END)
