@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.6.1
+; uBASIC 8088  v1.7.0
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -84,28 +84,28 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;
-;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom assisted debugging):
+;   V1.7 (2026-05-01) Refctaor and LIST feature enhancement
+;     - Added optional <start,end> Line range after LIST command
+;     - Refactored EXPR2 for function dispatch table
+;     - General Refactoring for size: LET/INPUT, POKE/OUT, Tokenizer
+;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom  debugging):
 ;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
 ;       all signed < / > comparisons were wrong.  Removed sbb.
 ;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
 ;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
-;     - Added optional <start,end> Line range after LIST command
-;     - Refactoring for size
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
 ;     Bitbang UART (8755 Port A), interrupt vectors (DIV0/NMI), reset stub at
-;     0xFFF0, bdly delay routine, ROM/YASM conditional I/O paths, showcase
-;     PROG_END init, rep stosw range fix.
+;     0xFFF0, bdly delay routine, showcase PROG_END init, rep stosw range fix.
 ;   v1.4.0 (2026-04-19)  FOR / NEXT with optional STEP.
 ;     4-entry FOR stack; TK_FOR=0x8F TK_NEXT=0x90 TK_THEN=0x91 TK_TO=0x92
 ;     TK_STEP=0x93; several kw_match/DI/CX clobber fixes; error ?6 NEXT
 ;     without FOR; dp_str/new_line tail-call optimisation.
 ;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
-;     Keywords stored as 0x80-0x8F tokens (~19% program-store saving); LIST
-;     detokenises; stmt fast-path dispatch; insline/deline/editln refactored.
-;     v1.3.1: LIST CR+LF fix; showcase re-encoded in tokenised form (195 B saved).
+;     Keywords stored as 0x80-0x8F tokens; LIST detokenises; 
+;     stmt fast-path dispatch; insline/deline/editln refactored.
+;     v1.3.1: LIST CR+LF fix; showcase re-encoded in tokenised form 
 ;   v1.2.0 (2026-04-17)  GOSUB / RETURN.
 ;     8-entry GOSUB stack; error ?5 RETURN without GOSUB.
 ;   v1.1.0 (2026-04-17)  Bug fixes.
@@ -442,7 +442,8 @@ stmt_call:
         sub ax, tk_kw_tab
         add ax, st_tab
         mov bx, ax
-        jmp [bx]                ; indirect call to handler  
+        jmp [bx]                ; indirect call to handler
+       
 
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
@@ -873,12 +874,22 @@ expr2:
         je e2_neg
         cmp al, '+'
         je e2_pos
-        ; CHR$
-        mov bx, chrs_tab
-        call kw_match
-        jc e2_nchrs
-	; drop through
-        
+
+        ; Unified Function Loop
+        mov bx, func_tab
+e2_func_lp:
+        cmp word [bx], 0        ; End of table?
+        je e2_nusr              ; No match found
+        push bx                 ; Save table pointer
+        call kw_match           ; Try to match keyword at [SI]
+        pop bx                  ; Restore table pointer
+        jnc e2_func_call        ; Match found! Jump to handler
+        add bx, 4               ; Next entry (2 bytes pointer + 2 bytes handler)
+        jmp e2_func_lp
+
+e2_func_call:
+        jmp [bx+2]              ; Indirect jump to the function handler
+
 ; eat_paren_expr: '(' expr ')' -> AX
 eat_paren_expr:
         call spaces
@@ -899,30 +910,18 @@ peek_in_hlp:
         xor ah, ah
         ret
         
-e2_nchrs:	; not chr$ is it PEEK 
-        ; PEEK
-        mov bx, peek_tab
-        call kw_match
-        jc e2_npeek	; not peek
+do_peek_func:
         call peek_in_hlp
         mov al, [bx]
         ret
 
-e2_npeek:	; not PEEK is it IN 
-        ; IN
-        mov bx, in_tab
-        call kw_match
-        jc e2_nin	; not peek
+do_in_func:
         call peek_in_hlp
         mov dx, bx
         in al,dx
         ret
 
-e2_nin:
-        ; USR
-        mov bx, usr_tab
-        call kw_match
-        jc e2_nusr
+do_usr_func:
         call eat_paren_expr
         jmp ax ; tail call
         
@@ -1467,85 +1466,68 @@ gs_underflow:
 ; Clobbers: AX, BX, CX, DX, DI (not SI - caller needs it)
 ; =============================================================================
 tokenize:
-        push si                 ; preserve SI for caller
-        mov di, si              ; DI = write ptr (same as read ptr initially)
+        push si                 ; Preserve SI for caller
+        mov di, si              ; DI = write ptr
 tk_lp:
-        mov al, [si]
-        cmp al, 0x0d            ; end of line?
+        lodsb                   ; Read char into AL, advance SI
+        cmp al, 0x0d            ; End of line?
         je  tk_done
-        cmp al, '"'             ; start of string literal?
-        jne tk_kw_scan
-        ; copy opening quote, then fall into string verbatim copy
-        lodsb                   ; consume the '"' (al still = '"')
-        stosb
-        jmp tk_str_body         ; enter string loop past the quote
-tk_kw_scan:
-        ; Only try keyword match if current char is a letter (A-Z/a-z).
-        ; Non-letters (spaces, digits, operators) cannot start a keyword:
-        ; copy verbatim without kw_match attempts. Also preserves spaces exactly.
-        cmp al, 'A'
-        jb  tk_char
-        cmp al, 'Z'
-        jbe tk_kw_try
-        cmp al, 'a'
-        jb  tk_char
-        cmp al, 'z'
-        ja  tk_char
-tk_kw_try:
-        ; try each keyword in token order
-        ; BX walks tk_kw_tab one word at a time; index computed from BX offset on match
-        mov bx, tk_kw_tab
+        stosb                   ; Write char to DI
+        cmp al, '"'             ; Start of string?
+        je  tk_str_entry
+        
+        ; Try keyword match on every character (Slow but Small)
+        dec si                  ; Back up SI to point at the char we just read
+        mov bx, tk_kw_tab       ; Start of keyword table
 tk_try:
-        cmp word [bx], 0        ; end of table?
-        je  tk_char             ; no keyword matched: copy char
-        push di                 ; kw_match clobbers DI (keyword scan ptr)
-        push bx                 ; kw_match may use BX indirectly; save for index calc
-        call kw_match           ; CF=0 if matched (SI advanced past keyword)
-        pop bx                  ; restore table pointer
-        pop di                  ; restore write pointer
-        jnc tk_emit             ; matched! BX still points to matched entry
-        add bx, 2               ; next table entry
-        jmp tk_try
-tk_emit:
-        ; compute token byte from table offset: index = (BX - tk_kw_tab) / 2
+        cmp word [bx], 0        ; End of table?[cite: 1]
+        je  tk_lp               ; No match: loop to next char (DI already advanced)
+        push di
+        push bx
+        call kw_match           ; Match keyword at [SI]?[cite: 1]
+        pop bx
+        pop di
+        jc  tk_next_kw          ; No match: try next keyword in table
+        
+        ; Match Found: Emit Token
+        dec di                  ; Back up DI to overwrite the literal char
         mov ax, bx
-        sub ax, tk_kw_tab       ; AX = byte offset into table
-        shr ax, 1               ; AX = token index (0..15)
-        add al, TK_PRINT        ; token byte = 0x80 + index
-        stosb                   ; write to DI
-        push ax                 ; save token byte
-        call spaces             ; consume trailing whitespace after keyword
-        pop ax                  ; restore token byte
-        cmp al, TK_REM          ; was it REM? (body passes through as is)
-        jne tk_lp
-        ; REM: copy rest of line verbatim
-tk_rem_lp:
-        lodsb                   ; read from SI
-        stosb                   ; write to DI
-        cmp al, 0x0d
-        jne tk_rem_lp
-        jmp tk_finish
-tk_char:
-        ; no keyword matched: copy one char literally and advance both ptrs
-        lodsb                   ; al = [si], si++
-        stosb                   ; [di] = al, di++
-        jmp tk_lp
-tk_str:
-        ; inside string: copy verbatim until closing quote or CR
-        lodsb                   ; read opening quote (first entry)
+        sub ax, tk_kw_tab       ; Get table offset[cite: 1]
+        shr ax, 1               ; Convert to index[cite: 1]
+        add al, TK_PRINT        ; Convert to token byte (0x80+)[cite: 1]
         stosb
-tk_str_body:
+        
+        push ax
+        call spaces             ; Consume trailing whitespace[cite: 1]
+        pop ax
+        cmp al, TK_REM          ; Was it REM?[cite: 1]
+        je  tk_rem_entry
+        jmp tk_lp
+
+tk_next_kw:
+        add bx, 2               ; Move to next table entry[cite: 1]
+        jmp tk_try
+
+tk_str_entry:
+        mov ah, '"'             ; Terminator for strings
+        jmp short tk_copy_loop
+tk_rem_entry:
+        mov ah, 0x0d            ; Terminator for REM (End of line)
+        ; Fall through
+
+tk_copy_loop:
         lodsb
         stosb
-        cmp al, '"'
-        je  tk_lp               ; closing quote: resume keyword scanning
-        cmp al, 0x0d
-        jne tk_str_body
-        jmp tk_finish           ; CR inside string (malformed)
+        cmp al, 0x0d            ; Always stop at CR to prevent overruns[cite: 1]
+        je  tk_finish
+        cmp al, ah              ; Found terminator?
+        jne tk_copy_loop
+        jmp tk_lp
+
 tk_done:
-        stosb                   ; write the CR
+        stosb                   ; Write the final CR[cite: 1]
 tk_finish:
-        pop si                  ; restore SI to body start
+        pop si                  ; Restore SI[cite: 1]
         ret
 
 ; =============================================================================
@@ -1716,7 +1698,6 @@ kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
-
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
@@ -1727,30 +1708,34 @@ tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
         dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next, kw_out      ; indices 15,16 -> tokens TK_FOR=0x8F, TK_NEXT=0x90
-        dw kw_then, kw_to, kw_step  ; sub-keywords: TK_THEN=0x91, TK_TO=0x92, TK_STEP=0x93
+        dw kw_for, kw_next, kw_out      ; tokens TK_FOR=0x8F, TK_NEXT=0x90, TK_OUT=0x91
+; residuals - sub-keywords: TK_THEN=0x92, TK_TO=0x93, TK_STEP=0x94
+then_tab:       dw kw_then
+to_tab:         dw kw_to
+step_tab:       dw kw_step
         dw 0                    ; sentinel
 
 
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.6.1"
+str_banner: db "uBASIC 8088 v1.7.0"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
-; --- Dispatch table: statement handlers in TK_PRINT order --------------------
+; --- Statement handlers table in TK_PRINT order --------------------
 st_tab:
         dw do_print, do_if, do_goto, do_list, do_run, do_new
         dw do_input, do_rem, do_end, do_let, do_poke, do_free
         dw do_help, do_gosub, do_return, do_for, do_next, do_out
-        ; non commands but still match
-peek_tab:       dw kw_peek
-usr_tab:        dw kw_usr
-then_tab:       dw kw_then
-chrs_tab:       dw kw_chrs
-to_tab:         dw kw_to
-step_tab:       dw kw_step
-in_tab:		dw kw_in
+
+; ---  Function Table ---
+func_tab:
+chrs_tab:
+	dw kw_chrs, eat_paren_expr
+        dw kw_peek, do_peek_func
+        dw kw_in,   do_in_func
+        dw kw_usr,  do_usr_func
+        dw 0                    ; Sentinel
 ROM_END:
 
 ; --- Reset vector at 0xFFF0 -------------------------------------------
