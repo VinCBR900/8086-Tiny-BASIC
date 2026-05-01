@@ -7,7 +7,7 @@
 ; 8bitworkshop (x86 mode) with a pre-loaded Mandelbrot showcase.
 ;
 ; Credit: Oscar Toledo G. for bootBASIC inspiration and tinyasm assembler.
-;
+;    
 ; ---------------------------------------------------------------------------
 ; LANGUAGE REFERENCE
 ; ---------------------------------------------------------------------------
@@ -22,18 +22,15 @@
 ;               ?4 bad variable   ?5 RETURN without GOSUB   ?B break (ROM only)
 ;
 ; Line store  : <lo> <hi> <tokenised body> <CR>
-;   Keyword tokens 0x80..0x90 (17 stmt tokens): PRINT IF GOTO LIST RUN NEW
-;     INPUT REM END LET POKE FREE HELP GOSUB RETURN FOR NEXT
-;   Sub-keyword tokens 0x91..0x93: THEN  TO  STEP
-;   String literals and REM bodies stored verbatim.
+;   Line numbers 1-32767
+;   PRINT String literals and REM bodies stored verbatim.
 ;
 ; =============================================================================
 ; BUILD INSTRUCTIONS
 ; =============================================================================
 ;
 ; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
-;            tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
-;
+;    tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
 ; ---------------------------------------------------------------------------
 ; Variant 1: Standalone 2 KB ROM  (real hardware or `sim_rom.c` simulator)
 ; ---------------------------------------------------------------------------
@@ -84,7 +81,7 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   V1.7 (2026-05-01) Refctaor and LIST feature enhancement
+;   V1.7 (2026-05-01) Refactor and LIST feature enhancement
 ;     - Added optional <start,end> Line range after LIST command
 ;     - Refactored EXPR2 for function dispatch table
 ;     - General Refactoring for size: LET/INPUT, POKE/OUT, Tokenizer
@@ -105,6 +102,7 @@
 ;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
 ;     Keywords stored as 0x80-0x8F tokens; LIST detokenises; 
 ;     stmt fast-path dispatch; insline/deline/editln refactored.
+;     detokenises; stmt fast-path dispatch; insline/deline/editln refactored.
 ;     v1.3.1: LIST CR+LF fix; showcase re-encoded in tokenised form 
 ;   v1.2.0 (2026-04-17)  GOSUB / RETURN.
 ;     8-entry GOSUB stack; error ?5 RETURN without GOSUB.
@@ -442,8 +440,7 @@ stmt_call:
         sub ax, tk_kw_tab
         add ax, st_tab
         mov bx, ax
-        jmp [bx]                ; indirect call to handler
-       
+        jmp [bx]                ; indirect call to handler  
 
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
@@ -660,7 +657,7 @@ loop_print:
 dp_nl:
         jmp new_line	; tail call   
 dp_expr:
-        mov bx, chrs_tab
+        mov bx, chrs_tab	; Check for CHR$
         call kw_match
         jc dp_num
         call eat_paren_expr
@@ -685,7 +682,8 @@ dp_after:
 poke_out_hlpr:
         call expr               ; Get address
         push ax                 ; Save it
-        call expect_comma       ; Consolidates the old 'cmp/jne/inc' block[cite: 1]
+        mov al, ','
+        call expect       ; Consolidates the old 'cmp/jne/inc' block[cite: 1]
         call expr               ; Get value[cite: 1]
         pop di                  ; DI = address
         ret                     ; AL = value (from expr result)
@@ -706,21 +704,14 @@ do_out:
 ; Centralized syntax checker
 ; Input: AL = character to expect
 ; =============================================================================
+expect_equals:
+        mov al, '='
 expect:
         call spaces
         cmp [si], al
         jne JERRSN              ; Jump to Syntax Error if no match
         inc si                  ; Consume the character
         ret
-
-; Specialized wrappers for common characters
-expect_comma:
-        mov al, ','
-        jmp expect
-
-expect_equals:
-        mov al, '='
-        jmp expect
 
 JERRSN:
         mov al, ERR_SN
@@ -1266,7 +1257,6 @@ el_noex:
         
 ; INSLINE  insert a line into the program store.
 ; Inputs:  AX = line number (word)
-;          DI = insertion point (from editln's find_line - no second walk)
 ;          SI -> tokenized body including CR
 ;          CX = body+CR length
 ; Clobbers: AX, BX, CX, DX, SI, DI
@@ -1425,14 +1415,17 @@ gs_noline:
         jmp     JERRUL
 gs_push:
         inc     word [GOSUB_SP] ; bump depth first (BX still = old depth)
-        add     bx, bx          ; BX = byte offset = old_depth * 2
-        mov     si, GOSUB_STK
-        add     si, bx          ; SI -> save slot
-        mov     ax, [RUN_NEXT]
+	call 	gosub_hlp
+	mov     ax, [RUN_NEXT]
         mov     [si], ax        ; push RUN_NEXT onto gosub stack
         mov     [RUN_NEXT], di  ; set PC to GOSUB target line
         ret
 
+gosub_hlp:
+	add     bx, bx          ; BX = byte offset (depth * 2)
+        mov     si, GOSUB_STK   ; SI -> base of gosub stack
+        add     si, bx          ; SI -> this slot
+	ret
 ; =============================================================================
 ; DO_RETURN  RETURN
 ;   Pops a return address from the GOSUB stack and resumes execution there.
@@ -1444,9 +1437,7 @@ do_return:
         jz      gs_underflow    ; yes -> error ?5
         dec     bx              ; pre-decrement
         mov     [GOSUB_SP], bx  ; store new depth
-        add     bx, bx          ; BX = byte offset (depth * 2)
-        mov     si, GOSUB_STK   ; SI -> base of gosub stack
-        add     si, bx          ; SI -> this slot
+	call 	gosub_hlp
         mov     ax, [si]        ; pop return address
         mov     [RUN_NEXT], ax  ; restore PC to line after GOSUB
         ret
@@ -1698,6 +1689,7 @@ kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
+
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
