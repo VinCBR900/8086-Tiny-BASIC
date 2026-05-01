@@ -33,6 +33,7 @@
 ;
 ; Assembler: Oscar Toledo's tinyasm  (https://github.com/nanochess/tinyasm)
 ;            tinyasm -f bin uBASIC8088.asm -o uBASIC_rom.bin
+;
 ; ---------------------------------------------------------------------------
 ; Variant 1: Standalone 2 KB ROM  (real hardware or `sim_rom.c` simulator)
 ; ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@
 ;
 ;   Open directly at https://8bitworkshop.com in 8086 mode.
 ;   YASM defines __YASM_MAJOR__ which selects this variant automatically.
-;   Assembled as a FREEDOS EXE; press RUN to execute the Mandelbrot showcase.
+;   Assembled as a FREEDOS EXE; auto executes the Mandelbrot showcase.
 ;
 ;   Memory map:
 ;     ORIGIN   = 0xF800       (8bitworkshop segment base)
@@ -90,6 +91,7 @@
 ;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
 ;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
 ;     - Added optional <start,end> Line range after LIST command
+;     - Refactoring for size
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
@@ -440,7 +442,8 @@ stmt_call:
         sub ax, tk_kw_tab
         add ax, st_tab
         mov bx, ax
-        jmp [bx]                ; indirect call to handler
+        jmp [bx]                ; indirect call to handler  
+
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
 ; =============================================================================
@@ -460,17 +463,12 @@ do_input:
 do_let:
 	call let_input_hlpr
         push di                 ; save var addr: expr clobbers DI via kw_match
-        call spaces
-        cmp byte [si], '='
-        jne dl_err2
-        inc si
+        call expect_equals
 let_store_ax:
         call expr
         pop di
         mov [di], ax
         ret
-dl_err2:
-        pop di
 JERRUK:
         mov al, ERR_UK
         jmp do_error
@@ -484,9 +482,21 @@ let_input_hlpr:
         jb JERRUK
         cmp al, 'Z'
         ja JERRUK
-        call get_var_addr
-        ret             ; DI = var address, returned to caller
-
+	; drop through
+        
+; =============================================================================
+; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
+; =============================================================================
+get_var_addr:
+        lodsb
+        call uc_al
+        sub al, 'A'
+        xor ah, ah
+        add ax, ax
+        add ax, VARS
+        mov di, ax
+   	ret
+        
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ;
@@ -554,7 +564,7 @@ dl_done:
         ret
 
 ; =============================================================================
-; DO_LIST - LIST <start,end> note range optional but both must be provided
+; DO_LIST - LIST <start,end> note start/end optional but both must be provided
 ; =============================================================================
 do_list:
         mov di, PROGRAM		; Default first line memory
@@ -640,7 +650,7 @@ dp_str:
     	jz loop_print
     
     	and al, 0x7f
-    	jmp output        ; Tail-call optimization: output will RET for us
+    	jmp output        ; Tail-call, output will RET for us
 
 loop_print:
         call output
@@ -671,27 +681,46 @@ dp_after:
 ; DO_POKE  POKE <addr>, <val> - need to finagle addresses above 32768
 ; DO_OUT  OUT <addr>, <val> 
 ; =============================================================================
+poke_out_hlpr:
+        call expr               ; Get address
+        push ax                 ; Save it
+        call expect_comma       ; Consolidates the old 'cmp/jne/inc' block[cite: 1]
+        call expr               ; Get value[cite: 1]
+        pop di                  ; DI = address
+        ret                     ; AL = value (from expr result)
+
+; do_poke and do_out now just call the helper and execute one instruction
 do_poke:
-	call poke_out_hlpr
-	mov [di], al
-	ret
+        call poke_out_hlpr
+        mov [di], al
+        ret
 
 do_out:
-	call poke_out_hlpr
-	mov dx,di
+        call poke_out_hlpr
+        mov dx, di
         out dx, al
-	ret
-
-poke_out_hlpr:
-        call expr		; destination address
-        push ax			; save: second expr's kw_match clobbers DI
-        call spaces
-        cmp byte [si], ','
-        jne JERRSN
-        inc si
-        call expr               ; AX = value to poke
-        pop di
         ret
+
+; =============================================================================
+; Centralized syntax checker
+; Input: AL = character to expect
+; =============================================================================
+expect:
+        call spaces
+        cmp [si], al
+        jne JERRSN              ; Jump to Syntax Error if no match
+        inc si                  ; Consume the character
+        ret
+
+; Specialized wrappers for common characters
+expect_comma:
+        mov al, ','
+        jmp expect
+
+expect_equals:
+        mov al, '='
+        jmp expect
+
 JERRSN:
         mov al, ERR_SN
         jmp do_error
@@ -921,19 +950,6 @@ epe_err:
         jmp JERRSN
 
 ; =============================================================================
-; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
-; =============================================================================
-get_var_addr:
-        lodsb
-        call uc_al
-        sub al, 'A'
-        xor ah, ah
-        add ax, ax
-        add ax, VARS
-        mov di, ax
-sp_r:   ret
-
-; =============================================================================
 ; SPACES  skip spaces; preserves AX, BX, CX, DX
 ; =============================================================================
 spaces:
@@ -972,6 +988,7 @@ inm_lp:
         jmp short inm_lp
 inm_done:
         mov ax, bx
+sp_r:
         ret
 
 ; =============================================================================
@@ -1013,8 +1030,7 @@ ipl_lp:
         dec di
         dec cx
         call backsp
-        mov al, ' '
-        call output
+        call output_space
         call backsp
         jmp ipl_lp
 backsp:
@@ -1112,7 +1128,6 @@ do_error:
         mov al, '?'
         call output
         pop ax
-        ; add al, '0'
         call output             ; print "?N"
         ; direct mode?
         cmp byte [RUNNING], 0
@@ -1501,7 +1516,7 @@ tk_emit:
         push ax                 ; save token byte
         call spaces             ; consume trailing whitespace after keyword
         pop ax                  ; restore token byte
-        cmp al, TK_REM          ; was it REM? (REM body must pass through verbatim)
+        cmp al, TK_REM          ; was it REM? (body passes through as is)
         jne tk_lp
         ; REM: copy rest of line verbatim
 tk_rem_lp:
@@ -1543,11 +1558,7 @@ do_for:
         call    spaces
         call    get_var_addr    ; DI = &var (address in VARS array)
         mov     [INS_TMP], di   ; save var_ptr: kw_match inside expr clobbers DI
-        ; parse '='
-        call    spaces
-        cmp     byte [si], '='
-        jne     df_syn
-        inc     si
+        call    expect_equals	; parse '='
         call    expr            ; AX = start value (DI clobbered by kw_match)
         mov     di, [INS_TMP]   ; restore &var
         mov     [di], ax        ; initialise loop variable
