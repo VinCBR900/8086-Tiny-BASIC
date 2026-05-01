@@ -617,16 +617,6 @@ dl_eol:
         jmp dl_lp
 
 ; =============================================================================
-; DO_REM  skip rest of line
-; =============================================================================
-do_rem:
-        lodsb           ; AL = [SI], then SI++
-        cmp al, 0x0d    ; Was it the CR?
-        jne do_rem      ; If not, keep going
-dp_ret:
-        ret
-
-; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
 ; Items: "string", CHR$(n), expression.
 ; ';' between items or trailing ';' suppresses CR+LF.
@@ -686,6 +676,7 @@ poke_out_hlpr:
         call expect       ; Consolidates the old 'cmp/jne/inc' block[cite: 1]
         call expr               ; Get value[cite: 1]
         pop di                  ; DI = address
+dp_ret:        
         ret                     ; AL = value (from expr result)
 
 ; do_poke and do_out now just call the helper and execute one instruction
@@ -1446,10 +1437,33 @@ gs_underflow:
         mov     al, ERR_RT      ; ?5 return without gosub
         jmp     do_error
 
+; =============================================================================
+; DO_REM (Execution Phase) - skips the rest of the line during program run.
+; =============================================================================
+do_rem:
+        mov di, si              ; Make stosb a no-op by writing to read-ptr
+        mov ah, 0x0d            ; We want to skip until the end of the line (CR)
+		; drop through
+; =============================================================================
+; SHARED TERMINATOR HELPER (The "Skip vs. Copy" Trick)
+; Input:  AH = Terminator char (e.g., '"' or 0x0d)
+;         SI = Read pointer, DI = Write pointer
+; Note:   If DI = SI, this effectively becomes a "Skip" loop.
+; =============================================================================
+copy_si_di:
+        lodsb                   ; Read char from SI into AL
+        stosb                   ; Write AL to DI
+        cmp al, 0x0d            ; Always stop at Carriage Return
+        je  .done
+        cmp al, ah              ; Did we hit our specific terminator?
+        jne copy_si_di          ; If not, keep copying
+.done:
+        ret
 
 ; =============================================================================
 ; TOKENIZE  Convert keyword text -> token bytes in-place in IBUF.
 ; Input:  SI -> start of body text in IBUF (after line number was parsed)
+; Converts keywords to bytes 0x80+ in-place in IBUF.
 ; Output: body in IBUF replaced with tokenized form; SI unchanged.
 ; String literals (between quotes) and REM bodies passed through verbatim.
 ; Token bytes 0x80..0x8F replace keywords; all other chars copied as-is.
@@ -1457,68 +1471,67 @@ gs_underflow:
 ; Clobbers: AX, BX, CX, DX, DI (not SI - caller needs it)
 ; =============================================================================
 tokenize:
-        push si                 ; Preserve SI for caller
-        mov di, si              ; DI = write ptr
+        push si                 ; Preserve SI for the caller[cite: 1]
+        mov di, si              ; Start write-pointer at start of body[cite: 1]
+
 tk_lp:
-        lodsb                   ; Read char into AL, advance SI
-        cmp al, 0x0d            ; End of line?
+        lodsb                   ; Read next character[cite: 1]
+        cmp al, 0x0d            ; End of line?[cite: 1]
         je  tk_done
-        stosb                   ; Write char to DI
-        cmp al, '"'             ; Start of string?
-        je  tk_str_entry
         
-        ; Try keyword match on every character (Slow but Small)
-        dec si                  ; Back up SI to point at the char we just read
-        mov bx, tk_kw_tab       ; Start of keyword table
+        ; --- Handle String Literals ---
+        cmp al, '"'             ; Start of a "string"?[cite: 1]
+        jne tk_not_str
+        stosb                   ; Write the opening quote[cite: 1]
+        mov ah, '"'             ; Tell helper to look for the closing quote[cite: 1]
+        call copy_si_di
+        jmp tk_lp               ; Continue tokenizing after the string
+
+tk_not_str:
+        ; --- Try Keyword Match ---
+        dec si                  ; Back up SI to include the char we just read[cite: 1]
+        mov bx, tk_kw_tab       ; Start of keyword pointer table[cite: 1]
 tk_try:
-        cmp word [bx], 0        ; End of table?[cite: 1]
-        je  tk_lp               ; No match: loop to next char (DI already advanced)
-        push di
-        push bx
-        call kw_match           ; Match keyword at [SI]?[cite: 1]
+        cmp word [bx], 0        ; End of keyword table?[cite: 1]
+        je  tk_char             ; No match found: process as literal character
+        
+        push di                 ; kw_match clobbers DI[cite: 1]
+        push bx                 ; Save table pointer for index calculation[cite: 1]
+        call kw_match           ; Compare [SI] against keyword in table[cite: 1]
         pop bx
         pop di
-        jc  tk_next_kw          ; No match: try next keyword in table
-        
-        ; Match Found: Emit Token
-        dec di                  ; Back up DI to overwrite the literal char
+        jc  tk_next_kw          ; No match: try next keyword in table[cite: 1]
+
+        ; --- Match Found: Emit Token ---
         mov ax, bx
-        sub ax, tk_kw_tab       ; Get table offset[cite: 1]
-        shr ax, 1               ; Convert to index[cite: 1]
-        add al, TK_PRINT        ; Convert to token byte (0x80+)[cite: 1]
-        stosb
+        sub ax, tk_kw_tab       ; Get byte offset into table[cite: 1]
+        shr ax, 1               ; Convert offset to index (0, 1, 2...)[cite: 1]
+        add al, TK_PRINT        ; Add base token value (e.g., 0x80)[cite: 1]
+        stosb                   ; Write token byte to DI[cite: 1]
         
-        push ax
-        call spaces             ; Consume trailing whitespace[cite: 1]
+        push ax                 ; Save token to check for REM[cite: 1]
+        call spaces             ; Consume trailing spaces after keyword[cite: 1]
         pop ax
-        cmp al, TK_REM          ; Was it REM?[cite: 1]
-        je  tk_rem_entry
-        jmp tk_lp
+        
+        cmp al, TK_REM          ; Was the keyword REM?[cite: 1]
+        jne tk_lp               ; If not, keep tokenizing
+        mov ah, 0x0d            ; If REM, copy the rest of the line verbatim[cite: 1]
+        call copy_si_di
+        jmp tk_finish           ; REM is always the end of a line[cite: 1]
 
 tk_next_kw:
-        add bx, 2               ; Move to next table entry[cite: 1]
+        add bx, 2               ; Move to next entry in pointer table[cite: 1]
         jmp tk_try
 
-tk_str_entry:
-        mov ah, '"'             ; Terminator for strings
-        jmp short tk_copy_loop
-tk_rem_entry:
-        mov ah, 0x0d            ; Terminator for REM (End of line)
-        ; Fall through
-
-tk_copy_loop:
-        lodsb
-        stosb
-        cmp al, 0x0d            ; Always stop at CR to prevent overruns[cite: 1]
-        je  tk_finish
-        cmp al, ah              ; Found terminator?
-        jne tk_copy_loop
+tk_char:
+        lodsb                   ; No keyword matched: get the char back[cite: 1]
+        stosb                   ; Write it literally[cite: 1]
         jmp tk_lp
 
 tk_done:
-        stosb                   ; Write the final CR[cite: 1]
+        stosb                   ; Write the final Carriage Return[cite: 1]
 tk_finish:
-        pop si                  ; Restore SI[cite: 1]
+        pop si                  ; Restore SI to the start of the body[cite: 1]
         ret
 
 ; =============================================================================
