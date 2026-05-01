@@ -673,8 +673,8 @@ poke_out_hlpr:
         call expr               ; Get address
         push ax                 ; Save it
         mov al, ','
-        call expect       ; Consolidates the old 'cmp/jne/inc' block[cite: 1]
-        call expr               ; Get value[cite: 1]
+        call expect       ; Consolidates the old 'cmp/jne/inc' block
+        call expr               ; Get value
         pop di                  ; DI = address
 dp_ret:        
         ret                     ; AL = value (from expr result)
@@ -1459,7 +1459,6 @@ copy_si_di:
         jne copy_si_di          ; If not, keep copying
 .done:
         ret
-
 ; =============================================================================
 ; TOKENIZE  Convert keyword text -> token bytes in-place in IBUF.
 ; Input:  SI -> start of body text in IBUF (after line number was parsed)
@@ -1471,67 +1470,67 @@ copy_si_di:
 ; Clobbers: AX, BX, CX, DX, DI (not SI - caller needs it)
 ; =============================================================================
 tokenize:
-        push si                 ; Preserve SI for the caller[cite: 1]
-        mov di, si              ; Start write-pointer at start of body[cite: 1]
+        push si                 ; Preserve SI for the caller
+        mov di, si              ; Start write-pointer at start of body
 
 tk_lp:
-        lodsb                   ; Read next character[cite: 1]
-        cmp al, 0x0d            ; End of line?[cite: 1]
+        lodsb                   ; Read next character
+        cmp al, 0x0d            ; End of line?
         je  tk_done
         
         ; --- Handle String Literals ---
-        cmp al, '"'             ; Start of a "string"?[cite: 1]
+        cmp al, '"'             ; Start of a "string"?
         jne tk_not_str
-        stosb                   ; Write the opening quote[cite: 1]
-        mov ah, '"'             ; Tell helper to look for the closing quote[cite: 1]
+        stosb                   ; Write the opening quote
+        mov ah, '"'             ; Tell helper to look for the closing quote
         call copy_si_di
         jmp tk_lp               ; Continue tokenizing after the string
 
 tk_not_str:
         ; --- Try Keyword Match ---
-        dec si                  ; Back up SI to include the char we just read[cite: 1]
-        mov bx, tk_kw_tab       ; Start of keyword pointer table[cite: 1]
+        dec si                  ; Back up SI to include the char we just read
+        mov bx, tk_kw_tab       ; Start of keyword pointer table
 tk_try:
-        cmp word [bx], 0        ; End of keyword table?[cite: 1]
+        cmp word [bx], 0        ; End of keyword table?
         je  tk_char             ; No match found: process as literal character
         
-        push di                 ; kw_match clobbers DI[cite: 1]
-        push bx                 ; Save table pointer for index calculation[cite: 1]
-        call kw_match           ; Compare [SI] against keyword in table[cite: 1]
+        push di                 ; kw_match clobbers DI
+        push bx                 ; Save table pointer for index calculation
+        call kw_match           ; Compare [SI] against keyword in table
         pop bx
         pop di
-        jc  tk_next_kw          ; No match: try next keyword in table[cite: 1]
+        jc  tk_next_kw          ; No match: try next keyword in table
 
         ; --- Match Found: Emit Token ---
         mov ax, bx
-        sub ax, tk_kw_tab       ; Get byte offset into table[cite: 1]
-        shr ax, 1               ; Convert offset to index (0, 1, 2...)[cite: 1]
-        add al, TK_PRINT        ; Add base token value (e.g., 0x80)[cite: 1]
-        stosb                   ; Write token byte to DI[cite: 1]
+        sub ax, tk_kw_tab       ; Get byte offset into table
+        shr ax, 1               ; Convert offset to index (0, 1, 2...)
+        add al, TK_PRINT        ; Add base token value (e.g., 0x80)
+        stosb                   ; Write token byte to DI
         
-        push ax                 ; Save token to check for REM[cite: 1]
-        call spaces             ; Consume trailing spaces after keyword[cite: 1]
+        push ax                 ; Save token to check for REM
+        call spaces             ; Consume trailing spaces after keyword
         pop ax
         
-        cmp al, TK_REM          ; Was the keyword REM?[cite: 1]
+        cmp al, TK_REM          ; Was the keyword REM?
         jne tk_lp               ; If not, keep tokenizing
-        mov ah, 0x0d            ; If REM, copy the rest of the line verbatim[cite: 1]
+        mov ah, 0x0d            ; If REM, copy the rest of the line verbatim
         call copy_si_di
-        jmp tk_finish           ; REM is always the end of a line[cite: 1]
+        jmp tk_finish           ; REM is always the end of a line
 
 tk_next_kw:
-        add bx, 2               ; Move to next entry in pointer table[cite: 1]
+        add bx, 2               ; Move to next entry in pointer table
         jmp tk_try
 
 tk_char:
-        lodsb                   ; No keyword matched: get the char back[cite: 1]
-        stosb                   ; Write it literally[cite: 1]
+        lodsb                   ; No keyword matched: get the char back
+        stosb                   ; Write it literally
         jmp tk_lp
 
 tk_done:
-        stosb                   ; Write the final Carriage Return[cite: 1]
+        stosb                   ; Write the final Carriage Return
 tk_finish:
-        pop si                  ; Restore SI to the start of the body[cite: 1]
+        pop si                  ; Restore SI to the start of the body
         ret
 
 ; =============================================================================
