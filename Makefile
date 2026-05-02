@@ -20,8 +20,7 @@ DEBUGLOG_STUB := debuglog.h
 all: rom
 
 help:
-	@echo "Variant 3 is the only supported build path."
-	@echo "  make rom      - Build standalone ROM image (-dROM=1 via tinyasm)"
+	@echo "  make rom      - Build standalone ROM image (via tinyasm)"
 	@echo "  make sim      - Build ROM simulator (sim_rom)"
 	@echo "  make rom-run  - Build ROM + simulator and run"
 	@echo "  make clean    - Remove build artifacts"
