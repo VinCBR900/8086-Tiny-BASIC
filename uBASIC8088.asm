@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.0
+; uBASIC 8088  v1.7.1
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -81,10 +81,20 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   V1.7 (2026-05-01) Refactor and LIST feature enhancement
-;     - Added optional <start,end> Line range after LIST command
-;     - Refactored EXPR2 for function dispatch table
-;     - General Refactoring for size: LET/INPUT, POKE/OUT, Tokenizer
+;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
+;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
+;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
+;       vs xor ah,ah=3B saves 2B each, 6B total).
+;     - tokenize: removed push ax/pop ax around call spaces (spaces only
+;       touches SI, never AX; push/pop were unnecessary, 2B saved).
+;     - do_for: replaced mov [INS_TMP],di / mov di,[INS_TMP] with mov bp,di /
+;       mov di,bp (BP free in do_for; avoids memory round-trip, 3B saved).
+;   v1.7.0 (2026-05-01)  Refactor and LIST range feature.
+;     - LIST accepts optional <start>,<end> line range.
+;     - EXPR2 function dispatch table refactor.
+;     - Size refactoring: LET/INPUT, POKE/OUT, tokenizer, stmt dispatcher.
+;     - editln: push cx / pop cx around call deline (deline's rep movsb
+;       zeroed CX, causing insline to write zero body bytes on line replace).
 ;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom  debugging):
 ;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
 ;       all signed < / > comparisons were wrong.  Removed sbb.
@@ -420,7 +430,7 @@ stmt:
         jnb stmt_text           ; >= 0x90: not a token
         inc si                  ; consume token byte
         sub al, TK_PRINT        ; AL = 0..17 (index into st_tab)
-        xor ah, ah
+        cbw
         add ax, ax              ; AX = index * 2 (dw handler table)
         mov bx, st_tab
         add bx, ax              ; BX -> correct st_tab handler
@@ -489,7 +499,7 @@ get_var_addr:
         lodsb
         call uc_al
         sub al, 'A'
-        xor ah, ah
+        cbw
         add ax, ax
         add ax, VARS
         mov di, ax
@@ -595,7 +605,7 @@ dl_body:
         jnb dl_raw              ; >= 0x94: not a token
         ; detokenize: look up keyword string and print it
         sub al, TK_PRINT        ; index 0..15
-        xor ah, ah
+        cbw
         add ax, ax              ; word offset
         mov bx, tk_kw_tab
         add bx, ax
@@ -1509,11 +1519,9 @@ tk_try:
         shr ax, 1               ; Convert offset to index (0, 1, 2...)
         add al, TK_PRINT        ; Add base token value (e.g., 0x80)
         stosb                   ; Write token byte to DI
-        
-        push ax                 ; Save token to check for REM
-        call spaces             ; Consume trailing spaces after keyword
-        pop ax
-        
+
+        call spaces             ; Consume trailing spaces (spaces only touches SI)
+
         cmp al, TK_REM          ; Was the keyword REM?
         jne tk_lp               ; If not, keep tokenizing
         mov ah, 0x0d            ; If REM, copy the rest of the line verbatim
@@ -1544,12 +1552,11 @@ tk_finish:
 do_for:
         call    spaces
         call    get_var_addr    ; DI = &var (address in VARS array)
-        mov     [INS_TMP], di   ; save var_ptr: kw_match inside expr clobbers DI
+        mov     bp, di          ; save var_ptr in BP: kw_match inside expr clobbers DI
         call    expect_equals	; parse '='
         call    expr            ; AX = start value (DI clobbered by kw_match)
-        mov     di, [INS_TMP]   ; restore &var
+        mov     di, bp          ; restore &var
         mov     [di], ax        ; initialise loop variable
-
         ; parse TO (token or plain keyword)
         call    spaces
         cmp     byte [si], TK_TO
@@ -1596,7 +1603,7 @@ df_have_step:
 	pop     cx              ; restore limit (was clobbered by input_number in expr)
 
         ; write frame: var_ptr, limit, step, loop_ptr
-        mov     di, [INS_TMP]   ; reload var_ptr (kw_match clobbered DI)
+        mov     di, bp          ; reload var_ptr (saved in BP before expr calls)
         mov     [bx],   di      ; var_ptr
         mov     [bx+2], cx      ; limit
         mov     [bx+4], ax      ; step
@@ -1725,7 +1732,7 @@ step_tab:       dw kw_step
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.0"
+str_banner: db "uBASIC 8088 v1.7.1"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Statement handlers table in TK_PRINT order --------------------
