@@ -1236,7 +1236,9 @@ el_ldone:
         call find_line          ; DI = insertion point (first line >= AX)
         cmp [di], dx            ; exact match = line already exists?
         jne el_noex
+        push cx                 ; save body+CR length: deline's rep movsb zeroes CX
         call deline             ; delete it; DI unchanged (still insert point)
+        pop cx                  ; restore body+CR length
 el_noex:
         pop bx                  ; restore body pointer
         cmp byte [bx], 0x0d     ; empty body = delete-only
@@ -1766,4 +1768,4 @@ reset_vec:
         dw 0x0000               ; IP = 0x0000
         dw 0xF800               ; CS = 0xF800 -> start
 %endif
-	times 2048-($-start) db 0xff	; pad 
+	times 2048-($-start) db 0xff	; pad
