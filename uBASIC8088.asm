@@ -91,9 +91,6 @@
 ;       vs xor ah,ah=3B saves 2B each, 6B total).
 ;     - tokenize: removed push ax/pop ax around call spaces (spaces only
 ;       touches SI, never AX; push/pop were unnecessary, 2B saved).
-;     - do_for: replaced mov [INS_TMP],di / mov di,[INS_TMP] with mov bp,di /
-;       mov di,bp (BP free in do_for; avoids memory round-trip, 3B saved).
-;
 ;   v1.7.0 (2026-05-01)  Refactor and LIST range feature.
 ;     - LIST accepts optional <start>,<end> line range.
 ;     - EXPR2 function dispatch table refactor.
@@ -463,7 +460,7 @@ stmt_call:
 ; =============================================================================
 do_input:
         ; Validate variable letter before proceeding
-	call let_input_hlpr
+	call get_var_addr
         push di                 ; save var addr: input_line/expr clobber DI
         mov al, '?'
         call output
@@ -475,7 +472,7 @@ do_input:
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
-	call let_input_hlpr
+	call get_var_addr
         push di                 ; save var addr: expr clobbers DI via kw_match
         call expect_equals
 let_store_ax:
@@ -487,8 +484,10 @@ JERRUK:
         mov al, ERR_UK
         jmp do_error
 
-; -- helper
-let_input_hlpr:
+; =============================================================================
+; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
+; =============================================================================
+get_var_addr:
         call spaces
         mov al, [si]
         call uc_al
@@ -496,12 +495,6 @@ let_input_hlpr:
         jb JERRUK
         cmp al, 'Z'
         ja JERRUK
-	; drop through
-        
-; =============================================================================
-; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
-; =============================================================================
-get_var_addr:
         lodsb
         call uc_al
         sub al, 'A'
@@ -1001,7 +994,7 @@ do_usr_func:
 ; E2_VAR: Factor level variable access
 ; =============================================================================
 e2_var:
-        call let_input_hlpr     ; Validates A-Z, DI=&var, SI advanced
+        call get_var_addr     ; Validates A-Z, DI=&var, SI advanced
         mov  ax, [di]           ; Simply load the value
         ret  
         
