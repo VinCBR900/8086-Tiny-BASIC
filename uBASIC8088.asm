@@ -14,8 +14,9 @@
 ;
 ; Statements  : PRINT  IF..THEN  GOTO  GOSUB  RETURN  FOR..TO[..STEP]  NEXT
 ;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
-; Expressions : + - * / % & | = < > <= >= <>   unary-
-;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) variables A..Z
+; Expressions : + - * / % & | = < > <= >= <>   unary -
+;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) ABS(num) 
+;				variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
@@ -83,7 +84,7 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added & | BOOL operators
-;     - added PRINT TAB(spaces), fix NEXT error 
+;     - added PRINT TAB(spaces), Added ABS(num), fix NEXT error 
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
 ;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
 ;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
@@ -170,7 +171,6 @@ ERR_NF:         equ 0x36  ; NEXT without FOR
 ERR_BRK:        equ 0x42  ; NMI break: prints "?B"
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
-T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
 T_F:            equ 0xC6        ; 'F'  IF
 T_O:            equ 0xCF        ; 'O'  GOTO
 T_N:            equ 0xCE        ; 'N'  RUN THEN
@@ -179,8 +179,10 @@ T_M:            equ 0xCD        ; 'M'  REM
 T_D:            equ 0xC4        ; 'D'  END
 T_E:            equ 0xC5        ; 'E'  POKE FREE
 T_K:            equ 0xCB        ; 'K'  PEEK
-T_R:            equ 0xD2        ; 'R'  USR
 T_P:            equ 0xD0        ; 'P'  HELP
+T_R:            equ 0xD2        ; 'R'  USR
+T_S:		equ 0xD3	; 'S'  ABS
+T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
 T_DS:           equ 0xA4        ; '$'  CHR$
 T_B:            equ 0xC2        ; 'B'  GOSUB
 
@@ -1754,6 +1756,7 @@ kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
 kw_tab:	    db 0x54, 0x41, T_B		; TAB
+kw_abs:	    db 0x41, 0x42, T_S
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
@@ -1816,6 +1819,7 @@ chrs_tab:
         dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
         dw kw_usr,  do_usr_func
+        dw kw_abs,  do_abs_func
         dw 0                    ; Sentinel
 tab_tab: dw kw_tab
 ROM_END:
@@ -1827,6 +1831,7 @@ ROM_END:
 %else        
 	org 0xfff0
 	cld
+    cli
 %endif
 reset_vec:
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
