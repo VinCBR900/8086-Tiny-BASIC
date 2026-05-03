@@ -84,7 +84,7 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added & | BOOL operators
-;     - added PRINT TAB(spaces), Added ABS(num), fix NEXT error 
+;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks 
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
 ;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
 ;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
@@ -997,19 +997,13 @@ do_usr_func:
         call eat_paren_expr
         jmp ax ; tail call
         
+; =============================================================================
+; E2_VAR: Factor level variable access
+; =============================================================================
 e2_var:
-        ; variable A-Z?
-        call uc_al
-        cmp al, 'A'
-        jb e2_bad
-        cmp al, 'Z'
-        ja e2_bad
-        call get_var_addr
-        mov ax, [di]
-        ret
-e2_bad:
-        xor ax, ax
-        ret      
+        call let_input_hlpr     ; Validates A-Z, DI=&var, SI advanced
+        mov  ax, [di]           ; Simply load the value
+        ret  
         
 e2_neg:
         inc si
