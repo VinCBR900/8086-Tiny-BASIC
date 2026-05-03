@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.1
+; uBASIC 8088  v1.7.2
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -14,12 +14,13 @@
 ;
 ; Statements  : PRINT  IF..THEN  GOTO  GOSUB  RETURN  FOR..TO[..STEP]  NEXT
 ;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
-; Expressions : + - * / %   = < > <= >= <>   unary-
-;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr)   variables A..Z
+; Expressions : + - * / % & | = < > <= >= <>   unary-
+;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
-;               ?4 bad variable   ?5 RETURN without GOSUB   ?B break (ROM only)
+;               ?4 bad variable   ?5 RETURN without GOSUB   ?6 NEXT without FOR
+;		?B break (ROM only)
 ;
 ; Line store  : <lo> <hi> <tokenised body> <CR>
 ;   Line numbers 1-32767
@@ -81,6 +82,8 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
+;   v1.7.2 (2026-05-02)  Refactored operator table, Added & | BOOL operators
+;     - added PRINT TAB(spaces), fix NEXT error 
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
 ;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
 ;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
@@ -89,6 +92,7 @@
 ;       touches SI, never AX; push/pop were unnecessary, 2B saved).
 ;     - do_for: replaced mov [INS_TMP],di / mov di,[INS_TMP] with mov bp,di /
 ;       mov di,bp (BP free in do_for; avoids memory round-trip, 3B saved).
+;
 ;   v1.7.0 (2026-05-01)  Refactor and LIST range feature.
 ;     - LIST accepts optional <start>,<end> line range.
 ;     - EXPR2 function dispatch table refactor.
@@ -637,7 +641,7 @@ dp_top:
         call peek_line	; empty line PRINT
         je dp_nl
         cmp byte [si], '"'
-        jne dp_expr
+        jne dp_chrs
         inc si		; skip over "
 dp_str:
         lodsb
@@ -654,14 +658,23 @@ loop_print:
         call output
         jmp short dp_str		
         
-dp_nl:
-        jmp new_line	; tail call   
-dp_expr:
+dp_chrs:
         mov bx, chrs_tab	; Check for CHR$
+        call kw_match
+        jc dp_tab
+        call eat_paren_expr
+        call output
+        jmp short dp_after
+dp_tab:
+        mov bx, tab_tab	; Check for TAB
         call kw_match
         jc dp_num
         call eat_paren_expr
-        call output
+        mov cx,ax
+        jcxz dp_after           ; TAB(0) -> nothing
+tab_loop:
+	call output_space
+        loop tab_loop
         jmp short dp_after
 dp_num:
         call expr
@@ -674,6 +687,31 @@ dp_after:
         call peek_line
         je dp_ret
         jmp short dp_top
+
+; =============================================================================
+; DO_FREE  print free program-store bytes - also do_pritn newline
+; =============================================================================
+do_free:
+        mov ax, PROGRAM_TOP
+        sub ax, [PROG_END]
+        call output_number
+        call output_space
+        mov si, kw_free
+        call dp_str
+dp_nl:
+	jmp new_line     ; Tail-call: new_line will RET for us
+
+; =============================================================================
+; DO_HELP  print all keywords
+; =============================================================================
+do_help:
+    mov si, kw_tab_start
+dh_lp:
+    call dp_str
+    call output_space
+    cmp byte [si], 0 ; Check for sentinel
+    jne dh_lp        ; Loop back if not zero
+    jmp new_line     ; Tail-call: new_line will RET for us
 
 ; =============================================================================
 ; DO_POKE  POKE <addr>, <val> - need to finagle addresses above 32768
@@ -712,11 +750,21 @@ expect:
         cmp [si], al
         jne JERRSN              ; Jump to Syntax Error if no match
         inc si                  ; Consume the character
-        ret
+sp_r:
+	ret
 
 JERRSN:
         mov al, ERR_SN
         jmp do_error
+
+; =============================================================================
+; SPACES  skip spaces; preserves AX, BX, CX, DX
+; =============================================================================
+spaces:
+        cmp byte [si], ' '
+        jne sp_r	; return
+        inc si
+        jmp short spaces
 
 ; =============================================================================
 ; EXPR  evaluate expression including relational operators
@@ -725,7 +773,7 @@ JERRSN:
 ; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000
 ; Clobbers: AX, BX, CX, DX, SI
 expr:
-        call    expr_add        ; Left operand -> AX
+        call    expr_bool        ; Left operand -> AX
         push    ax              ; Save left
         call    spaces
         
@@ -756,7 +804,7 @@ expr:
 
 .do_rel:
         push    dx              ; Save operator mask
-        call    expr_add        ; Right operand -> AX
+        call    expr_bool        ; Right operand -> AX
         pop     dx              ; Restore mask (DL)
         pop     bx              ; BX = left operand
 
@@ -785,74 +833,96 @@ ea_ret:
         ret
 
 ; =============================================================================
-; EXPR_ADD  additive level: + and -
+; PREC_ENGINE: Generic Precedence Level Handler
+; Handles / * + - & | 
+; BX = Table Pointer, DI = Next Level Function Pointer
 ; =============================================================================
+expr_bool:      ; lowest precidence
+        mov bx, tab_bool
+        mov di, expr_add
+        jmp short prec_engine
+
+bool_and:
+        and ax, cx
+        ret
+        
+bool_or:
+        or ax, cx
+        ret
+        
 expr_add:
-        call expr1
-ea_lp:
-        call spaces
-        mov dl, [si]
-        cmp dl, '+'
-        je ea_do
-        cmp dl, '-'
-        jne ea_ret
-ea_do:
-        push dx                 ; save operator DL (clobbered by expr1)
-        push ax                 ; save left
-        inc si
-        call expr1
-        pop bx                  ; BX = left
-        pop dx                  ; DL = operator
-        cmp dl, '-'
-        jne ea_add
-        neg ax
-ea_add:
-        add ax, bx
-        jmp ea_lp
+        mov bx, tab_add
+        mov di, expr1
+        jmp short prec_engine
 
-; =============================================================================
-; EXPR1  multiplicative level: * / %
-; =============================================================================
 expr1:
-        call expr2
-e1_lp:
+        mov bx, tab_mul
+        mov di, expr2   ; functions highest precidence
+        ; Fall through to engine
+
+prec_engine:
+        push bx                 ; [Stack] Save Table
+        push di                 ; [Stack] Save Next-Level Func
+        call di                 ; Get initial LHS (Left Hand Side) value
+.lp:
+        mov bp, sp              ; Use BP to peek at the saved BX/DI
+        mov di, [bp]            ; DI = Next-Level Func
+        mov bx, [bp+2]          ; BX = Table
+        
         call spaces
-        mov dl, [si]
-        cmp dl, '*'
-        je e1_do
-        cmp dl, '/'
-        je e1_do
-        cmp dl, '%'
-        jne e1_ret
-e1_do:
-        inc si
-        push dx
-        push ax
-        call expr2
-        pop cx                  ; CX = left
-        pop dx                  ; DL = operator
-        cmp dl, '*'
-        jne e1_div
-        xchg ax, cx             ; AX = left, CX = right
-        imul cx
-        jmp e1_lp
-e1_div:
-        or ax, ax               ; AX = right (divisor)
-        je e1_zero
-        xchg ax, cx             ; AX = left, CX = right
-        mov bl, dl              ; save operator before IDIV clobbers DX
-        cwd
-        idiv cx                 ; AX=quotient DX=remainder (DL overwritten!)
-        cmp bl, '%'
-        jne e1_lp
-        mov ax, dx              ; modulo: return remainder
-        jmp e1_lp
-e1_zero:
-        mov al, ERR_OV
-        jmp do_error
+        mov dl, [si]            ; Peek at char in IBUF
+.search:
+        cmp byte [bx], 0        ; End of table?
+        je .done                ; No match, we are finished with this level
+        cmp [bx], dl            ; Does char match operator in table?
+        je .found
+        add bx, 3               ; Next entry (Char + Word)
+        jmp .search
+
+.found:
+        inc si                  ; Consume operator character
+        push ax                 ; [Stack] Save LHS
+        push word [bx+1]        ; [Stack] Save Math Handler Address
+        call di                 ; Get RHS (Right Hand Side) value -> AX
+        mov cx, ax              ; CX = RHS
+        pop bx                  ; BX = Math Handler
+        pop ax                  ; AX = LHS
+        call bx                 ; Execute math: AX = AX (op) CX
+        jmp .lp                 ; Repeat for chaining (e.g., 1+2+3)
+
+.done:
+        add sp, 4               ; Clean up BX and DI from stack
+        ret
+
+math_add:
+        add ax, cx
+        ret
+
+math_sub:
+        sub ax, cx
+        ret
+
+math_mul:
+        imul cx                 ; AX = AX * CX
+        ret
+
+math_div:
+        or cx, cx               ; Division by zero?
+        je .err
+        cwd                     ; Sign-extend AX into DX for IDIV
+        idiv cx                 ; AX = quotient, DX = remainder
+        ret
+.err:
+        mov al, ERR_OV          ; Overflow/Div-by-zero error code
+        jmp do_error        
+
+math_mod:
+        call math_div           ; Perform division
+        mov ax, dx              ; Return remainder
+        ret
 
 ; =============================================================================
-; EXPR2  atom level
+; EXPR2  Functions
 ; =============================================================================
 e2_pos:
         inc si
@@ -901,6 +971,14 @@ peek_in_hlp:
         mov bx, ax
         xor ah, ah
         ret
+
+do_abs_func:
+        call eat_paren_expr     ; AX = value
+        or   ax, ax             ; Set flags (2 bytes)
+        jns  .done              ; Jump if positive (2 bytes)
+        neg  ax                 ; Negate if negative (2 bytes)
+.done:
+        ret
         
 do_peek_func:
         call peek_in_hlp
@@ -940,15 +1018,6 @@ e2_neg:
 epe_err:
         jmp JERRSN
 
-; =============================================================================
-; SPACES  skip spaces; preserves AX, BX, CX, DX
-; =============================================================================
-spaces:
-        cmp byte [si], ' '
-        jne sp_r	; return
-        inc si
-        jmp short spaces
-
 e2_nusr:
         ; Reload AL from [si] - kw_match may have clobbered it
         mov al, [si]
@@ -979,7 +1048,6 @@ inm_lp:
         jmp short inm_lp
 inm_done:
         mov ax, bx
-sp_r:
         ret
 
 ; =============================================================================
@@ -1083,31 +1151,6 @@ output:
     ret
 %endif
         
-; =============================================================================
-; DO_FREE  print free program-store bytes
-; =============================================================================
-do_free:
-        mov ax, PROGRAM_TOP
-        sub ax, [PROG_END]
-        call output_number
-        call output_space
-        mov si, kw_free
-        call dp_str
-	jmp new_line     ; Tail-call: new_line will RET for us
-
-; =============================================================================
-; DO_HELP  print all keywords
-; =============================================================================
-do_help:
-    mov si, kw_tab_start
-dh_lp:
-    call dp_str
-    call output_space
-    cmp byte [si], 0 ; Check for sentinel
-    jne dh_lp        ; Loop back if not zero
-
-    jmp new_line     ; Tail-call: new_line will RET for us
-    
 ; =============================================================================
 ; DO_ERROR  print error; never returns to caller
 ; Inputs  : AX = error code
@@ -1552,10 +1595,10 @@ tk_finish:
 do_for:
         call    spaces
         call    get_var_addr    ; DI = &var (address in VARS array)
-        mov     bp, di          ; save var_ptr in BP: kw_match inside expr clobbers DI
+        mov     [INS_TMP], di   ; save var_ptr: prec_engine clobbers BP (mov bp,sp)
         call    expect_equals	; parse '='
         call    expr            ; AX = start value (DI clobbered by kw_match)
-        mov     di, bp          ; restore &var
+        mov     di, [INS_TMP]   ; restore &var
         mov     [di], ax        ; initialise loop variable
         ; parse TO (token or plain keyword)
         call    spaces
@@ -1603,7 +1646,7 @@ df_have_step:
 	pop     cx              ; restore limit (was clobbered by input_number in expr)
 
         ; write frame: var_ptr, limit, step, loop_ptr
-        mov     di, bp          ; reload var_ptr (saved in BP before expr calls)
+        mov     di, [INS_TMP]   ; reload var_ptr (prec_engine clobbers BP)
         mov     [bx],   di      ; var_ptr
         mov     [bx+2], cx      ; limit
         mov     [bx+4], ax      ; step
@@ -1710,7 +1753,7 @@ kw_chrs:    db 0x43,0x48,0x52,T_DS
 kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
-
+kw_tab:	    db 0x54, 0x41, T_B		; TAB
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
@@ -1741,14 +1784,40 @@ st_tab:
         dw do_input, do_rem, do_end, do_let, do_poke, do_free
         dw do_help, do_gosub, do_return, do_for, do_next, do_out
 
+; Additive Level Table
+tab_add:
+        db '+'
+        dw math_add
+        db '-'
+        dw math_sub
+        db 0                    ; Sentinel
+
+; Multiplicative Level Table
+tab_mul:
+        db '*'
+        dw math_mul
+        db '/'
+        dw math_div
+        db '%'
+        dw math_mod
+        db 0                    ; Sentinel
+; Boolean Table
+tab_bool:
+        db '&'
+        dw bool_and
+        db '|'
+        dw bool_or
+        db 0                    ; Sentinel
+
 ; ---  Function Table ---
 func_tab:
 chrs_tab:
-	dw kw_chrs, eat_paren_expr
+	dw kw_chrs, eat_paren_expr	; special as only effective in print
         dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
         dw kw_usr,  do_usr_func
         dw 0                    ; Sentinel
+tab_tab: dw kw_tab
 ROM_END:
 
 ; --- Reset vector at 0xFFF0 -------------------------------------------
