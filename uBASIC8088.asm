@@ -14,9 +14,9 @@
 ;
 ; Statements  : PRINT  IF..THEN  GOTO  GOSUB  RETURN  FOR..TO[..STEP]  NEXT
 ;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
-; Expressions : + - * / % & | = < > <= >= <>   unary -
+; Expressions : + - * / % & | = < > <= >= <>   unary-
 ;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) ABS(num) 
-;				variables A..Z
+;               variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
@@ -84,7 +84,8 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added & | BOOL operators
-;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks 
+;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
+;     - Minor fixes to support multi-statement :
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
 ;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
 ;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
@@ -168,6 +169,7 @@ ERR_NF:         equ 0x36  ; NEXT without FOR
 ERR_BRK:        equ 0x42  ; NMI break: prints "?B"
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
+T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
 T_F:            equ 0xC6        ; 'F'  IF
 T_O:            equ 0xCF        ; 'O'  GOTO
 T_N:            equ 0xCE        ; 'N'  RUN THEN
@@ -176,12 +178,11 @@ T_M:            equ 0xCD        ; 'M'  REM
 T_D:            equ 0xC4        ; 'D'  END
 T_E:            equ 0xC5        ; 'E'  POKE FREE
 T_K:            equ 0xCB        ; 'K'  PEEK
-T_P:            equ 0xD0        ; 'P'  HELP
 T_R:            equ 0xD2        ; 'R'  USR
-T_S:		equ 0xD3	; 'S'  ABS
-T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
+T_P:            equ 0xD0        ; 'P'  HELP
 T_DS:           equ 0xA4        ; '$'  CHR$
-T_B:            equ 0xC2        ; 'B'  GOSUB
+T_B:            equ 0xC2        ; 'B'  GOSUB TAB
+T_S:            equ 0xD3        ; 'S'  ABS
 
 ; --- Token bytes (0x80.. = keyword in stored program) ---
 ; Order matches st_tab
@@ -393,11 +394,13 @@ sl_ret:
 ; PEEK_LINE  Advance and check for CR
 ; =============================================================================
 peek_line:
-        call spaces
-        cmp byte [si], 0x0d
+        call  spaces
+        cmp   byte [si], ':'    ; statement separator -> treat as line end (ZF=1)
+        je    stmt_ret          ; return with ZF=1 so callers stop at ':'
+        cmp   byte [si], 0x0d  ; CR -> ZF=1 (end of line)
 stmt_ret:
 do_if_false:
-	ret
+        ret
         
 ; =============================================================================
 ; DO_IF  IF <expr> [THEN] <stmt>
@@ -460,19 +463,24 @@ stmt_call:
 ; =============================================================================
 do_input:
         ; Validate variable letter before proceeding
-	call get_var_addr
+	call let_input_hlpr
         push di                 ; save var addr: input_line/expr clobber DI
         mov al, '?'
         call output
         call output_space
-        call input_line
-        jmp short let_store_ax
+        push si                 ; save program SI: input_line resets SI to IBUF
+        call input_line         ; fills IBUF, sets SI=IBUF
+        call expr               ; parse value from IBUF
+        pop si                  ; restore program SI for multi-stmt continuation
+        pop di
+        mov [di], ax
+        ret
         
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
-	call get_var_addr
+	call let_input_hlpr
         push di                 ; save var addr: expr clobbers DI via kw_match
         call expect_equals
 let_store_ax:
@@ -484,10 +492,8 @@ JERRUK:
         mov al, ERR_UK
         jmp do_error
 
-; =============================================================================
-; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
-; =============================================================================
-get_var_addr:
+; -- helper
+let_input_hlpr:
         call spaces
         mov al, [si]
         call uc_al
@@ -495,6 +501,12 @@ get_var_addr:
         jb JERRUK
         cmp al, 'Z'
         ja JERRUK
+	; drop through
+        
+; =============================================================================
+; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
+; =============================================================================
+get_var_addr:
         lodsb
         call uc_al
         sub al, 'A'
@@ -990,13 +1002,10 @@ do_usr_func:
         call eat_paren_expr
         jmp ax ; tail call
         
-; =============================================================================
-; E2_VAR: Factor level variable access
-; =============================================================================
 e2_var:
-        call get_var_addr     ; Validates A-Z, DI=&var, SI advanced
-        mov  ax, [di]           ; Simply load the value
-        ret  
+        call let_input_hlpr     ; validates A-Z, advances SI, DI=&var
+        mov  ax, [di]           ; load variable value
+        ret
         
 e2_neg:
         inc si
@@ -1743,7 +1752,7 @@ kw_peek:    db 0x50,0x45,0x45,T_K
 kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
 kw_tab:	    db 0x54, 0x41, T_B		; TAB
-kw_abs:	    db 0x41, 0x42, T_S
+kw_abs:     db 0x41, 0x42, T_S         ; ABS
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
@@ -1765,7 +1774,7 @@ step_tab:       dw kw_step
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.1"
+str_banner: db "uBASIC 8088 v1.7.2"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Statement handlers table in TK_PRINT order --------------------
@@ -1818,7 +1827,6 @@ ROM_END:
 %else        
 	org 0xfff0
 	cld
-    cli
 %endif
 reset_vec:
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
