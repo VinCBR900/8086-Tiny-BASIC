@@ -419,28 +419,25 @@ di_kw_then:
         mov bx, then_tab
         call kw_match           ; try plain-text THEN (direct mode)
         ; drop through
-        
+
 ; =============================================================================
 ; STMT  execute one statement from SI
 ; Token fast-path: stored programs have keyword tokens (0x80..0x8F);
 ; direct-mode input falls through to the kw_match loop as before.
 ; =============================================================================
 stmt:
-        call peek_line
-        je stmt_ret
+        call peek_line          
+        je   stmt_ret           
         ; --- Token fast-path (stored programs) ---
-        mov al, [si]
-        cmp al, TK_PRINT        ; first token?
-        jb  stmt_text           ; < 0x80: plain text -> kw_match loop
-        cmp al, TK_PRINT + NUM_TOKENS
-        jnb stmt_text           ; >= 0x90: not a token
-        inc si                  ; consume token byte
-        sub al, TK_PRINT        ; AL = 0..17 (index into st_tab)
-        cbw
-        add ax, ax              ; AX = index * 2 (dw handler table)
-        mov bx, st_tab
-        add bx, ax              ; BX -> correct st_tab handler
-        jmp [bx]                ; dispatch directly (saves kw_match loop)
+        mov  al, [si]           
+        cmp  al, TK_PRINT       
+        jb   stmt_text          ; < 0x80: plain text
+        cmp  al, TK_PRINT + NUM_TOKENS 
+        jnb  stmt_text          ; >= 0x92: not a dispatched token
+        inc  si                 ; Consume token
+        mov  bx, st_tab         ; Load handler table base
+        call get_token_ptr      ; BX = &st_tab[index]
+        jmp  word [bx]          ; Jump to handler
         ; --- Text fall-through (direct mode) ---
 stmt_text:
         mov bx, tk_kw_tab
@@ -458,6 +455,19 @@ stmt_call:
         mov bx, ax
         jmp [bx]                ; indirect call to handler  
 
+; =============================================================================
+; GET_TOKEN_PTR: Calculate table entry address for a token
+; Input:  AL = Token (0x80+), BX = Table Base (st_tab or tk_kw_tab)
+; Output: BX = Address of the word entry in the table
+; Clobbers: AX
+; =============================================================================
+get_token_ptr:
+        sub  al, TK_PRINT       ; Normalize token to 0-based index
+        cbw                     ; AX = Index (sign-extend AL)
+        add  ax, ax             ; AX = Index * 2 (for word table)
+        add  bx, ax             ; BX = Pointer to table entry
+        ret
+        
 ; =============================================================================
 ; DO_INPUT  INPUT <var>
 ; =============================================================================
@@ -607,28 +617,23 @@ dl_lp:
         add si, 2
 
 dl_body:
-        lodsb
-        cmp al, 0x0d            ; CR = end of line
-        je  dl_eol
-        cmp al, TK_PRINT        ; token? (0x80..0x8F)
-        jb  dl_raw              ; < 0x80: plain char
-        cmp al, TK_PRINT + NUM_TOKENS + 3  ; cover TK_FOR..TK_STEP (0x8F..0x93)
-        jnb dl_raw              ; >= 0x94: not a token
-        ; detokenize: look up keyword string and print it
-        sub al, TK_PRINT        ; index 0..15
-        cbw
-        add ax, ax              ; word offset
-        mov bx, tk_kw_tab
-        add bx, ax
-        mov bx, [bx]            ; BX -> keyword string
-        ; print keyword chars (bit-7 terminated), followed by space
-        push si
-        mov si, bx
-dl_kw_lp:
-        call dp_str
-        call output_space
-        pop si
-        jmp dl_body
+        lodsb                   
+        cmp  al, 0x0d           ; End of line?
+        je   dl_eol            
+        cmp  al, TK_PRINT       ; Is it a token?
+        jb   dl_raw             
+        cmp  al, TK_PRINT + NUM_TOKENS + 3 ; Cover TK_FOR..TK_STEP[cite: 1]
+        jnb  dl_raw             
+        ; Detokenize using helper
+        mov  bx, tk_kw_tab      ; Load string pointer table base
+        call get_token_ptr      ; BX = &tk_kw_tab[index]
+        mov  bx, [bx]           ; BX = Pointer to keyword string
+        push si                 
+        mov  si, bx             
+        call dp_str             ; Print the keyword
+        call output_space       
+        pop  si                 
+        jmp  dl_body            
 dl_raw:
         call output
         jmp dl_body
