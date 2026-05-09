@@ -10,9 +10,12 @@ Originally inspired by the 1980s BYTE magazine article "Ease into 16 bit Computi
 Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), which is leveraged here.
 
 ## Functionality
-**Statements**: `PRINT [TAB(spaces)]`, `IF` .. `THEN`, `GOTO`, `GOSUB` `RETURN`, `FOR` .. `TO` .. `STEP` `NEXT`, `LET`, `INPUT`, `REM`, `END`, `RUN`, `LIST [start,end]`, `NEW`, `POKE`, `FREE`, `HELP`, `OUT`
+**Statements**: `PRINT [TAB(spaces)] [;] [CHR$(n)]`, `IF` .. `THEN`, `GOTO`, `GOSUB` `RETURN`, `FOR` .. `TO` .. `STEP` `NEXT`, `LET`, `INPUT`, `REM`, `END`, `RUN`, `LIST [start,end]`, `NEW`, `POKE`, `FREE`, `HELP`, `OUT`
 
-**Expressions**: `+ - * / % & | = < > <= >= <>` unary- `CHR$(n)` `PEEK(addr)` `USR(addr)` `IN(io)` `ABS(val)` A-Z
+**Expressions**:  
+  - Arithmetic `+` `-` `*` `/` `% (Mod)`; Boolean `&` `|`; Relational `<` `>` `<=` `>=` `<>`, unary`-` and `= (assignment)` 
+  - functions `PEEK(addr)`, `USR(addr)`, `IN(io)`, `ABS(val)`, `RND(limit)` 
+  - variables `A`..`Z`
 
 **Numbers**: signed 16-bit (`-32768..32767`)
 
