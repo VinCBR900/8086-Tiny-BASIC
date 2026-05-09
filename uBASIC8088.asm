@@ -1,12 +1,12 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.2
+; uBASIC 8088  v1.7.3
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
 ; Targets a 2 KB code ROM + 2 KB RAM embedded system; also runs in
 ; 8bitworkshop (x86 mode) with a pre-loaded Mandelbrot showcase.
 ;
-; Credit: Oscar Toledo G. for bootBASIC inspiration and tinyasm assembler.
+; Credit: Oscar Toledo for bootBASIC inspiration and tinyasm assembler.
 ;    
 ; ---------------------------------------------------------------------------
 ; LANGUAGE REFERENCE
@@ -83,9 +83,10 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.7.2 (2026-05-02)  Refactored operator table, Added & | BOOL operators
+;   v1.7.3 (2026-05-09)  Bugfix, STMT dispatcher optimization, Shared Token match
+;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` BOOL ops
 ;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
-;     - Minor fixes to support multi-statement :
+;     - Minor fixes to support multi-statement `:`
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
 ;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
 ;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
@@ -169,20 +170,20 @@ ERR_NF:         equ 0x36  ; NEXT without FOR
 ERR_BRK:        equ 0x42  ; NMI break: prints "?B"
 
 ; --- Keyword last-byte constants: ASCII | 0x80 -------------------------------
-T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
-T_F:            equ 0xC6        ; 'F'  IF
-T_O:            equ 0xCF        ; 'O'  GOTO
-T_N:            equ 0xCE        ; 'N'  RUN THEN
-T_W:            equ 0xD7        ; 'W'  NEW
-T_M:            equ 0xCD        ; 'M'  REM
+T_B:            equ 0xC2        ; 'B'  GOSUB TAB
 T_D:            equ 0xC4        ; 'D'  END
 T_E:            equ 0xC5        ; 'E'  POKE FREE
+T_F:            equ 0xC6        ; 'F'  IF
 T_K:            equ 0xCB        ; 'K'  PEEK
-T_R:            equ 0xD2        ; 'R'  USR
+T_M:            equ 0xCD        ; 'M'  REM
+T_N:            equ 0xCE        ; 'N'  RUN THEN
+T_O:            equ 0xCF        ; 'O'  GOTO
 T_P:            equ 0xD0        ; 'P'  HELP
-T_DS:           equ 0xA4        ; '$'  CHR$
-T_B:            equ 0xC2        ; 'B'  GOSUB TAB
+T_R:            equ 0xD2        ; 'R'  USR
 T_S:            equ 0xD3        ; 'S'  ABS
+T_T:            equ 0xD4        ; 'T'  PRINT LIST INPUT LET
+T_W:            equ 0xD7        ; 'W'  NEW
+T_DS:           equ 0xA4        ; '$'  CHR$
 
 ; --- Token bytes (0x80.. = keyword in stored program) ---
 ; Order matches st_tab
@@ -416,9 +417,10 @@ do_if:
         inc si                  ; consume token
         jmp stmt                ; drop through into stmt
 di_kw_then:
-        mov bx, then_tab
+        mov bx, then_tab	; THEN optional
         call kw_match           ; try plain-text THEN (direct mode)
         ; drop through
+
 
 ; =============================================================================
 ; STMT  execute one statement from SI
@@ -426,14 +428,16 @@ di_kw_then:
 ; direct-mode input falls through to the kw_match loop as before.
 ; =============================================================================
 stmt:
-        call peek_line          
-        je   stmt_ret           
+        call peek_line
+        je stmt_ret
+        ; Range check
+        mov al, [si]
+        cmp al, TK_PRINT        ; first token?
+        jb  stmt_text           ; < 0x80: plain text -> kw_match loop
+        cmp al, TK_PRINT + NUM_TOKENS
+        jnb stmt_text           ; >= 0x92: not a token     
+        
         ; --- Token fast-path (stored programs) ---
-        mov  al, [si]           
-        cmp  al, TK_PRINT       
-        jb   stmt_text          ; < 0x80: plain text
-        cmp  al, TK_PRINT + NUM_TOKENS 
-        jnb  stmt_text          ; >= 0x92: not a dispatched token
         inc  si                 ; Consume token
         mov  bx, st_tab         ; Load handler table base
         call get_token_ptr      ; BX = &st_tab[index]
@@ -449,11 +453,8 @@ stmt_lp:
         loop stmt_lp
         jmp do_let              ; no keyword -> implicit LET/assignment
 stmt_call:
-        mov ax, bx
-        sub ax, tk_kw_tab
-        add ax, st_tab
-        mov bx, ax
-        jmp [bx]                ; indirect call to handler  
+	sub  bx, tk_kw_tab      ; BX = Index * 2 (the offset into the tables)
+        jmp  word [bx + st_tab] ; 8086 adds st_tab to BX and jumps to that word
 
 ; =============================================================================
 ; GET_TOKEN_PTR: Calculate table entry address for a token
@@ -469,41 +470,45 @@ get_token_ptr:
         ret
         
 ; =============================================================================
-; DO_INPUT  INPUT <var>
-; =============================================================================
-do_input:
-        ; Validate variable letter before proceeding
-	call let_input_hlpr
-        push di                 ; save var addr: input_line/expr clobber DI
-        mov al, '?'
-        call output
-        call output_space
-        push si                 ; save program SI: input_line resets SI to IBUF
-        call input_line         ; fills IBUF, sets SI=IBUF
-        call expr               ; parse value from IBUF
-        pop si                  ; restore program SI for multi-stmt continuation
-        pop di
-        mov [di], ax
-        ret
-        
-; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; =============================================================================
 do_let:
-	call let_input_hlpr
-        push di                 ; save var addr: expr clobbers DI via kw_match
-        call expect_equals
-let_store_ax:
-        call expr
-        pop di
-        mov [di], ax
-        ret
-JERRUK:
-        mov al, ERR_UK
-        jmp do_error
+        call get_var_addr       ; Validates A-Z, returns DI, advances SI
+        push di                 ; [1 byte] Save var address for the tail
+        call expect_equals      ; Consumes '='
+        call expr               ; Result -> AX
+        jmp  short var_store    ; [2 bytes] Jump to shared storage tail
 
-; -- helper
-let_input_hlpr:
+; =============================================================================
+; DO_INPUT  INPUT <var>
+; =============================================================================
+do_input:
+        call get_var_addr       ; Validates A-Z, returns DI, advances SI
+        push di                 ; [1 byte] Save var address
+        
+        ; Prompt logic
+        mov  al, '?'            ; 
+        call output             ; 
+        call output_space       ; Prints " "
+        
+        push si                 ; [1 byte] Save program pointer (multi-stmt support)
+        call input_line         ; Resets SI to IBUF
+        call expr               ; Parse number from user input -> AX
+        pop  si                 ; [1 byte] Restore program pointer
+        ; Fall through to var_store...
+
+; =============================================================================
+; VAR_STORE: Shared tail for assignment logic
+; =============================================================================
+var_store:
+        pop  di                 ; Restore variable address
+        mov  [di], ax           ; Store result of expression
+        ret
+
+; =============================================================================
+; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
+; =============================================================================
+get_var_addr:
         call spaces
         mov al, [si]
         call uc_al
@@ -511,12 +516,6 @@ let_input_hlpr:
         jb JERRUK
         cmp al, 'Z'
         ja JERRUK
-	; drop through
-        
-; =============================================================================
-; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
-; =============================================================================
-get_var_addr:
         lodsb
         call uc_al
         sub al, 'A'
@@ -525,6 +524,10 @@ get_var_addr:
         add ax, VARS
         mov di, ax
    	ret
+
+JERRUK:
+        mov al, ERR_UK
+        jmp do_error
         
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
@@ -617,23 +620,26 @@ dl_lp:
         add si, 2
 
 dl_body:
-        lodsb                   
-        cmp  al, 0x0d           ; End of line?
-        je   dl_eol            
-        cmp  al, TK_PRINT       ; Is it a token?
-        jb   dl_raw             
-        cmp  al, TK_PRINT + NUM_TOKENS + 3 ; Cover TK_FOR..TK_STEP[cite: 1]
-        jnb  dl_raw             
+        lodsb
+        cmp al, 0x0d            ; CR = end of line
+        je  dl_eol
+        cmp al, TK_PRINT        ; token? (0x80..0x8F)
+        jb  dl_raw              ; < 0x80: plain char
+        cmp al, TK_PRINT + NUM_TOKENS + 3  ; cover TK_FOR..TK_STEP (0x8F..0x93)
+        jnb dl_raw              ; >= 0x94: not a token
+
         ; Detokenize using helper
         mov  bx, tk_kw_tab      ; Load string pointer table base
         call get_token_ptr      ; BX = &tk_kw_tab[index]
-        mov  bx, [bx]           ; BX = Pointer to keyword string
-        push si                 
-        mov  si, bx             
-        call dp_str             ; Print the keyword
-        call output_space       
-        pop  si                 
-        jmp  dl_body            
+        mov bx, [bx]            ; BX -> keyword string
+        ; print keyword chars (bit-7 terminated), followed by space
+        push si
+        mov si, bx
+dl_kw_lp:
+        call dp_str
+        call output_space
+        pop si
+        jmp dl_body
 dl_raw:
         call output
         jmp dl_body
@@ -756,7 +762,7 @@ do_out:
 ; Input: AL = character to expect
 ; =============================================================================
 expect_equals:
-        mov al, '='
+        mov al, '='		; LET, FOR
 expect:
         call spaces
         cmp [si], al
@@ -966,18 +972,16 @@ e2_func_call:
 
 ; eat_paren_expr: '(' expr ')' -> AX
 eat_paren_expr:
-        call spaces
-        cmp byte [si], '('
-        jne epe_err
+	mov al, '('
+        call expect
 e2_par:
-	inc si
         call expr
-        call spaces
-        cmp byte [si], ')'
-        jne epe_err
-        inc si
-        ret 
-
+	push ax
+	mov al, ')'
+        call expect
+        pop ax
+        ret
+        
 peek_in_hlp:
         call eat_paren_expr
         mov bx, ax
@@ -1007,8 +1011,11 @@ do_usr_func:
         call eat_paren_expr
         jmp ax ; tail call
         
+; =============================================================================
+; E2_VAR: Factor level variable access
+; =============================================================================
 e2_var:
-        call let_input_hlpr     ; validates A-Z, advances SI, DI=&var
+        call get_var_addr     ; Validates A-Z, DI=&var, SI advanced
         mov  ax, [di]           ; load variable value
         ret
         
@@ -1017,9 +1024,6 @@ e2_neg:
         call expr2
         neg ax
         ret
-
-epe_err:
-        jmp JERRSN
 
 e2_nusr:
         ; Reload AL from [si] - kw_match may have clobbered it
@@ -1455,13 +1459,12 @@ do_gosub:
         call    expr            ; AX = target line number
         call    find_line       ; DI -> line entry >= AX
         cmp     [di], ax        ; exact match?
-        jne     gs_noline       ; no -> undefined line error
+        jne     JERRUL 		; no -> undefined line error
         mov     bx, [GOSUB_SP]  ; BX = current stack depth
         cmp     bx, 8           ; stack full? (max 8 levels)
         jb      gs_push         ; room: go push
         jmp     JERRSN		; stack overflow -> syntax error
-gs_noline:
-        jmp     JERRUL
+
 gs_push:
         inc     word [GOSUB_SP] ; bump depth first (BX still = old depth)
 	call 	gosub_hlp
@@ -1475,6 +1478,7 @@ gosub_hlp:
         mov     si, GOSUB_STK   ; SI -> base of gosub stack
         add     si, bx          ; SI -> this slot
 	ret
+        
 ; =============================================================================
 ; DO_RETURN  RETURN
 ;   Pops a return address from the GOSUB stack and resumes execution there.
@@ -1503,7 +1507,7 @@ do_rem:
         mov ah, 0x0d            ; We want to skip until the end of the line (CR)
 		; drop through
 ; =============================================================================
-; SHARED TERMINATOR HELPER (The "Skip vs. Copy" Trick)
+; SHARED TERMINATOR HELPER 
 ; Input:  AH = Terminator char (e.g., '"' or 0x0d)
 ;         SI = Read pointer, DI = Write pointer
 ; Note:   If DI = SI, this effectively becomes a "Skip" loop.
@@ -1779,7 +1783,7 @@ step_tab:       dw kw_step
 ; =============================================================================
 ; Strings (bit 7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.2"
+str_banner: db "uBASIC 8088 v1.7.3"
 CRLF:	    db 0x0d, 0x0a + 0x80	
 
 ; --- Statement handlers table in TK_PRINT order --------------------
@@ -1832,6 +1836,7 @@ ROM_END:
 %else        
 	org 0xfff0
 	cld
+        cli
 %endif
 reset_vec:
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
