@@ -6,7 +6,7 @@
 ; Targets a 2 KB code ROM + 2 KB RAM embedded system; also runs in
 ; 8bitworkshop (x86 mode) with a pre-loaded Mandelbrot showcase.
 ;
-; Credit: Oscar Toledo for bootBASIC inspiration and tinyasm assembler.
+; Credit: Oscar Toledo G. for bootBASIC inspiration and TinyASM 8086 assembler.
 ;    
 ; ---------------------------------------------------------------------------
 ; LANGUAGE REFERENCE
@@ -16,12 +16,11 @@
 ;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
 ; Expressions : + - * / % & | = < > <= >= <>   unary-
 ;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) ABS(num) 
-;               variables A..Z
+;               RND(limit) variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
 ;               ?4 bad variable   ?5 RETURN without GOSUB   ?6 NEXT without FOR
-;		?B break (ROM only)
 ;
 ; Line store  : <lo> <hi> <tokenised body> <CR>
 ;   Line numbers 1-32767
@@ -46,8 +45,6 @@
 ;                DDR A  (0x02)  init: 0xFD  (all outputs except RX)
 ;              Baud rate: 4800 baud @ 5 MHz  (BAUD = 60 loop constant)
 ;     Reset  : 8086 reset -> phys 0xFFFF0 -> FAR JMP to 0xF800:0x0000
-;     INT 0  : divide-by-zero  -> print ?2, re-enter interpreter
-;     INT 2  : NMI / break key -> print ?B, re-enter interpreter
 ;
 ;   Memory map:
 ;     ORIGIN   = 0xF800       ROM: 0xF800-0xFFFF, reset stub at 0xFFF0
@@ -83,7 +80,9 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.7.3 (2026-05-09)  Bugfix, STMT dispatcher optimization, Shared Token match
+;   v1.7.3 (2026-05-09)  `eat_paren_expr:` Bugfix , Size Optimizations:
+;     - STMT dispatcher optimization, Refactor DO_LET and DO_INPUT to share
+;     - Added RND(limit) function, Removed ROM INT 0/2h vectors for space 
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` BOOL ops
 ;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
 ;     - Minor fixes to support multi-statement `:`
@@ -147,6 +146,7 @@ CURLN:          equ RAM_BASE + 0x004    ; word:  current line number (error repo
 RUN_NEXT:       equ RAM_BASE + 0x006    ; word:  next-line pointer for run loop
 NMI:            equ RAM_BASE + 0x008    ; 4 bytes: NMI vector (ROM)
 IBUF:           equ RAM_BASE + 0x00C    ; 64 bytes: input line buffer
+RND_SEED:       equ RAM_BASE + 0x04A    ; Word: Unused space before INS_TMP
 INS_TMP:        equ RAM_BASE + 0x04C    ; word:  insline / do_for var_ptr scratch
 GOSUB_SP:       equ RAM_BASE + 0x04E    ; word: gosub stack depth (0..7)
 GOSUB_STK:      equ RAM_BASE + 0x050    ; 16 bytes: 8 gosub return addresses
@@ -324,21 +324,6 @@ start:
 %endif
         rep stosw
 
-        ; Install interrupt vectors into the now-zeroed IVT.
-        ; meaningless for 8bitworkshop
-        xor di, di              ; DI -> [0x0000] = INT 0 (divide error)
-        xchg ax,di
-        mov ax, divide_error
-        stosw                   ; [0x0000] = IP of divide_error
-        mov ax, 0xf800
-        push ax			; save 0xf800
-        stosw                   ; [0x0002] = CS = 0xF800
-        mov di, 8               ; DI -> [0x0008] = INT 2 (NMI)
-        mov ax, nmi_handler
-        stosw                   ; [0x0008] = IP of nmi_handler
-        pop ax
-        stosw                   ; [0x000A] = CS = 0xF800
-
 %ifndef __YASM_MAJOR__
         ; PROG_END = empty program (set after rep stosw so it isn't wiped)
         mov word [PROG_END], PROGRAM
@@ -346,6 +331,7 @@ start:
         ; PROG_END points past last showcase byte (excl sentinel)
         mov word [PROG_END], PROGRAM+(SHOWCASE_END-SHOWCASE_DATA)-2
 %endif
+	mov word [RND_SEED], 0xACE1 	; setup rnd               
         ; signon
 	mov si, str_banner
         call dp_str
@@ -1010,7 +996,35 @@ do_in_func:
 do_usr_func:
         call eat_paren_expr
         jmp ax ; tail call
-        
+
+; =============================================================================
+; DO_RND_FUNC - function RND(limit)
+; Returns: AX - signed RND 
+; Clobbers BX, CX, DX
+; =============================================================================
+; DO_RND_FUNC - BASIC Handler for RND(limit)
+; =============================================================================
+do_rnd_func:
+        call eat_paren_expr     ; AX = limit 'n'
+        push ax                 ; Save limit
+        call rnd_shuffle        ; Update seed, returns new seed in AX         
+        pop  cx                 ; CX = limit 'n'
+        jmp  math_mod           ; Returns (AX % CX) in AX via DX
+
+; =============================================================================
+; RND_SHUFFLE - Shared PRNG Advance logic
+; Clobbers AX
+; =============================================================================
+rnd_shuffle:
+	mov ax, [RND_SEED] ; 
+    inc ax			   ; avoid lockup at 0x0000 but less 'randomness'
+	shr ax, 1          ; "8086 shift-by-1" limitation
+	jnc .skip          ;
+	xor ax, 0xA001     ; 
+.skip:
+	mov [RND_SEED], ax ; 3 bytes
+    	ret
+
 ; =============================================================================
 ; E2_VAR: Factor level variable access
 ; =============================================================================
@@ -1192,52 +1206,44 @@ output_space:
 ; =============================================================================
 getchar:
 input_key:
+	call rnd_shuffle
 %ifdef __YASM_MAJOR__
-    mov ah, 0x00
-    int 0x16
-    ret
+	; --- Check Keyboard Status ---
+        mov ah, 0x01            ; Function 01h: Peek buffer
+        int 0x16                ; Call BIOS
+        jz input_key         ; If ZF=1, no key yet, keep shuffling
+
+        ; --- Key Found, Now Read It ---
+        mov ah, 0x00            ; Function 00h: Get key (actually removes it from buffer)
+        int 0x16                ; AX now contains the key
+        ; AL = ASCII character
+        ret
 %else
-.ik_wait:
-    in al, PORT_A           ; Read port
-    test al, RX             ; Check RX line (usually bit 1)
-    jnz .ik_wait            ; Loop until start bit (Low)
+    	in al, PORT_A           ; Read port
+    	test al, RX             ; Check RX line (usually bit 1)
+    	jnz input_key            ; Loop until start bit (Low)
     
-    call bdly               ; Center of start bit (or end, per original logic)
-    mov ah, 0x80             ; AH = Marker bit. When it shifts out, we're done.
+    	call bdly               ; Center of start bit (or end, per original logic)
+    	mov ah, 0x80             ; AH = Marker bit. When it shifts out, we're done.
 .ik_bit:
-    in al, PORT_A           ; Read data bit
-    shr al, 1               ; Move bit 1 into bit 0...
-    shr al, 1               ; ...and bit 0 into Carry Flag (CF)
-    rcr ah, 1               ; Rotate CF into AH, and AH's LSB into CF
-    call bdly               ; Wait for next bit period
-    jnc .ik_bit             ; If the marker '1' hasn't fallen into CF, loop
-    mov al, ah              ; Move result to return register
-    ret
+    	in al, PORT_A           ; Read data bit
+    	shr al, 1               ; Move bit 1 into bit 0...
+    	shr al, 1               ; ...and bit 0 into Carry Flag (CF)
+    	rcr ah, 1               ; Rotate CF into AH, and AH's LSB into CF
+    	call bdly               ; Wait for next bit period
+    	jnc .ik_bit             ; If the marker '1' hasn't fallen into CF, loop
+    	mov al, ah              ; Move result to return register
+    	ret
 
 ; =============================================================================
 ; bdly (bit-delay) - Optimized for size
 ; Clobbers: CX (saved by Marker Bit logic above instead of push/pop)
 ; =============================================================================
 bdly:
-    mov cx, BAUD            ; 3 bytes
-    loop $                  ; 2 bytes - 17 cycles per iteration on 8088
-    ret                     ; 1 byte
+    	mov cx, BAUD            ; 3 bytes
+    	loop $                  ; 2 bytes - 17 cycles per iteration on 8088
+    	ret                     ; 1 byte
 %endif
-
-; DIVIDE_ERROR  INT 0 handler: reset stack and show ?2
-divide_error:
-        mov al, ERR_OV
-        jmp do_error_hw
-
-; NMI_HANDLER  INT 2 handler: reset stack and show ?B
-nmi_handler:
-        mov al, ERR_BRK
-        ; fall through to do_error_hw
-
-; DO_ERROR_HW: abandon corrupt interrupt stack, re-enter interpreter
-do_error_hw:
-        mov sp, STACK_TOP
-        jmp do_error
 
 ; =============================================================================
 ; LINE EDITOR  
@@ -1762,6 +1768,7 @@ kw_usr:     db 0x55,0x53,T_R
 kw_in:	    db 0x49, T_N
 kw_tab:	    db 0x54, 0x41, T_B		; TAB
 kw_abs:     db 0x41, 0x42, T_S         ; ABS
+kw_rnd:     db 0x52, 0x4e, T_D
             db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
@@ -1778,7 +1785,6 @@ then_tab:       dw kw_then
 to_tab:         dw kw_to
 step_tab:       dw kw_step
         dw 0                    ; sentinel
-
 
 ; =============================================================================
 ; Strings (bit 7 terminated)
@@ -1821,10 +1827,11 @@ tab_bool:
 func_tab:
 chrs_tab:
 	dw kw_chrs, eat_paren_expr	; special as only effective in print
-        dw kw_peek, do_peek_func
+	dw kw_rnd,  do_rnd_func   
+	dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
         dw kw_usr,  do_usr_func
-        dw kw_abs,  do_abs_func
+        dw kw_abs,  do_abs_func     
         dw 0                    ; Sentinel
 tab_tab: dw kw_tab
 ROM_END:
