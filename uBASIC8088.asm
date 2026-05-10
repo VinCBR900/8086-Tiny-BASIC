@@ -386,7 +386,16 @@ peek_line:
         je    stmt_ret          ; return with ZF=1 so callers stop at ':'
         cmp   byte [si], 0x0d  ; CR -> ZF=1 (end of line)
 stmt_ret:
+        ret
+
+; =============================================================================
+; DO_IF_FALSE  Skip the rest of the line when an IF condition is false
+; =============================================================================
 do_if_false:
+        lodsb               ; Load next character
+        cmp al, 0x0d        ; Is it the end of the line (CR)?
+        jne do_if_false     ; If not, keep skipping
+        dec si              ; Back up so SI points at the CR for the main loop
         ret
         
 ; =============================================================================
@@ -1410,7 +1419,6 @@ do_end:
 run_end:
         mov byte [RUNNING], al  ; Clear running flag
         ret
-        
 ; =============================================================================
 ; DO_GOTO / DO_RUN
 ; =============================================================================
