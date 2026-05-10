@@ -16,7 +16,7 @@
 ;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
 ; Expressions : + - * / % & | = < > <= >= <>   unary-
 ;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) ABS(num) 
-;               RND(limit) variables A..Z
+;               RND(limit) NOT(expr) variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
@@ -82,27 +82,17 @@
 ; =============================================================================
 ;   v1.7.3 (2026-05-09)  `eat_paren_expr:` Bugfix , Size Optimizations:
 ;     - STMT dispatcher optimization, Refactor DO_LET and DO_INPUT to share
-;     - Added RND(limit) function, Removed ROM INT 0/2h vectors for space 
+;     - Added RND(limit), NOT(exp) function, Removed INT 0/2h vectors for space 
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` BOOL ops
 ;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
 ;     - Minor fixes to support multi-statement `:`
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
-;     - xor ah,ah -> cbw in stmt dispatch, get_var_addr, do_list detokenize
-;       (AL is always 0..25 at these points so sign-extension is safe; cbw=1B
-;       vs xor ah,ah=3B saves 2B each, 6B total).
-;     - tokenize: removed push ax/pop ax around call spaces (spaces only
-;       touches SI, never AX; push/pop were unnecessary, 2B saved).
 ;   v1.7.0 (2026-05-01)  Refactor and LIST range feature.
 ;     - LIST accepts optional <start>,<end> line range.
 ;     - EXPR2 function dispatch table refactor.
 ;     - Size refactoring: LET/INPUT, POKE/OUT, tokenizer, stmt dispatcher.
-;     - editln: push cx / pop cx around call deline (deline's rep movsb
-;       zeroed CX, causing insline to write zero body bytes on line replace).
 ;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom  debugging):
-;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
-;       all signed < / > comparisons were wrong.  Removed sbb.
 ;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
-;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
@@ -110,8 +100,6 @@
 ;     0xFFF0, bdly delay routine, showcase PROG_END init, rep stosw range fix.
 ;   v1.4.0 (2026-04-19)  FOR / NEXT with optional STEP.
 ;     4-entry FOR stack; TK_FOR=0x8F TK_NEXT=0x90 TK_THEN=0x91 TK_TO=0x92
-;     TK_STEP=0x93; several kw_match/DI/CX clobber fixes; error ?6 NEXT
-;     without FOR; dp_str/new_line tail-call optimisation.
 ;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
 ;     Keywords stored as 0x80-0x8F tokens; LIST detokenises; 
 ;     stmt fast-path dispatch; insline/deline/editln refactored.
@@ -962,6 +950,9 @@ e2_func_lp:
         jmp e2_func_lp
 
 e2_func_call:
+	push bx
+	call eat_paren_expr
+        pop bx
         jmp [bx+2]              ; Indirect jump to the function handler
 
 ; eat_paren_expr: '(' expr ')' -> AX
@@ -976,14 +967,7 @@ e2_par:
         pop ax
         ret
         
-peek_in_hlp:
-        call eat_paren_expr
-        xchg bx,ax
-        xor ah, ah
-        ret
-
 do_abs_func:
-        call eat_paren_expr     ; AX = value
         or   ax, ax             ; Set flags (2 bytes)
         jns  .done              ; Jump if positive (2 bytes)
         neg  ax                 ; Negate if negative (2 bytes)
@@ -991,27 +975,30 @@ do_abs_func:
         ret
         
 do_peek_func:
-        call peek_in_hlp
-        mov al, [bx]
-        ret
+    xchg bx, ax             ; Move address from AX to BX
+    mov al, [bx]            ; Read byte from memory
+    xor ah, ah              ; Clear high byte
+    ret
 
 do_in_func:
-        call peek_in_hlp
-        xchg dx, bx
-        in al,dx
-        ret
+    xchg dx, ax              ; AX contains the port number from eat_paren_expr
+    in al, dx               ; Read from port
+    xor ah, ah              ; Clear high byte so BASIC sees a valid 16-bit integer
+    ret
 
 do_usr_func:
-        call eat_paren_expr
         jmp ax ; tail call
 
+do_not_func:
+	not ax
+        ret
+        
 ; =============================================================================
 ; DO_RND_FUNC - function RND(limit)
 ; Returns: AX - signed RND +/- limit 
 ; Clobbers BX, CX, DX
 ; =============================================================================
 do_rnd_func:
-        call eat_paren_expr     ; AX = limit 'n'
         push ax                 ; Save limit
         call rnd_shuffle        ; Update seed, returns new seed in AX         
         pop  cx                 ; CX = limit 'n'
@@ -1774,7 +1761,8 @@ kw_in:	    db 0x49, T_N
 kw_tab:	    db 0x54, 0x41, T_B		; TAB
 kw_abs:     db 0x41, 0x42, T_S         ; ABS
 kw_rnd:     db 0x52, 0x4e, T_D
-            db 0
+kw_not:     db 0x4e, 0x4f, T_T	
+		db 0
 
 ; --- Token -> keyword string pointer table (same order as st_tab / TK_xx) ---
 ; 17 stmt entries + 3 sub-keyword entries
@@ -1836,7 +1824,8 @@ chrs_tab:
 	dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
         dw kw_usr,  do_usr_func
-        dw kw_abs,  do_abs_func     
+        dw kw_abs,  do_abs_func
+        dw kw_not,  do_not_func
         dw 0                    ; Sentinel
 tab_tab: dw kw_tab
 ROM_END:
