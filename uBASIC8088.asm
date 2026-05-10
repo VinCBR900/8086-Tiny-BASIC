@@ -508,8 +508,8 @@ get_var_addr:
         cbw
         add ax, ax
         add ax, VARS
-        mov di, ax
-   	ret
+   	xchg di,ax
+        ret
 
 JERRUK:
         mov al, ERR_UK
@@ -517,7 +517,6 @@ JERRUK:
         
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
-;
 ; Inputs  : BX -> table entry word 0 = keyword string ptr
 ;           SI -> input text
 ; Outputs : CF=0 matched, SI advanced past keyword
@@ -582,7 +581,7 @@ dl_done:
         ret
 
 ; =============================================================================
-; DO_LIST - LIST <start,end> note start/end optional but both must be provided
+; DO_LIST - LIST [start,end] note start/end optional but both must be provided
 ; =============================================================================
 do_list:
         mov di, PROGRAM		; Default first line memory
@@ -674,7 +673,7 @@ dp_tab:
         call kw_match
         jc dp_num
         call eat_paren_expr
-        mov cx,ax
+        xchg ax,cx
         jcxz dp_after           ; TAB(0) -> nothing
 tab_loop:
 	call output_space
@@ -922,7 +921,7 @@ math_div:
 
 math_mod:
         call math_div           ; Perform division
-        mov ax, dx              ; Return remainder
+        xchg ax,dx		; Return remainder
         ret
 
 ; =============================================================================
@@ -970,7 +969,7 @@ e2_par:
         
 peek_in_hlp:
         call eat_paren_expr
-        mov bx, ax
+        xchg bx,ax
         xor ah, ah
         ret
 
@@ -989,7 +988,7 @@ do_peek_func:
 
 do_in_func:
         call peek_in_hlp
-        mov dx, bx
+        xchg dx, bx
         in al,dx
         ret
 
@@ -999,10 +998,8 @@ do_usr_func:
 
 ; =============================================================================
 ; DO_RND_FUNC - function RND(limit)
-; Returns: AX - signed RND 
+; Returns: AX - signed RND +/- limit 
 ; Clobbers BX, CX, DX
-; =============================================================================
-; DO_RND_FUNC - BASIC Handler for RND(limit)
 ; =============================================================================
 do_rnd_func:
         call eat_paren_expr     ; AX = limit 'n'
@@ -1017,12 +1014,11 @@ do_rnd_func:
 ; =============================================================================
 rnd_shuffle:
 	mov ax, [RND_SEED] ; 
-    inc ax			   ; avoid lockup at 0x0000 but less 'randomness'
 	shr ax, 1          ; "8086 shift-by-1" limitation
 	jnc .skip          ;
 	xor ax, 0xA001     ; 
 .skip:
-	mov [RND_SEED], ax ; 3 bytes
+	mov [RND_SEED], ax ; 
     	ret
 
 ; =============================================================================
@@ -1068,7 +1064,7 @@ inm_lp:
         add bx, ax
         jmp short inm_lp
 inm_done:
-        mov ax, bx
+        xchg ax,bx
         ret
 
 ; =============================================================================
@@ -1414,6 +1410,7 @@ do_end:
 run_end:
         mov byte [RUNNING], al  ; Clear running flag
         ret
+        
 ; =============================================================================
 ; DO_GOTO / DO_RUN
 ; =============================================================================
