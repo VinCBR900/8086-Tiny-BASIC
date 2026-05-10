@@ -14,7 +14,7 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
 
 **Expressions**:  
   - Arithmetic `+` `-` `*` `/` `% (Mod)`; Boolean `&` `|`; Relational `<` `>` `<=` `>=` `<>`, unary`-` and `= (assignment)` 
-  - functions `PEEK(addr)`, `USR(addr)`, `IN(io)`, `ABS(val)`, `RND(limit)` 
+  - functions `PEEK(addr)`, `USR(addr)`, `IN(io)`, `ABS(val)`, `RND(limit)`, `NOT(val)` 
   - variables `A`..`Z`
 
 **Numbers**: signed 16-bit (`-32768..32767`)
