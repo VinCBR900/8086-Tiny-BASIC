@@ -12,11 +12,14 @@
 ; LANGUAGE REFERENCE
 ; ---------------------------------------------------------------------------
 ;
-; Statements  : PRINT  IF..THEN  GOTO  GOSUB  RETURN  FOR..TO[..STEP]  NEXT
-;               LET  INPUT  REM  OUT  END  RUN  LIST  NEW  POKE  FREE  HELP
-; Expressions : + - * / % & | = < > <= >= <>   unary-
-;               CHR$(n)  PEEK(addr)  IN(port)  USR(addr) TAB(spaces) ABS(num) 
-;               RND(limit) NOT(expr) variables A..Z
+; Statements  : END, FOR..TO [..STEP]  NEXT, GOTO, GOSUB  RETURN, IF..THEN,  
+;               INPUT, LET, PRINT [CHR$(val)] [TAB(n)] [;], POKE, OUT, REM;  
+;               FREE, HELP, LIST [start,end], NEW, RUN
+; Expressions - Arithmetic: + - * / %(Mod) = unary-
+;               Relop: < > <= >= <>   
+;               Bitwise: &(and), |(or), ^(xor)
+;               Functions: ABS(num), IN(port), PEEK(addr), RND(limit), USR(addr)   
+;               variables A..Z
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
 ; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
@@ -81,18 +84,23 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;   v1.7.3 (2026-05-09)  `eat_paren_expr:` Bugfix , Size Optimizations:
-;     - STMT dispatcher optimization, Refactor DO_LET and DO_INPUT to share
-;     - Added RND(limit), NOT(exp) function, Removed INT 0/2h vectors for space 
-;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` BOOL ops
+;     - STMT dispatcher optimization, Refactor DO_LET/DO_INPUT shared sections, 
+;     - Added ^ (XOR biwise), NOT(exp)/RND(limit) functions, 
+;	  - Removed INT 0/2h vectors for space 
+;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` bitwise ops
 ;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
 ;     - Minor fixes to support multi-statement `:`
 ;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free):
+;     - tokenize: improvements
 ;   v1.7.0 (2026-05-01)  Refactor and LIST range feature.
 ;     - LIST accepts optional <start>,<end> line range.
 ;     - EXPR2 function dispatch table refactor.
 ;     - Size refactoring: LET/INPUT, POKE/OUT, tokenizer, stmt dispatcher.
 ;   v1.6.1 (2026-04-30)  Bug-fix release (sim_rom  debugging):
+;     - sbb ax,ax before jl in relational eval clobbered flags from cmp;
+;       all signed < / > comparisons were wrong.  Removed sbb.
 ;     - Showcase token bytes updated for TK_OUT insertion (THEN/TO/STEP each
+;       shifted up by one: 0x91->0x92, 0x92->0x93, 0x93->0x94).
 ;   v1.6.0 (2026-04-26)  Added IN / OUT port I/O commands.
 ;     Refactored statement dispatch table to create space; misc size savings.
 ;   v1.5.0 (2026-04-23)  ROM target.
@@ -100,6 +108,8 @@
 ;     0xFFF0, bdly delay routine, showcase PROG_END init, rep stosw range fix.
 ;   v1.4.0 (2026-04-19)  FOR / NEXT with optional STEP.
 ;     4-entry FOR stack; TK_FOR=0x8F TK_NEXT=0x90 TK_THEN=0x91 TK_TO=0x92
+;     TK_STEP=0x93; several kw_match/DI/CX clobber fixes; error ?6 NEXT
+;     without FOR; dp_str/new_line tail-call optimisation.
 ;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
 ;     Keywords stored as 0x80-0x8F tokens; LIST detokenises; 
 ;     stmt fast-path dispatch; insline/deline/editln refactored.
@@ -773,7 +783,7 @@ spaces:
 ; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000
 ; Clobbers: AX, BX, CX, DX, SI
 expr:
-        call    expr_bool        ; Left operand -> AX
+        call    expr_bitwise        ; Left operand -> AX
         push    ax              ; Save left
         call    spaces
         
@@ -804,7 +814,7 @@ expr:
 
 .do_rel:
         push    dx              ; Save operator mask
-        call    expr_bool        ; Right operand -> AX
+        call    expr_bitwise        ; Right operand -> AX
         pop     dx              ; Restore mask (DL)
         pop     bx              ; BX = left operand
 
@@ -837,17 +847,21 @@ ea_ret:
 ; Handles / * + - & | 
 ; BX = Table Pointer, DI = Next Level Function Pointer
 ; =============================================================================
-expr_bool:      ; lowest precidence
-        mov bx, tab_bool
-        mov di, expr_add
+expr_bitwise:      ; lowest precidence
+        mov bx, tab_bitwise
+        mov di, expr_add	; no match
         jmp short prec_engine
 
-bool_and:
+bitwise_and:
         and ax, cx
         ret
         
-bool_or:
+bitwise_or:
         or ax, cx
+        ret
+        
+bitwise_xor:
+	xor ax, cx
         ret
         
 expr_add:
@@ -977,12 +991,12 @@ do_abs_func:
 do_peek_func:
     xchg bx, ax             ; Move address from AX to BX
     mov al, [bx]            ; Read byte from memory
-    xor ah, ah              ; Clear high byte
-    ret
-
+    db 0xbb		    ; swallow next 2 bytes with mov bx, imm
+	; drop through
 do_in_func:
     xchg dx, ax              ; AX contains the port number from eat_paren_expr
     in al, dx               ; Read from port
+in_tail:		; resumes from do_peek
     xor ah, ah              ; Clear high byte so BASIC sees a valid 16-bit integer
     ret
 
@@ -1808,18 +1822,19 @@ tab_mul:
         db '%'
         dw math_mod
         db 0                    ; Sentinel
-; Boolean Table
-tab_bool:
+
+; bitwise Table
+tab_bitwise:
         db '&'
-        dw bool_and
+        dw bitwise_and
         db '|'
-        dw bool_or
+        dw bitwise_or
+        db '^'
+        dw bitwise_xor
         db 0                    ; Sentinel
 
 ; ---  Function Table ---
 func_tab:
-chrs_tab:
-	dw kw_chrs, eat_paren_expr	; special as only effective in print
 	dw kw_rnd,  do_rnd_func   
 	dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
@@ -1827,7 +1842,12 @@ chrs_tab:
         dw kw_abs,  do_abs_func
         dw kw_not,  do_not_func
         dw 0                    ; Sentinel
-tab_tab: dw kw_tab
+        
+        ; special as only effective in print
+chrs_tab:
+	dw kw_chrs	
+tab_tab:
+	dw kw_tab
 ROM_END:
 
 ; --- Reset vector at 0xFFF0 -------------------------------------------
