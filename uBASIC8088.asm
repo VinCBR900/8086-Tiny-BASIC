@@ -89,6 +89,7 @@
 ;   v1.7.3 (2026-05-09)  `eat_paren_expr:` Bugfix , Size Optimizations:
 ;     - STMT dispatcher optimization, Refactor DO_LET/DO_INPUT shared sections, 
 ;     - Added ^ (XOR biwise), NOT(exp)/RND(limit) functions, 
+;	  - Removed INT 0/2h vectors for space 
 ;   v1.7.2 (2026-05-02)  Refactored operator table, Added `&` `|` bitwise ops
 ;     - added PRINT TAB(spaces) and ABS(num), fix NEXT error, minor size tweaks
 ;     - Minor fixes to support multi-statement `:`
@@ -306,6 +307,7 @@ start:
 	cld
 	mov ax, cs      ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves them at PSP)
 %else
+	cli
         ; ROM cold start: CS=0xF800 after far JMP. RAM is at segment 0.
         xor ax, ax      ; AX=0 -> DS=ES=SS=0 (RAM segment)
 %endif
@@ -500,6 +502,9 @@ var_store:
 ; =============================================================================
 ; GET_VAR_ADDR  letter at [SI] -> DI=&var, SI advanced
 ; =============================================================================
+JERRUK:
+        mov al, ERR_UK
+        jmp do_error
 get_var_addr:
         call spaces
         mov al, [si]
@@ -516,10 +521,6 @@ get_var_addr:
         add ax, VARS
    	xchg di,ax
         ret
-
-JERRUK:
-        mov al, ERR_UK
-        jmp do_error
         
 ; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
@@ -761,10 +762,6 @@ expect:
 sp_r:
 	ret
 
-JERRSN:
-        mov al, ERR_SN
-        jmp do_error
-
 ; =============================================================================
 ; SPACES  skip spaces; preserves AX, BX, CX, DX
 ; =============================================================================
@@ -776,10 +773,10 @@ spaces:
 
 ; =============================================================================
 ; EXPR  evaluate expression including relational operators
-;
 ; Inputs  : SI -> expression text
 ; Outputs : AX = signed 16-bit result; true=0xFFFF false=0x0000
 ; Clobbers: AX, BX, CX, DX, SI
+; =============================================================================
 expr:
         call    expr_bitwise        ; Left operand -> AX
         push    ax              ; Save left
@@ -839,7 +836,44 @@ expr:
 e1_ret:
 ea_ret:
         ret
+; =============================================================================
+; Central Errors
+; =============================================================================
+JERRSN:
+        mov al, ERR_SN
+        jmp do_error
+        db 0xbb			; consume mov al
+div_err:
+        mov al, ERR_OV          ; Overflow/Div-by-zero error code
+        jmp do_error        
 
+; =============================================================================
+; Math Function Stubs
+; =============================================================================
+math_add:
+        add ax, cx
+        ret
+
+math_sub:
+        sub ax, cx
+        ret
+
+math_mul:
+        imul cx                 ; AX = AX * CX
+        ret
+
+math_mod:
+        call math_div           ; Perform division
+        xchg ax,dx		; Return remainder
+        ret  
+        
+math_div:
+        or cx, cx               ; Division by zero?
+        je div_err
+        cwd                     ; Sign-extend AX into DX for IDIV
+        idiv cx                 ; AX = quotient, DX = remainder
+        ret
+      
 ; =============================================================================
 ; PREC_ENGINE: Generic Precedence Level Handler
 ; Handles / * + - & | 
@@ -904,33 +938,6 @@ prec_engine:
 
 .done:
         add sp, 4               ; Clean up BX and DI from stack
-        ret
-
-math_add:
-        add ax, cx
-        ret
-
-math_sub:
-        sub ax, cx
-        ret
-
-math_mul:
-        imul cx                 ; AX = AX * CX
-        ret
-
-math_div:
-        or cx, cx               ; Division by zero?
-        je .err
-        cwd                     ; Sign-extend AX into DX for IDIV
-        idiv cx                 ; AX = quotient, DX = remainder
-        ret
-.err:
-        mov al, ERR_OV          ; Overflow/Div-by-zero error code
-        jmp do_error        
-
-math_mod:
-        call math_div           ; Perform division
-        xchg ax,dx		; Return remainder
         ret
 
 ; =============================================================================
@@ -998,8 +1005,7 @@ in_tail:		; resumes from do_peek
     xor ah, ah              ; Clear high byte so BASIC sees a valid 16-bit integer
     ret
 
-do_usr_func:
-        jmp ax ; tail call
+;do_user_func is at end as tiny
 
 do_not_func:
 	not ax
@@ -1508,6 +1514,9 @@ gosub_hlp:
 ;   Pops a return address from the GOSUB stack and resumes execution there.
 ; Clobbers: AX, BX
 ; =============================================================================
+gs_underflow:
+        mov     al, ERR_RT      ; ?5 return without gosub
+        jmp     do_error
 do_return:
         mov     bx, [GOSUB_SP]  ; BX = current stack depth
         or      bx, bx          ; stack empty?
@@ -1518,10 +1527,6 @@ do_return:
         mov     ax, [si]        ; pop return address
         mov     [RUN_NEXT], ax  ; restore PC to line after GOSUB
         ret
-
-gs_underflow:
-        mov     al, ERR_RT      ; ?5 return without gosub
-        jmp     do_error
 
 ; =============================================================================
 ; DO_REM (Execution Phase) - skips the rest of the line during program run.
@@ -1616,7 +1621,7 @@ tk_done:
         stosb                   ; Write the final Carriage Return
 tk_finish:
         pop si                  ; Restore SI to the start of the body
-        ret
+        ret   
 
 ; =============================================================================
 ; DO_FOR  FOR <var> = <start> TO <end> [STEP <step>]
@@ -1624,6 +1629,7 @@ tk_finish:
 ; Inputs : SI -> line body after FOR token
 ; Clobbers: AX, BX, CX, DX, DI
 ; =============================================================================
+df_syn: jmp     JERRSN
 do_for:
         call    spaces
         call    get_var_addr
@@ -1666,10 +1672,8 @@ df_no_step:
         mov     ax, [RUN_NEXT]
         mov     [bx+6], ax      ; [bx+6] loop_ptr
         ret
-
-df_syn: jmp     JERRSN
-
-; HELPERS (The "Byte Shaver" Section)
+        
+; HELPERS
 ; for_ptr_hlp: Convert index in CX to frame pointer in BX
 ; BX = FOR_STK + (CX * 8). Clobbers: BX.
 for_ptr_hlp:
@@ -1699,6 +1703,9 @@ etk_match:
 ; Inputs : SI -> line body after NEXT token
 ; Clobbers: AX, BX, CX, DX, DI
 ; =============================================================================
+dn_no_for:
+        mov     al, ERR_NF
+        jmp     do_error  
 do_next:
         call    spaces
         call    get_var_addr    ; DI = &var
@@ -1735,10 +1742,6 @@ dn_loop:
         mov     ax, [bx+6]
         mov     [RUN_NEXT], ax
         ret
-
-dn_no_for:
-        mov     al, ERR_NF
-        jmp     do_error
        
 ; =============================================================================
 ; DO_DELAY: Usage "DELAY <0.1 secs>"
@@ -1869,7 +1872,6 @@ ROM_END:
 %else        
 	org 0xfff0
 	cld
-        cli
 %endif
 reset_vec:
         ; 8755 serial: bit1=RX(in), rest=out; TX idle high
@@ -1887,4 +1889,8 @@ reset_vec:
         dw 0x0000               ; IP = 0x0000
         dw 0xF800               ; CS = 0xF800 -> start
 %endif
+; placed here as 2 bytes spare
+do_usr_func:
+        jmp ax ; tail call
+
 	times 2048-($-start) db 0xff	; pad
