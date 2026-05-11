@@ -13,7 +13,7 @@
 ; LANGUAGE REFERENCE
 ; ---------------------------------------------------------------------------
 ;
-; Statements  : END, FOR..TO [..STEP]  NEXT, GOTO, GOSUB  RETURN, IF..THEN,  
+; Statements  : DELAY, END, FOR..TO [..STEP]  NEXT, GOTO, GOSUB  RETURN, IF..THEN,  
 ;               INPUT, LET, PRINT [CHR$(val)] [TAB(n)] [;], POKE, OUT, REM;  
 ;               FREE, HELP, LIST [start,end], NEW, RUN
 ; Expressions - Arithmetic: + - * / %(Mod) = unary-
