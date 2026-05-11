@@ -1156,13 +1156,11 @@ new_line:
 ; =============================================================================
 putchar:
 output:
-%ifdef __YASM_MAJOR__
     push bx
+%ifdef __YASM_MAJOR__
     mov ah, 0x0e
     mov bx, 0x0007
     int 0x10
-    pop bx
-    ret
 %else
     mov ah, al          ; AH = character to send
     mov al, 0           ; Start bit (Line goes low)
@@ -1179,8 +1177,9 @@ output:
     stc                 ; Ensure Carry is 1 for the next shift-in
     dec bx              ; Use BX (1-byte dec) instead of BL (2-byte dec)
     jnz .out_bit
-    ret
 %endif
+    pop bx
+    ret
         
 ; =============================================================================
 ; DO_ERROR  print error; never returns to caller
