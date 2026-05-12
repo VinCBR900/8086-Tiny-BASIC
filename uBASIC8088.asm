@@ -251,12 +251,12 @@ SHOWCASE_DATA:
         db 0x1E,0x00, 0x80,0x22,"2+3=",0x22,";2+3;",0x22,"  6*7=",0x22,";6*7",0x0D      ; 30
         db 0x28,0x00, 0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 40
         db 0x32,0x00, 0x80,0x22,"--- COMPARISONS ---",0x22,0x0D           ; 50
-        db 0x3C,0x00, 0x81,"5>3 ",0x93,0x80,0x22,"5>3 ok",0x22,0x0D      ; 60  IF THEN(0x93) PRINT
-        db 0x46,0x00, 0x81,"3<5 ",0x93,0x80,0x22,"3<5 ok",0x22,0x0D      ; 70
-        db 0x50,0x00, 0x81,"3>=3 ",0x93,0x80,0x22,"3>=3 ok",0x22,0x0D    ; 80
-        db 0x5A,0x00, 0x81,"4<>3 ",0x93,0x80,0x22,"4<>3 ok",0x22,0x0D    ; 90
+        db 0x3C,0x00, 0x81,"5>3",0x93,0x80,0x22,"5>3 ok",0x22,0x0D      ; 60  IF THEN(0x93) PRINT
+        db 0x46,0x00, 0x81,"3<5",0x93,0x80,0x22,"3<5 ok",0x22,0x0D      ; 70
+        db 0x50,0x00, 0x81,"3>=3",0x93,0x80,0x22,"3>=3 ok",0x22,0x0D    ; 80
+        db 0x5A,0x00, 0x81,"4<>3",0x93,0x80,0x22,"4<>3 ok",0x22,0x0D    ; 90
         db 0x64,0x00, 0x80,0x22,"--- FOR/NEXT ---",0x22,0x0D              ; 100
-        db 0x6E,0x00, 0x8F,"I=1 ",0x94,"5",0x0D                           ; 110 FOR I=1 TO(0x94) 5
+        db 0x6E,0x00, 0x8F,"I=1",0x94,"5",0x0D                           ; 110 FOR I=1 TO(0x94) 5
         db 0x78,0x00, 0x80,"I;",0x0D                                       ; 120 PRINT I;
         db 0x82,0x00, 0x90,"I",0x0D                                        ; 130 NEXT I
         db 0x8C,0x00, 0x80,0x22,0x22,0x0D                                  ; 140 PRINT ""
@@ -268,34 +268,33 @@ SHOWCASE_DATA:
         db 0xB4,0x00, 0x80,0x22,0x22,0x0D                                  ; 180 PRINT ""
         ; ── Mandelbrot ─────────────────────────────────────────────────────────
         db 0xBE,0x00, 0x80,0x22,"--- MANDELBROT ---",0x22,0x0D            ; 190
-        db 0xC8,0x00, 0x8F,"I=-64 ",0x94,"56 ",0x95,"6",0x0D              ; 200 FOR I=-64 TO(0x94) 56 STEP(0x95) 6
+        db 0xC8,0x00, 0x8F,"I=-64",0x94,"56 ",0x95,"6",0x0D              ; 200 FOR I=-64 TO(0x94) 56 STEP(0x95) 6
         db 0xD2,0x00, 0x8F,"C=-128 ",0x94,"16 ",0x95,"4",0x0D             ; 210 FOR C=-128 TO(0x94) 16 STEP(0x95) 4
         db 0xDC,0x00, "D=I:A=C:B=D:E=0",0x0D                              ; 220 init row
-        db 0xE6,0x00, 0x8F,"N=1 ",0x94,"16",0x0D                          ; 230 FOR N=1 TO(0x94) 16
+        db 0xE6,0x00, 0x8F,"N=1",0x94,"16",0x0D                          ; 230 FOR N=1 TO(0x94) 16
         db 0xF0,0x00, "T=A*A/64-B*B/64+C",0x0D                            ; 240 iterate
         db 0xFA,0x00, "B=2*A*B/64+D:A=T",0x0D                             ; 250
-        db 0x04,0x01, 0x81,"A*A/64+B*B/64>256 ",0x93,0x8D,"600",0x0D      ; 260 IF THEN(0x93) GOSUB 600
+        db 0x04,0x01, 0x81,"A*A/64+B*B/64>256",0x93,0x8D,"600",0x0D      ; 260 IF THEN(0x93) GOSUB 600
         db 0x0E,0x01, 0x90,"N",0x0D                                        ; 270 NEXT N
-        db 0x18,0x01, 0x81,"E>0 ",0x93,0x80,"CHR$(E+32);",0x0D            ; 280 IF E>0 THEN(0x93) PRINT
-        db 0x22,0x01, 0x81,"E=0 ",0x93,0x80,"CHR$(32);",0x0D              ; 290 IF E=0 THEN(0x93) PRINT
+        db 0x18,0x01, 0x81,"E>0",0x93,0x80,"CHR$(E+32);",0x0D            ; 280 IF E>0 THEN(0x93) PRINT
+        db 0x22,0x01, 0x81,"E=0",0x93,0x80,"CHR$(32);",0x0D              ; 290 IF E=0 THEN(0x93) PRINT
         db 0x2C,0x01, 0x90,"C",0x0D                                        ; 300 NEXT C
-        db 0x36,0x01, 0x80,0x22,0x22,0x0D                                  ; 310 PRINT "" (newline)
+        db 0x36,0x01, 0x80,0x0D                                  	; 310 PRINT (newline)
         db 0x40,0x01, 0x90,"I",0x0D                                        ; 320 NEXT I
         db 0x4A,0x01, 0x88,0x0D                                            ; 330 END
         ; ── Subroutine 500: sum 1..10 ──────────────────────────────────────────
         db 0xF4,0x01, "S=0",0x0D                                           ; 500
-        db 0xFE,0x01, 0x8F,"J=1 ",0x94,"10",0x0D                          ; 510 FOR J=1 TO(0x94) 10
+        db 0xFE,0x01, 0x8F,"J=1",0x94,"10",0x0D                          ; 510 FOR J=1 TO(0x94) 10
         db 0x08,0x02, "S=S+J",0x0D                                         ; 520
         db 0x12,0x02, 0x90,"J",0x0D                                        ; 530 NEXT J
         db 0x1C,0x02, 0x8E,0x0D                                            ; 540 RETURN
         ; ── Subroutine 550: factorial 5 ────────────────────────────────────────
         db 0x26,0x02, "F=1",0x0D                                           ; 550
-        db 0x30,0x02, 0x8F,"K=1 ",0x94,"5",0x0D                           ; 560 FOR K=1 TO(0x94) 5
+        db 0x30,0x02, 0x8F,"K=1",0x94,"5",0x0D                           ; 560 FOR K=1 TO(0x94) 5
         db 0x3A,0x02, "F=F*K",0x0D                                         ; 570
         db 0x44,0x02, 0x90,"K",0x0D                                        ; 580 NEXT K
         db 0x4E,0x02, 0x8E,0x0D                                            ; 590 RETURN
         ; ── Subroutine 600: record Mandelbrot escape iteration ─────────────────
-        ; FIX v1.7.5: was 0x92 (TK_DELAY), corrected to 0x93 (TK_THEN)
         db 0x58,0x02, 0x81,"E=0 ",0x93,"E=N",0x0D                         ; 600 IF E=0 THEN(0x93) E=N
         db 0x62,0x02, 0x8E,0x0D                                            ; 610 RETURN
         dw 0                                                                ; end sentinel
@@ -645,15 +644,15 @@ dl_body:
         je   dl_eol
         cmp  al, TK_PRINT       ; below token range?
         jb   dl_raw
-        cmp  al, TK_STEP + 1    ; above token range? (TK_STEP = 0x95)
-        jnb  dl_raw
+;        cmp  al, TK_STEP + 1    ; above token range? (TK_STEP = 0x95)
+;        jnb  dl_raw
         mov  bx, tk_kw_tab
         call get_token_ptr      ; BX -> tk_kw_tab entry
         mov  bx, [bx]           ; BX -> keyword string
         push si
         ; Detokenise: space BEFORE + keyword text + space AFTER
         ; FIX v1.7.5: space before added so "FOR I=1 TO 5" lists correctly
-        cmp al,' '
+        cmp byte [si-1],' '
         jne .skip_space
         call output_space
 .skip_space:
@@ -1943,6 +1942,9 @@ tk_kw_tab:
 then_tab:   dw kw_then
 to_tab:     dw kw_to
 step_tab:   dw kw_step
+; PRINT-only functions (single entry each; matched individually, not iterated)
+chrs_tab:   dw kw_chrs
+tab_tab:    dw kw_tab
 
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
@@ -1998,10 +2000,6 @@ func_tab:
         dw kw_abs,  do_abs_func
         dw kw_not,  do_not_func
         dw 0
-
-; PRINT-only functions (single entry each; matched individually, not iterated)
-chrs_tab:   dw kw_chrs
-tab_tab:    dw kw_tab
 
 ROM_END:
 
