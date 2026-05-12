@@ -650,15 +650,13 @@ dl_body:
         mov  bx, tk_kw_tab
         call get_token_ptr      ; BX -> tk_kw_tab entry
         mov  bx, [bx]           ; BX -> keyword string
+        push si
         ; Detokenise: space BEFORE + keyword text + space AFTER
         ; FIX v1.7.5: space before added so "FOR I=1 TO 5" lists correctly
-	cmp al,' '
-        je .skip_space
-	push ax
+        cmp al,' '
+        jne .skip_space
         call output_space
-        pop ax
-.skip_space:        
-        push si
+.skip_space:
         mov  si, bx
         call dp_str
         call output_space
