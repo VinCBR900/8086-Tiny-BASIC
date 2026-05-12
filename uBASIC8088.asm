@@ -632,38 +632,49 @@ dl_lp:
         jz   dl_done
         cmp  bp, ax
         jl   dl_done
-        call output_number
-        call output_space
-
-        mov  si, di
-        add  si, 2              ; SI -> line body
-
+call output_number
+    call output_space
+    lea  si, [di+2]
+    xor  dx, dx             ; DL = 0: nothing printed yet for this line
 dl_body:
-	lodsb
-        cmp  al, 0x0D
-        je   dl_eol
-        cmp  al, TK_PRINT       ; below token range?
-        jb   dl_raw
-;        cmp  al, TK_STEP + 1    ; above token range? (TK_STEP = 0x95)
-;        jnb  dl_raw
-        mov  bx, tk_kw_tab
-        call get_token_ptr      ; BX -> tk_kw_tab entry
-        mov  bx, [bx]           ; BX -> keyword string
-        push si
-        ; Detokenise: space BEFORE + keyword text + space AFTER
-        ; FIX v1.7.5: space before added so "FOR I=1 TO 5" lists correctly
-        cmp byte [si-1],' '
-        jne .skip_space
-        call output_space
-.skip_space:
-        mov  si, bx
-        call dp_str
-        call output_space
-        pop  si
-        jmp  dl_body
+    lodsb
+    cmp  al, 0x0D
+    je   dl_eol
+    cmp  al, TK_PRINT       ; Is it a token?
+    jb   dl_raw
+
+    ; --- TOKEN HANDLING ---
+    push si
+    push ax                 ; Save current token
+    
+    ; Check if we need a leading space:
+    ; Don't print space if: 1. Start of line (DL=0) 
+    ;                      2. Prev was space (DL=' ')
+    ;                      3. Prev was a token (DL=1)
+    test dl, dl
+    jz   .skip_leading
+    cmp  dl, ' '
+    je   .skip_leading
+    cmp  dl, 1
+    je   .skip_leading
+    call output_space
+
+.skip_leading:
+    pop  ax                 ; Restore current token
+    mov  bx, tk_kw_tab
+    call get_token_ptr
+    mov  si, [bx]
+    call dp_str             ; Print the keyword
+    call output_space
+    
+    pop  si
+    mov  dl, 1              ; Set state: "Last thing was a token"
+    jmp  dl_body
+
 dl_raw:
-        call output
-        jmp  dl_body
+    call output
+    mov  dl, al             ; Store the actual char printed (e.g., ' ', '=', etc.)
+    jmp  dl_body
 dl_eol:
         call new_line
         call next_line_ptr
