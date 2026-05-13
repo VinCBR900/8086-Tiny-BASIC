@@ -83,15 +83,12 @@
 ; =============================================================================
 ;   v1.7.5 (2026-05-12)  Bug fixes and size optimisations:
 ;     - Updated Showcase tokens and rmeoved spaces
-;     - LIST: emit space BEFORE each detokenised keyword so "FOR I=1 TO 5"
-;       lists as "FOR I=1 TO 5" not "FOR I=1TO 5".
+;     - LIST: clean up before/after token spaces
 ;     - Removed dead dw 0 sentinel after step_tab (2 bytes saved).
 ;     - kw_match: removed redundant '_' boundary check (3 bytes saved).
 ;     - do_for: stack overflow now reports ERR_OM (?3) not ERR_SN (?0).
-;     - dl_body token upper bound uses TK_STEP+1 instead of magic +22.
 ;     - get_var_addr: removed redundant double-read of [SI].
 ;     - Subroutine headers normalised; formatting pass throughout.
-;
 ;   v1.7.4 (2026-05-09)  [archived as uBASIC8088-v1.7.4.asm]
 ;     eat_paren_expr bugfix.  Size optimisations: STMT dispatcher,
 ;     DO_LET/DO_INPUT shared sections.  Added ^ XOR bitwise, NOT()/RND().
@@ -161,7 +158,7 @@ ERR_OM:         equ 0x33        ; ?3 Out of memory
 ERR_UK:         equ 0x34        ; ?4 Bad variable
 ERR_RT:         equ 0x35        ; ?5 RETURN without GOSUB
 ERR_NF:         equ 0x36        ; ?6 NEXT without FOR
-ERR_BRK:        equ 0x42        ; ?B NMI break
+ERR_BRK:        equ 0x42        ; ?B NMI break (ROM version, no room) 
 
 ; =============================================================================
 ; KEYWORD TERMINATOR CONSTANTS  (last byte of keyword string = ASCII | 0x80)
@@ -633,48 +630,45 @@ dl_lp:
         cmp  bp, ax
         jl   dl_done
 call output_number
-    call output_space
-    lea  si, [di+2]
-    xor  dx, dx             ; DL = 0: nothing printed yet for this line
+        call output_space
+        lea  si, [di+2]
+        xor  dx, dx             ; DL = 0: nothing printed yet for this line
 dl_body:
-    lodsb
-    cmp  al, 0x0D
-    je   dl_eol
-    cmp  al, TK_PRINT       ; Is it a token?
-    jb   dl_raw
+        lodsb
+        cmp  al, 0x0D
+        je   dl_eol
+        cmp  al, TK_PRINT       ; Is it a token?
+        jb   dl_raw
 
-    ; --- TOKEN HANDLING ---
-    push si
-    push ax                 ; Save current token
-    
-    ; Check if we need a leading space:
-    ; Don't print space if: 1. Start of line (DL=0) 
-    ;                      2. Prev was space (DL=' ')
-    ;                      3. Prev was a token (DL=1)
-    test dl, dl
-    jz   .skip_leading
-    cmp  dl, ' '
-    je   .skip_leading
-    cmp  dl, 1
-    je   .skip_leading
-    call output_space
+        ; --- TOKEN HANDLING ---
+        push si
+        push ax                 ; Save current token
+
+        ; Check for leading space - Don't print if:  
+        test dl, dl		; 1. Start of line (DL=0)
+        jz   .skip_leading
+        cmp  dl, ' '		; 2. Prev was space (DL=' ')
+        je   .skip_leading
+        cmp  dl, 1		; 3. Prev was a token (DL=1)
+        je   .skip_leading
+        call output_space
 
 .skip_leading:
-    pop  ax                 ; Restore current token
-    mov  bx, tk_kw_tab
-    call get_token_ptr
-    mov  si, [bx]
-    call dp_str             ; Print the keyword
-    call output_space
-    
-    pop  si
-    mov  dl, 1              ; Set state: "Last thing was a token"
-    jmp  dl_body
+        pop  ax                 ; Restore current token
+        mov  bx, tk_kw_tab
+        call get_token_ptr
+        mov  si, [bx]
+        call dp_str             ; Print the keyword
+        call output_space
+
+        pop  si
+        mov  dl, 1              ; Set state: "Last thing was a token"
+        jmp  dl_body
 
 dl_raw:
-    call output
-    mov  dl, al             ; Store the actual char printed (e.g., ' ', '=', etc.)
-    jmp  dl_body
+        call output
+        mov  dl, al             ; Store the actual char printed (e.g., ' ', '=', etc.)
+        jmp  dl_body
 dl_eol:
         call new_line
         call next_line_ptr
@@ -1625,22 +1619,11 @@ do_gosub:
 
 gs_push:
         inc  word [GOSUB_SP]
-        call gosub_hlp
+        add  bx, bx              ; BX is already loaded, use it
+        lea  si, [GOSUB_STK + bx]
         mov  ax, [RUN_NEXT]
-        mov  [si], ax           ; save return address in stack slot
-        mov  [RUN_NEXT], di     ; jump to target
-        ret
-
-; =============================================================================
-; GOSUB_HLP  compute address of GOSUB stack slot
-; Inputs  : BX = current stack depth (0-based, before push/pop)
-; Outputs : SI -> slot in GOSUB_STK
-; Clobbers: BX, SI
-; =============================================================================
-gosub_hlp:
-        add  bx, bx             ; byte offset = depth * 2
-        mov  si, GOSUB_STK
-        add  si, bx
+        mov  [si], ax            
+        mov  [RUN_NEXT], di      ; DI is target from find_line
         ret
 
 ; =============================================================================
@@ -1658,7 +1641,8 @@ do_return:
         jz   gs_underflow
         dec  bx
         mov  [GOSUB_SP], bx
-        call gosub_hlp
+        add  bx, bx             ; byte offset = depth * 2
+        lea si, [GOSUB_STK + bx]
         mov  ax, [si]
         mov  [RUN_NEXT], ax
         ret
@@ -1948,8 +1932,6 @@ tk_kw_tab:
         dw kw_for, kw_next, kw_out, kw_delay
 
 ; Sub-keyword pointer entries (matched individually; not iterated)
-; FIX v1.7.5: removed trailing dw 0 sentinel — these tables are never
-;             walked in a loop, so the sentinel was dead data (saves 2 bytes)
 then_tab:   dw kw_then
 to_tab:     dw kw_to
 step_tab:   dw kw_step
