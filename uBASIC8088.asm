@@ -373,6 +373,28 @@ ml_numbered:
         jmp  short main_loop
 
 ; =============================================================================
+; DO_ERROR  print "?N[@line]", then restart main loop — never returns
+; Inputs  : AL = error code character ('0'..'6', 'B', ...)
+; Clobbers: everything
+; =============================================================================
+do_error:
+        push ax
+        call new_line
+        mov  al, '?'
+        call output
+        pop  ax
+        call output             ; print "?N"
+        cmp  byte [RUNNING], 0
+        je   do_error_nl
+        mov  al, '@'
+        call output
+        mov  ax, [CURLN]
+        call output_number
+do_error_nl:
+        call new_line
+        jmp  main_loop
+
+; =============================================================================
 ; STMT_LINE  execute ':'-separated statements from SI
 ; Inputs  : SI -> statement text (tokenised or raw)
 ; Clobbers: AX, BX, CX, DX, SI, DI (via stmt)
@@ -427,6 +449,7 @@ do_if:
         jne  di_kw_then
         inc  si                 ; consume token
         jmp  stmt
+
 di_kw_then:
         mov  bx, then_tab       ; THEN is optional in direct mode
         call kw_match
@@ -629,8 +652,7 @@ dl_lp:
         jz   dl_done
         cmp  bp, ax
         jl   dl_done
-	call output_number
-        call output_space
+	call num_space
         lea  si, [di+2]
         xor  dx, dx             ; DL = 0: nothing printed yet for this line
 dl_body:
@@ -738,8 +760,7 @@ dp_after:
 do_free:
         mov  ax, PROGRAM_TOP
         sub  ax, [PROG_END]
-        call output_number
-        call output_space
+        call num_space
         mov  si, kw_free
         call dp_str
 dp_nl:
@@ -1188,6 +1209,43 @@ inm_done:
         ret
 
 ; =============================================================================
+; INPUT_LINE  read an edited line into IBUF; returns SI -> IBUF
+; Supports backspace editing.  Maximum 62 characters.
+; Inputs  : (none)
+; Outputs : SI -> IBUF (terminated with CR)
+; Clobbers: AX, CX, DI
+; =============================================================================
+input_line:
+        mov  di, IBUF
+        xor  cx, cx
+ipl_lp:
+        call input_key
+        cmp  al, 0x08           ; backspace?
+        jne  ipl_nbs
+        or   cx, cx
+        je   ipl_lp             ; buffer empty: ignore
+        dec  di
+        dec  cx
+        call backsp
+        call output_space
+        call backsp
+        jmp  ipl_lp
+
+ipl_nbs:
+        cmp  al, 0x0D           ; CR?
+        je   ipl_cr
+        cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
+        jnb  ipl_lp
+        call output
+        stosb
+        inc  cx
+        jmp  ipl_lp
+ipl_cr:
+        stosb
+        mov  si, IBUF
+	jmp new_line
+        
+; =============================================================================
 ; OUTPUT_NUMBER  print signed 16-bit integer to terminal
 ; Inputs  : AX = signed 16-bit value
 ; Clobbers: AX, CX, DX
@@ -1211,59 +1269,8 @@ on_pos:
 on_digit:
         pop  ax
         add  al, '0'
-        jmp  output             ; tail-call
-
-; =============================================================================
-; INPUT_LINE  read an edited line into IBUF; returns SI -> IBUF
-; Supports backspace editing.  Maximum 62 characters.
-; Inputs  : (none)
-; Outputs : SI -> IBUF (terminated with CR)
-; Clobbers: AX, CX, DI
-; =============================================================================
-input_line:
-        mov  di, IBUF
-        xor  cx, cx
-ipl_lp:
-        call input_key
-        cmp  al, 0x08           ; backspace?
-        jne  ipl_nbs
-        or   cx, cx
-        je   ipl_lp             ; buffer empty: ignore
-        dec  di
-        dec  cx
-        call backsp
-        call output_space
-        call backsp
-        jmp  ipl_lp
-backsp:
-        mov  al, 0x08
-        jmp  output             ; tail-call
-
-ipl_nbs:
-        cmp  al, 0x0D           ; CR?
-        je   ipl_cr
-        cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
-        jnb  ipl_lp
-        call output
-        stosb
-        inc  cx
-        jmp  ipl_lp
-ipl_cr:
-        stosb
-        mov  si, IBUF
-        ; fall through to new_line
-
-; =============================================================================
-; NEW_LINE  emit CR + LF
-; Inputs  : (none)
-; Clobbers: AX
-; =============================================================================
-new_line:
-        mov  al, 0x0D
-        call output
-        mov  al, 0x0A
-        ; fall through to output
-
+        ; drop through
+        
 ; =============================================================================
 ; OUTPUT / PUTCHAR  send character in AL to terminal
 ; ROM variant  : bitbang 8N1 via Intel 8755 Port A
@@ -1301,32 +1308,23 @@ output:
 %endif
 
 ; =============================================================================
-; DO_ERROR  print "?N[@line]", then restart main loop — never returns
-; Inputs  : AL = error code character ('0'..'6', 'B', ...)
-; Clobbers: everything
-; =============================================================================
-do_error:
-        push ax
-        call new_line
-        mov  al, '?'
-        call output
-        pop  ax
-        call output             ; print "?N"
-        cmp  byte [RUNNING], 0
-        je   do_error_nl
-        mov  al, '@'
-        call output
-        mov  ax, [CURLN]
-        call output_number
-do_error_nl:
-        call new_line
-        jmp  main_loop
-
-; =============================================================================
+; NEW_LINE  emit CR + LF
 ; OUTPUT_SPACE  emit a single space character
-; Inputs  : (none)
+; BACKSP  emits BACKSPACE
+; Inputs  : Only Num_Space - AX is num
 ; Clobbers: AX
 ; =============================================================================
+num_space:
+	call output_number
+        jmp output_space
+new_line:
+        mov  al, 0x0D
+        call output
+        mov  al, 0x0A
+	db 0x3d
+backsp:
+	mov al, 0x08
+        db 0x3d
 output_space:
         mov  al, ' '
         jmp  output             ; tail-call
