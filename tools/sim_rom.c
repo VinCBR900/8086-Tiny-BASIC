@@ -8,19 +8,55 @@
 #include "cpu.h"
 
 /*
- * sim_rom.c  --  uBASIC 8088 simulator with ASM/bin loaders
+ * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC
+ * Leverages Mike Chamber's XTulator project cpu core.
+ * Compright Vincent Crabtree 2026, MIT License
  *
- * Input modes:
- *   1) ASM source: invokes tinyasm from the same directory as sim_rom
- *      (supports tinyasm on Linux and tinyasm.exe on Windows), then parses
- *      the generated listing to find getchar and putchar routine addresses.
- *   2) Binary image: requires --getchar and --putchar addresses.
+ * Supports two input modes:
+ *   1) ASM source
+ *      Invokes tinyasm from the same directory as sim_wrap
+ *      (tinyasm on Linux, tinyasm.exe on Windows), then parses
+ *      the generated listing to locate getchar and putchar labels.
  *
- * In both modes getchar is blocking and returns byte in AL, putchar writes AL.
+ *   2) Raw binary image
+ *      Requires explicit --getchar and --putchar addresses.
  *
- * Default load address when --load is omitted:
- *   load = 0x10000 - image_size
- * Examples: 2 KiB -> 0xF800, 64 KiB -> 0x0000.
+ * Runtime behaviour:
+ *
+ *   * getchar is blocking and returns the received byte in AL.
+ *   * putchar outputs the byte in AL.
+ *   * Both are interecepted by simulator and not actually executed.
+ *
+ * Default load address:
+ *   If --load is omitted:
+ *
+ *       load_address = 0x10000 - image_size
+ *
+ *   Examples:
+ *       2 KiB image  -> 0xF800
+ *       64 KiB image -> 0x0000
+ *
+ * Usage:
+ *   sim_rom <program.asm>
+ *            [--load ADDR]
+ *            [--trace]
+ *            [--cycles N]
+ *
+ *   sim_rom <program.bin>
+ *            --getchar ADDR
+ *            --putchar ADDR
+ *            [--load ADDR]
+ *            [--trace]
+ *            [--cycles N]
+ *
+ * ASM mode notes:
+ *   * Requires tinyasm/tinyasm.exe in same directory beside sim_rom.
+ *   * Automatically extracts getchar/putchar addresses from listing output.
+ *   * Fails if assembly errors occur or labels are missing.
+ *
+ * Binary mode notes:
+ *   * Both --getchar and --putchar are mandatory.
+ *   * Intended for pre-assembled ROM/RAM binary images.
  */
 
 #define MEM_SIZE 65536u
