@@ -517,7 +517,7 @@ do_input:
 ; =============================================================================
 var_store:
         pop  di
-        mov  [di], ax
+        stosw
         ret
 
 ; =============================================================================
@@ -783,7 +783,7 @@ poke_out_hlpr:
 ; =============================================================================
 do_poke:
         call poke_out_hlpr
-        mov  [di], al
+        stosb
         ret
 
 ; =============================================================================
@@ -1759,7 +1759,6 @@ tk_finish:
 ; Clobbers: AX, BX, CX, DX, DI
 ; =============================================================================
 df_syn:
-        ; FIX v1.7.5: reports ERR_OM (?3) for stack overflow, not ERR_SN (?0)
         mov  al, ERR_OM
         jmp  do_error
 do_for:
@@ -1769,8 +1768,7 @@ do_for:
         call expect_equals
         call expr               ; AX = start value
         mov  di, [INS_TMP]
-        mov  [di], ax           ; initialise loop variable
-
+	stosw			; initialise loop variable
         ; TO is mandatory
         mov  al, TK_TO
         mov  bx, to_tab
