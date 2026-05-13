@@ -840,10 +840,10 @@ sp_r:
         ret
 
 ; =============================================================================
-; SPACES  skip space characters (preserves AX, BX, CX, DX)
+; SPACES  skip space characters (need to preserve AX, BX, CX, DX)
 ; Inputs  : SI -> current position
 ; Outputs : SI advanced past spaces
-; Clobbers: (none)
+; Clobbers: (none) - lodsb breaks AL
 ; =============================================================================
 spaces:
         cmp  byte [si], ' '
@@ -1189,20 +1189,21 @@ e2_nusr:
 input_number:
         xor  bx, bx
 inm_lp:
-        mov  al, [si]
+        lodsb               ; AL = [SI], SI++
         sub  al, '0'
-        jb   inm_done
+        jb   inm_stop
         cmp  al, 9
-        ja   inm_done
-        inc  si
-        cbw
-        xchg ax, bx
+        ja   inm_stop      
+        cbw                 ; AX = digit
+        xchg ax, bx         ; BX = digit, AX = running total
         mov  cx, 10
-        mul  cx
-        add  bx, ax
+        mul  cx             ; DX:AX = AX * 10
+        add  bx, ax         ; BX = total * 10 + digit
         jmp  short inm_lp
+inm_stop:
+        dec  si             ; BACK UP: LODSB advanced SI past the non-digit
 inm_done:
-        xchg ax, bx
+        xchg ax, bx         ; Result into AX
         ret
 
 ; =============================================================================
@@ -1636,26 +1637,28 @@ gs_push:
 ; Inputs  : (none)
 ; Clobbers: AX, BX, SI
 ; =============================================================================
-gs_underflow:
+gs_underflow: 
         mov  al, ERR_RT
         jmp  do_error
 do_return:
-        mov  bx, [GOSUB_SP]
-        or   bx, bx
-        jz   gs_underflow
-        dec  bx
-        mov  [GOSUB_SP], bx
-        add  bx, bx             ; byte offset = depth * 2
-; Bodge for Tinyasm which doesnt udnerstand LEA
+	mov  si, GOSUB_SP		; 3
+        mov  ax, [si]			; 2
+        or   ax, ax			; 2
+        jz   gs_underflow		; 2
+        dec  ax				; 1
+        mov  [si], ax			; 2
+        add  ax, ax             ; byte offset = depth * 2	;2
+        xchg ax, bx			; 1
+; Bodge for Tinyasm which doesnt understand LEA
 %ifdef __YASM_MAJOR__
 	lea  si, [GOSUB_STK + bx]
 %else
-	db 0x8d, 0x77, 0x50
+	db 0x8d, 0x77, 0x50		; 3
 %endif
-        mov  ax, [si]
-        mov  [RUN_NEXT], ax
-        ret
-
+        lodsw				; 1
+        mov  [RUN_NEXT], ax		; 2
+        ret				; 1
+        
 ; =============================================================================
 ; DO_REM  REM — skip remainder of line during program execution
 ; Inputs  : SI -> REM body
@@ -1791,15 +1794,19 @@ df_no_step:
         jnb  df_syn             ; FOR stack full
         inc  word [FOR_SP]
         call for_ptr_hlp        ; BX -> frame slot
-        pop  dx                 ; DX = limit
-        mov  di, [INS_TMP]
-        mov  [bx],   di         ; var_ptr
-        mov  [bx+2], dx         ; limit
-        mov  [bx+4], ax         ; step
-        mov  ax, [RUN_NEXT]
-        mov  [bx+6], ax         ; loop_ptr (start of next line)
+        ; setup frame
+        xchg bx, di             ; DI = base address of frame
+	xchg ax, bx		; save 'step'
+	mov  ax, [INS_TMP]      ; Get var_ptr
+        stosw                   ; Store [INS_TMP] at [di], then di += 2        
+        pop ax	                ; Get limit
+        stosw                   ; Store limit at [di+2], then di += 2
+        xchg ax, bx             ; get 'step' back
+        stosw                   ; Store 'step' at [di+4], then di += 2
+        mov  ax, [RUN_NEXT]     ; Get loop_ptr
+        stosw                   ; Store loop_ptr at [di+6], then di += 2      
         ret
-
+	
 ; =============================================================================
 ; FOR_PTR_HLP  convert FOR stack depth to frame pointer
 ; Inputs  : CX = depth index (0-based)
@@ -1808,7 +1815,7 @@ df_no_step:
 ; =============================================================================
 for_ptr_hlp:
         mov  bx, cx
-        shl  bx, 1              ; * 2
+        shl  bx, 1              ; * 2	no `shl RX, n` on 8086
         shl  bx, 1              ; * 4
         shl  bx, 1              ; * 8
         add  bx, FOR_STK
@@ -1870,7 +1877,6 @@ dn_loop:
 dn_neg:
         cmp  ax, dx
         jge  dn_loop
-
 dn_done:
         mov  [FOR_SP], cx       ; pop frame (CX = correct new depth)
         ret
