@@ -629,7 +629,7 @@ dl_lp:
         jz   dl_done
         cmp  bp, ax
         jl   dl_done
-call output_number
+	call output_number
         call output_space
         lea  si, [di+2]
         xor  dx, dx             ; DL = 0: nothing printed yet for this line
@@ -1862,8 +1862,12 @@ dn_search:
         cmp  word [bx+4], 0
         jl   dn_neg
         cmp  ax, dx
-        jle  dn_loop
-        jmp  dn_done
+        jge  dn_done
+dn_loop:
+        mov  ax, [bx+6]
+        mov  [RUN_NEXT], ax     ; jump back to top of loop
+        ret
+
 dn_neg:
         cmp  ax, dx
         jge  dn_loop
@@ -1872,10 +1876,6 @@ dn_done:
         mov  [FOR_SP], cx       ; pop frame (CX = correct new depth)
         ret
 
-dn_loop:
-        mov  ax, [bx+6]
-        mov  [RUN_NEXT], ax     ; jump back to top of loop
-        ret
 
 ; =============================================================================
 ; DO_DELAY  DELAY <count>  (ROM / real-hardware build only)
