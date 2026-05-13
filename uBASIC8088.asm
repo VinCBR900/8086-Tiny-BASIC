@@ -380,8 +380,7 @@ ml_numbered:
 do_error:
         push ax
         call new_line
-        mov  al, '?'
-        call output
+        call question
         pop  ax
         call output             ; print "?N"
         cmp  byte [RUNNING], 0
@@ -524,9 +523,7 @@ do_let:
 do_input:
         call get_var_addr       ; DI = &var, SI advanced
         push di
-        mov  al, '?'
-        call output
-        call output_space
+        call question
         push si                 ; save program pointer
         call input_line         ; resets SI -> IBUF
         call expr               ; parse number -> AX
@@ -1310,8 +1307,9 @@ output:
 ; =============================================================================
 ; NEW_LINE  emit CR + LF
 ; OUTPUT_SPACE  emit a single space character
-; BACKSP  emits BACKSPACE
-; Inputs  : Only Num_Space - AX is num
+; BACKSP  emits BASCKSPACE
+; QUESTION  emits '?'
+; Inputs  : Num_Space AX is num
 ; Clobbers: AX
 ; =============================================================================
 num_space:
@@ -1322,13 +1320,16 @@ new_line:
         call output
         mov  al, 0x0A
 	db 0x3d
+question:
+	mov al, '?'
+	db 0x3d
 backsp:
 	mov al, 0x08
         db 0x3d
 output_space:
         mov  al, ' '
-        jmp  output             ; tail-call
-
+        jmp  output             ; tail-call 
+   
 ; =============================================================================
 ; INPUT_KEY  read one character from terminal into AL
 ; ROM variant  : bitbang UART RX from Intel 8755 Port A bit 1
