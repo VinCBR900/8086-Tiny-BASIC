@@ -13,7 +13,7 @@
 ; LANGUAGE REFERENCE
 ; ---------------------------------------------------------------------------
 ;
-; Statements  : END, FOR..TO [..STEP], NEXT, GOTO, GOSUB, RETURN, IF..THEN,
+; Statements  : DELAY, END, FOR..TO [..STEP], NEXT, GOTO, GOSUB, RETURN, IF..THEN,
 ;               INPUT, LET, PRINT [CHR$(val)] [TAB(n)] [;], POKE, OUT, REM,
 ;               FREE, HELP, LIST [start,end], NEW, RUN
 ; Expressions - Arithmetic : + - * / % (Mod)  unary-
@@ -1620,7 +1620,12 @@ do_gosub:
 gs_push:
         inc  word [GOSUB_SP]
         add  bx, bx              ; BX is already loaded, use it
-        lea  si, [GOSUB_STK + bx]
+; Bodge for Tinyasm which doesnt udnerstand LEA
+%ifdef __YASM_MAJOR__
+	lea  si, [GOSUB_STK + bx]
+%else
+	db 0x8d, 0x77, 0x50
+%endif
         mov  ax, [RUN_NEXT]
         mov  [si], ax            
         mov  [RUN_NEXT], di      ; DI is target from find_line
@@ -1642,7 +1647,12 @@ do_return:
         dec  bx
         mov  [GOSUB_SP], bx
         add  bx, bx             ; byte offset = depth * 2
-        lea si, [GOSUB_STK + bx]
+; Bodge for Tinyasm which doesnt udnerstand LEA
+%ifdef __YASM_MAJOR__
+	lea  si, [GOSUB_STK + bx]
+%else
+	db 0x8d, 0x77, 0x50
+%endif
         mov  ax, [si]
         mov  [RUN_NEXT], ax
         ret
