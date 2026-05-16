@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include "cpuconf.h"
 // #include "../chipset/i8259.h"
-#include "i8259.h"
+#include "./i8259.h"
 
 union _bytewordregs_ {
 	uint16_t wordregs[8];
