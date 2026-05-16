@@ -29,7 +29,7 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
 
 ## Build instructions 
 
-Standalone ROM target is built with makefile, otherwise copy/paste into 8bitworkshop to run the embedded demo program.
+Use the project Makefile to build the ROM image and simulator locally, or copy/paste into 8bitworkshop to run the embedded demo program.
 
 http://8bitworkshop.com/v3.12.1/?redir.html?platform=x86&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2F8086-Tiny-BASIC&file=uBASIC8088.asm
 
@@ -38,6 +38,12 @@ http://8bitworkshop.com/v3.12.1/?redir.html?platform=x86&githubURL=https%3A%2F%2
 - `make`
 
 The build uses the bundled `tools/tinyasm.c` assembler which is a subset clone of NASM.
+
+### Build everything
+```bash
+make
+```
+Builds both the ROM image and simulator.
 
 ### Build ROM image
 ```bash
@@ -55,6 +61,8 @@ Output: `build/sim_rom`.
 ```bash
 make rom-run
 ```
+Runs `uBASIC8088.asm` in the simulator using tinyasm assembler mode.
+
 
 ### Clean artifacts
 ```bash
