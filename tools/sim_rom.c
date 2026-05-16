@@ -1,11 +1,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <signal.h>
 #include <ctype.h>
 #include <limits.h>
 #include "cpu.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /*
  * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC
