@@ -2,7 +2,6 @@
 ; MiniBASIC8088  MBF5 Float Library  v0.3
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
-; WORK IN PRGRESS - NOTHING TO SEE HERE 
 ; 5-byte Microsoft Binary Format floating-point routines for 8088/8086.
 ; Standalone test harness: assemble with tinyasm, run with sim_rom.
 ;
@@ -122,6 +121,17 @@ t1dbg:  mov  al, [si]
         mov  ax, 6
         call flt_from_int_b
         call flt_mul
+        ; DEBUG hex dump
+        push si
+        mov  si, FLT_A
+        mov  cx, 5
+t3dbg:  mov  al, [si]
+        call print_hex_byte
+        inc  si
+        loop t3dbg
+        mov  al, '='
+        call output
+        pop  si
         call flt_print
         call new_line
 
@@ -216,6 +226,7 @@ s_39:   db "3.9",0x0D
 ; Clobbers: AX, CX, DI
 ; =============================================================================
 flt_zero:
+        cld
         xor  al, al
         mov  di, FLT_A
         mov  cx, 5
@@ -228,6 +239,7 @@ fz_lp:  stosb
 ; Clobbers: AX, CX, DI
 ; =============================================================================
 flt_zero_b:
+        cld
         xor  al, al
         mov  di, FLT_B
         mov  cx, 5
@@ -239,6 +251,7 @@ fzb_lp: stosb
 ; Copy helpers — clobber CX, SI, DI
 ; =============================================================================
 flt_a_to_b:
+        cld
         mov  si, FLT_A
         mov  di, FLT_B
         mov  cx, 5
@@ -246,6 +259,7 @@ flt_a_to_b:
         ret
 
 flt_b_to_a:
+        cld
         mov  si, FLT_B
         mov  di, FLT_A
         mov  cx, 5
@@ -253,6 +267,7 @@ flt_b_to_a:
         ret
 
 flt_t_to_a:
+        cld
         mov  si, FLT_T
         mov  di, FLT_A
         mov  cx, 5
@@ -260,6 +275,7 @@ flt_t_to_a:
         ret
 
 flt_a_to_t:
+        cld
         mov  si, FLT_A
         mov  di, FLT_T
         mov  cx, 5
@@ -436,10 +452,15 @@ fcmp_same_sign:
         and  bl, 0x7F
         cmp  al, bl
         jne  fcmp_ne
-        mov  ax, [FLT_A+2]
-        mov  bx, [FLT_B+2]
-        cmp  ax, bx
-        jne  fcmp_ne16
+        ; Compare bytes 2 and 3 (mant[23:16] then mant[15:8]), most significant first
+        mov  al, [FLT_A+2]
+        mov  bl, [FLT_B+2]
+        cmp  al, bl
+        jne  fcmp_ne
+        mov  al, [FLT_A+3]
+        mov  bl, [FLT_B+3]
+        cmp  al, bl
+        jne  fcmp_ne
         mov  al, [FLT_A+4]
         mov  bl, [FLT_B+4]
         cmp  al, bl
@@ -447,8 +468,6 @@ fcmp_same_sign:
         pop  cx
 fcmp_eq: xor ax, ax
         ret
-fcmp_ne16: jb fcmp_lt
-        jmp  fcmp_gt
 fcmp_ne: pop cx
         jb   fcmp_lt
 fcmp_gt: test cl, 0x80
@@ -732,6 +751,7 @@ fa_same_sign:
         rcr  bl, 1
         rcr  dx, 1
         rcr  ah, 1
+        rcr  al, 1              ; preserve sub-guard bit shifted out of AH
         inc  bh
         jz   fa_zero            ; exponent overflow
 
@@ -956,23 +976,28 @@ fdiv_norm_lp:
         ; If we reach here, quotient was 0 (shouldn't happen if A!=0)
         jmp  fdiv_done
 fdiv_norm_done:
-        ; AH has bit7 set. CL = left-shift count applied.
-        ; Adjust exponent: base = eA-eB+0x80, pre-shift added 1, normalise removes CL.
-        ; Net: FLT_ER = eA-eB+0x80+1-CL = [FLT_ER]+1-CL
+        ; AX = normalised quotient (AH bit7 set). CL = shift count applied.
+        ; FLT_ER = eA-eB+0x80. Pre-shift added 1. Normalise subtracted CL.
+        ; Net: FLT_ER += 1 - CL
         inc  byte [FLT_ER]
         sub  [FLT_ER], cl
 
-        ; Guard byte from remainder
-        push ax
-        mov  al, dh
-        xor  ah, ah
-        div  bh
-        mov  cl, al             ; CL = guard byte
-        pop  ax
+        ; Save normalised quotient before computing guard (guard calc destroys AX)
+        push ax                 ; save [AH=q_hi, AL=q_lo]
 
-        ; Pack to BL:DX:AH for norm_pack (already normalised)
-        mov  bl, ah             ; BL = high byte of quotient (bit7 set)
-        mov  dh, al             ; DH = low byte
+        ; Guard byte from remainder (DX still holds remainder from div)
+        mov  al, dh             ; high byte of remainder
+        xor  ah, ah
+        div  bh                 ; AL = guard byte approximation
+        mov  cl, al             ; CL = guard byte
+
+        pop  ax                 ; restore normalised quotient: AH=q_hi(bit7 set), AL=q_lo
+
+        ; Pack to BL:DX:AH:AL for norm_pack
+        ; BL = high mantissa byte (AH, bit7 already set = normalised)
+        ; DH = second byte (AL), DL = 0, AH = guard byte
+        mov  bl, ah             ; BL = high byte (bit7 set, normalised)
+        mov  dh, al             ; DH = second byte
         xor  dl, dl
         mov  ah, cl             ; AH = guard byte
         mov  bh, [FLT_ER]
@@ -1063,8 +1088,9 @@ fp_scale_done:
         mov  ax, 10
         call flt_from_int_b
         call flt_cmp
-        cmp  ax, 1
-        jne  fp_chk_lo
+        cmp  ax, -1             ; A < 10 -> ok (cmp returns -1 means A<B)
+        je   fp_chk_lo
+        ; A >= 10: divide by 10 and bump de
         mov  ax, 10
         call flt_from_int_b
         call flt_div
@@ -1131,20 +1157,34 @@ fp_strip_done:
 
         ; Print: SI=digit ptr, BX=digits remaining before decimal point
         pop  ax                 ; restore decimal exponent (de)
-        inc  ax                 ; number of digits before decimal point = de+1
+        inc  ax                 ; BX = de+1 = digits before decimal point (0 or neg = sub-unit)
         mov  bx, ax
         mov  si, IBUF
+        ; Sub-unit path (de < 0, BX <= 0): emit "0." then leading zeros
+        or   bx, bx
+        jg   fp_print_lp
+        mov  al, '0'
+        call output
+        mov  al, '.'
+        call output
+        neg  bx                 ; BX = count of leading zeros to emit
+fp_lead_zero:
+        or   bx, bx
+        jle  fp_print_lp
+        mov  al, '0'
+        call output
+        dec  bx
+        jmp  fp_lead_zero
 fp_print_lp:
         cmp  si, di
         jnb  fp_print_done
-        ; Emit digit first, then check if decimal point follows
         mov  al, [si]
         call output
         inc  si
         dec  bx
-        jnz  fp_print_lp       ; more digits before decimal point
+        jnz  fp_print_lp
         cmp  si, di
-        jnb  fp_print_done     ; no more digits -> done (no trailing '.')
+        jnb  fp_print_done
         mov  al, '.'
         call output
         jmp  fp_print_lp
