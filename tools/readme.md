@@ -11,7 +11,7 @@ We use the CPU core from Mike Chamber's **XTulator** project to emulate the embe
 
 https://github.com/mikechambers84/XTulator
 
-We need a wrapper and stub files as not using full PC architectire with an 8088 in MIN mode.
+We need a wrapper and stub files as not using full PC architectire with an 8088 in MIN mode. Very minor changes were made on include paths to build.
 
 ### PC Simulator
 Before the CPU simulator, development used  Adrian Cable's **8086tiny** suite below.  We dropped this as the simulator (though very good) uses memory space for CPU registers which didnt work for embedded testing.
