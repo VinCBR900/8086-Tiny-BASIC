@@ -107,7 +107,19 @@ static int find_label_addr_in_lst(const char *lst_file, const char *label, uint1
     while (fgets(line, sizeof(line), f)) {
         unsigned a = 0;
         char symbol[256] = {0}, symbol_l[256] = {0};
+        /* Format 1: "ADDR  ... LABEL:" inline listing line */
         if (sscanf(line, "%x %255[^: ]", &a, symbol) == 2) {
+            lower_copy(symbol_l, sizeof(symbol_l), symbol);
+            if (strcmp(symbol_l, needle) == 0) {
+                fclose(f);
+                *addr = (uint16_t)(a & 0xFFFFu);
+                return 0;
+            }
+        }
+        /* Format 2: "LABEL  addr" symbol table line (tinyasm listing footer) */
+        a = 0;
+        memset(symbol, 0, sizeof(symbol));
+        if (sscanf(line, "%255s %x", symbol, &a) == 2) {
             lower_copy(symbol_l, sizeof(symbol_l), symbol);
             if (strcmp(symbol_l, needle) == 0) {
                 fclose(f);

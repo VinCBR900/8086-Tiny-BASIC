@@ -19,9 +19,9 @@
 
 //Be sure to only define ONE of the CPU_* options at any given time, or you will likely get some unexpected/bad results!
 
-//#define CPU_8086
+#define CPU_8086
 //#define CPU_186
-#define CPU_V20
+//#define CPU_V20
 //#define CPU_286
 
 #if defined(CPU_8086)

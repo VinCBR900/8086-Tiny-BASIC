@@ -20,6 +20,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "cpu.h"
+//  minor path fixes for standalone compile
+// #include "../config.h"
+// #include "../debuglog.h"
 #include "../config.h"
 #include "../debuglog.h"
 
