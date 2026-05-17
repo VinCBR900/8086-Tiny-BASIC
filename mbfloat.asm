@@ -92,15 +92,6 @@ start:
         call flt_from_int
         call flt_a_to_b
         call flt_add
-        ; DEBUG: print FLT_A bytes as hex
-        mov  si, FLT_A
-        mov  cx, 5
-t1dbg:  mov  al, [si]
-        call print_hex_byte
-        inc  si
-        loop t1dbg
-        mov  al, '='
-        call output
         call flt_print
         call new_line
 
@@ -121,17 +112,6 @@ t1dbg:  mov  al, [si]
         mov  ax, 6
         call flt_from_int_b
         call flt_mul
-        ; DEBUG hex dump
-        push si
-        mov  si, FLT_A
-        mov  cx, 5
-t3dbg:  mov  al, [si]
-        call print_hex_byte
-        inc  si
-        loop t3dbg
-        mov  al, '='
-        call output
-        pop  si
         call flt_print
         call new_line
 
@@ -172,6 +152,16 @@ t3dbg:  mov  al, [si]
         call print_sz
         mov  si, s_25
         call flt_parse
+        push si
+        mov  si, FLT_A
+        mov  cx, 5
+t7h:    mov  al, [si]
+        call print_hex_byte
+        inc  si
+        loop t7h
+        mov  al, '='
+        call output
+        pop  si
         call flt_print
         call new_line
 
@@ -806,11 +796,9 @@ fmul_anz:
         jmp  fmul_zero
 fmul_bnz:
 
-        ; Exponent: eA + eB - 0x81
-        ; (MBF value = 2^(exp-0x80) × 0.mant; product of two 0.mant values
-        ;  needs an extra -1 to stay in [0.5,1) after normalisation)
+        ; Exponent: eA + eB - 0x80
         add  al, bl
-        sub  al, 0x81
+        sub  al, 0x80
         mov  [FLT_ER], al
 
         ; Result sign = sign_A XOR sign_B
@@ -875,7 +863,7 @@ fms20:  add  bx, dx
         ; If not, the true product is half of what it should be (MS FMS35).
         or   bh, bh
         js   fms_norm_ok
-        inc  byte [FLT_ER]      ; adjust exponent for the shift we are about to do
+        dec  byte [FLT_ER]      ; product<0.5: shift left doubles mant, halves value -> dec exp
         jnz  fms_do_shift
         jmp  fmul_zero
 fms_do_shift:
@@ -883,11 +871,6 @@ fms_do_shift:
         rcl  bx, 1
 
 fms_norm_ok:
-        ; Repack BX:CX to BL:DX:AH for norm_pack (MS FMS37):
-        ;   new BL = BH (byte 0 of product)
-        ;   new DH = BL (byte 1 of product)
-        ;   new DL = CH (byte 2 of product)
-        ;   new AH = CL (guard byte)
         mov  dl, ch
         mov  dh, bl
         mov  bl, bh
@@ -1287,6 +1270,19 @@ fpar_scale:
         mov  ax, 10
         call flt_from_int_b
         call flt_div
+        ; DEBUG after div
+        push cx
+        push si
+        mov  si, FLT_A
+        mov  cx, 5
+fpsdbg: mov  al, [si]
+        call print_hex_byte
+        inc  si
+        loop fpsdbg
+        mov  al, '!'
+        call output
+        pop  si
+        pop  cx
         pop  cx
         dec  cl
         jnz  fpar_scale
