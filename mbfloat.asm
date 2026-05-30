@@ -1,9 +1,46 @@
 ; =============================================================================
-; MiniBASIC8088  MBF5 Float Library  v0.3
+; MiniBASIC8088  MBF5 Float Library  v0.4-wip
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 5-byte Microsoft Binary Format floating-point routines for 8088/8086.
 ; Standalone test harness: assemble with tinyasm, run with sim_rom.
+;
+; ---------------------------------------------------------------------------
+; VERSION HISTORY
+; ---------------------------------------------------------------------------
+; v0.1 : Initial implementation. Basic operations functional.
+; v0.2 : Fixed norm_pack rounding (AL vs AH), flt_add carry chain,
+;         flt_print decimal point, flt_cmp byte-order, CLD guards.
+; v0.3 : Fixed flt_mul exponent (DEC not INC FLT_ER when product<0.5),
+;         flt_parse SI clobber (RAM save via FLT_TS), AH garbage (xor ah,ah),
+;         flt_print FLT_T conflict (stack save), T5 test harness ordering,
+;         flt_parse fractional part SI lost across flt_from_int_b calls.
+;         Test results: T1-T10 all passing (T2/T3/T4/T10 with precision ~4 sig figs).
+; v0.4 : (WIP) Precision improvements.
+;         DONE: flt_div two-stage 32-bit quotient - full precision 7 sig figs.
+;               flt_mul step5 (A_byte4 * B_hi >>8) - T3=-42 exact, T10=65534 exact.
+;         BUG:  T5 regression: -0.5000076 (was exact -0.5 in v0.3).
+;               Root cause LOCATED: norm_pack byte3=0x80 in result {80,80,00,80,00}.
+;               After flt_sub(100, 100.5): borrow-out path produces BL=0x01 DH=0 DL=0 AH=0
+;               analytically correct, but at runtime DL=0x80 after norm_pack 7-bit shifts.
+;               SUSPECT: rcl dx,1 in np_bit loop. DX = DH:DL (16-bit). After 7 rcl shifts
+;               with initial DL=0, CF input to each rcl is from rcl ah,1. If AH had a
+;               non-zero value when entering norm_pack (from flt_mul step5 leaving AH
+;               non-zero via the pop ax), that bit could be rotating through.
+;               FIX TO TRY: check AH value at norm_pack entry for the flt_sub path.
+;               In flt_add/flt_sub: xor al,al before jmp norm_pack is present, but
+;               AH is NOT cleared. After the borrow-out negation, AH=0x00 (add 0xFF,1=0).
+;               But is flt_mul step5 somehow leaving AH non-zero via a different path?
+;               Next step: add AH hex debug just before norm_pack entry in fa_do_norm.
+;
+; ---------------------------------------------------------------------------
+; KNOWN OPEN ITEMS (post v0.4)
+; ---------------------------------------------------------------------------
+; - SI not preserved across arithmetic routines (integration hazard #14)
+; - flt_to_int saturates at +/-32767, not +/-32768 (#16)
+; - DIV/0 prints inline rather than raising error (#17)
+; - FLT_T not safe for inter-routine data shuttling when flt_add in call chain
+;   (documented: callers must save/restore FLT_A by other means)
 ;
 ; ---------------------------------------------------------------------------
 ; MBF5 FORMAT
@@ -127,13 +164,11 @@ start:
 
         mov  si, s_t5           ; T5: 100 - 100.5 = -0.5
         call print_sz
-        mov  ax, 100
-        call flt_from_int
-        call flt_a_to_t         ; save 100 in FLT_T
         mov  si, s_1005
         call flt_parse          ; FLT_A = 100.5
         call flt_a_to_b         ; FLT_B = 100.5
-        call flt_t_to_a         ; FLT_A = 100
+        mov  ax, 100
+        call flt_from_int       ; FLT_A = 100
         call flt_sub            ; FLT_A = 100 - 100.5
         call flt_print
         call new_line
@@ -152,16 +187,6 @@ start:
         call print_sz
         mov  si, s_25
         call flt_parse
-        push si
-        mov  si, FLT_A
-        mov  cx, 5
-t7h:    mov  al, [si]
-        call print_hex_byte
-        inc  si
-        loop t7h
-        mov  al, '='
-        call output
-        pop  si
         call flt_print
         call new_line
 
@@ -785,6 +810,23 @@ fa_smaller_gone:
 ; Clobbers: AX, BX, CX, DX, SI, DI, FLT_SA, FLT_ER
 ; =============================================================================
 flt_mul:
+; =============================================================================
+; FLT_MUL  FLT_A = FLT_A * FLT_B
+;
+; 24x24->32 via 4 partial products, using all 4 bytes of A's mantissa.
+; Based on MS $FMULS (MATH2.ASM:416) extended with step5 for A_byte4.
+;
+; Steps:
+;   1: A_lo_word * B_lo_word  -> high 16 bits in CX
+;   2: A_lo_word * B_hi_byte  -> accumulate into BX:CX
+;   3: B_lo_word * A_hi_byte  -> accumulate into BX:CX
+;   4: A_hi_byte * B_hi_byte  -> add to BX
+;   5: A_byte4  * B_hi_byte   -> (product>>8) added to CX, low byte = sub-guard
+;
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = product
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_SA, FLT_ER
+; =============================================================================
         mov  al, [FLT_A+0]
         or   al, al
         jnz  fmul_anz
@@ -807,76 +849,96 @@ fmul_bnz:
         and  al, 0x80
         mov  [FLT_SA], al
 
-        ; Load FLT_A mantissa into CL:AX (CL=hi, AH=byte2, AL=byte3)
+        ; Load FLT_A mantissa into CL:AX (CL=byte1|80, AH=byte2, AL=byte3)
         mov  cl, [FLT_A+1]
         and  cl, 0x7F
-        or   cl, 0x80           ; restore implied-1
+        or   cl, 0x80
         mov  ah, [FLT_A+2]
         mov  al, [FLT_A+3]
-        ; AX=A[2:3], CL=A[1]&7F|80
 
-        ; Load FLT_B mantissa into BL:DX (BL=hi, DH=byte2, DL=byte3)
+        ; Load FLT_B mantissa into BL:DX (BL=byte1|80, DH=byte2, DL=byte3)
         mov  bl, [FLT_B+1]
         and  bl, 0x7F
         or   bl, 0x80
         mov  dh, [FLT_B+2]
         mov  dl, [FLT_B+3]
 
-        ; Save operand pieces in MS $FMULS style:
-        ;   SI = 0x00:BL  (B hi byte as 16-bit, BH=0)
-        ;   DI = 0x00:CL  (A hi byte as 16-bit, CH=0)
-        ;   On stack: [CX=00:CL], [AX=A_lo_word]
-        ;   BP used for B_lo_word (DX) but we use memory instead (BP reserved)
-        ;   We re-read DX from FLT_B+2 after the first multiply.
+        ; Save: SI=00:BL (B hi), DI=00:CL (A hi), BH=0 throughout
         xor  bh, bh
-        mov  si, bx             ; SI = 0x00:BL (B hi byte)
+        mov  si, bx             ; SI = 0x00:BL
         xor  ch, ch
-        mov  di, cx             ; DI = 0x00:CL (A hi byte)
-        push cx                 ; push A_hi  (CX = 00:CL)
-        push ax                 ; push A_lo_word
+        mov  di, cx             ; DI = 0x00:CL
+        push cx                 ; save A_hi word
+        push ax                 ; save A_lo_word
 
-        ; Step 1: A_lo_word * B_lo_word -> DX:AX (32-bit); keep high word in CX
-        mul  dx                 ; AX * DX -> DX:AX
-        mov  cx, dx             ; CX = high word of step1
+        ; Step 1: A_lo_word * B_lo_word -> DX:AX; keep high 16 in CX
+        mul  dx
+        mov  cx, dx
         pop  ax                 ; restore A_lo_word
+
         ; Step 2: A_lo_word * B_hi_byte -> DX:AX; accumulate
-        mul  si                 ; AX * SI = A_lo * (00:BL) -> DX:AX
+        mul  si
         add  cx, ax
         jnc  fms10
         inc  dx
-fms10:  mov  bx, dx            ; BX = running high-word accumulator
+fms10:  mov  bx, dx
         pop  dx                 ; restore A_hi word (= DI = 00:CL)
+
         ; Step 3: B_lo_word * A_hi_byte -> DX:AX; accumulate
         mov  ah, [FLT_B+2]
-        mov  al, [FLT_B+3]     ; AX = B_lo_word (re-read; original DX was clobbered)
-        mul  dx                 ; AX * DX = B_lo * (00:A_hi) -> DX:AX
+        mov  al, [FLT_B+3]     ; AX = B_lo_word (re-read)
+        mul  dx
         add  cx, ax
         jnc  fms20
         inc  dx
 fms20:  add  bx, dx
-        ; Step 4: A_hi_byte * B_hi_byte -> AX (8x8, fits in 16 bits)
+
+        ; Step 4: A_hi_byte * B_hi_byte -> AX
         mov  ax, di             ; AX = 00:A_hi
-        mul  si                 ; AX * SI = (00:A_hi) * (00:B_hi) -> AX
+        mul  si                 ; AX = A_hi * B_hi
         add  bx, ax
 
-        ; Product in BX:CX.  Check normalisation: BH bit7 must be set.
-        ; If not, the true product is half of what it should be (MS FMS35).
+        ; Step 5: A_byte4 * B_hi_byte -> 16-bit result in AX.
+        ; Contribution to BX:CX: product >> 8 (AH) added to CX_lo byte.
+        ; Product & 0xFF (AL) is the sub-guard for norm_pack rounding.
+        ; To add AH to CX_lo without disturbing CX_hi: use xchg/add on ch/cl.
+        mov  al, [FLT_A+4]
+        mul  si                 ; AX = [FLT_A+4] * B_hi_byte
+        ; AH = (A4*B_hi)>>8, AL = (A4*B_hi)&0xFF (sub-guard)
+        ; Save sub-guard, add AH to CL (CX low byte):
+        push ax                 ; save sub-guard in AL
+        mov  al, ah             ; AL = (A4*B_hi)>>8
+        xor  ah, ah             ; AX = (A4*B_hi)>>8 as 16-bit
+        add  cx, ax             ; add to CX; may carry into BX
+        jnc  fms30
+        inc  bx
+fms30:  pop  ax                 ; restore: AL = sub-guard, AH = step4 product high (garbage now)
+        ; AL = sub-guard for norm_pack
+
+        ; Product in BX:CX, sub-guard in AL.
+        ; Check normalisation: BH bit7 must be set.
         or   bh, bh
         js   fms_norm_ok
-        dec  byte [FLT_ER]      ; product<0.5: shift left doubles mant, halves value -> dec exp
+        ; BH bit7 not set: product in [0.25,0.5), shift left, dec exponent
+        dec  byte [FLT_ER]
         jnz  fms_do_shift
         jmp  fmul_zero
 fms_do_shift:
+        ; Left-shift BX:CX:AL (32+8 bits) to normalise
+        rcl  al, 1
         rcl  cx, 1
         rcl  bx, 1
 
 fms_norm_ok:
-        mov  dl, ch
-        mov  dh, bl
-        mov  bl, bh
-        mov  ah, cl
+        ; Repack BX:CX to BL:DH:DL:AH for norm_pack (MS FMS37 pattern):
+        ;   BL = BH (byte 0), DH = BL_old (byte 1), DL = CH (byte 2), AH = CL (byte 3)
+        ; AL stays as sub-guard for norm_pack.
+        ; Order matters — save BL before overwriting:
+        mov  dh, bl             ; DH = byte 1 (BL)
+        mov  bl, bh             ; BL = byte 0 (BH)
+        mov  ah, cl             ; AH = byte 3 (CL)
+        mov  dl, ch             ; DL = byte 2 (CH)
         mov  bh, [FLT_ER]
-        xor  al, al
         jmp  norm_pack
 
 fmul_zero: jmp flt_zero
@@ -905,6 +967,41 @@ fmul_zero: jmp flt_zero
 ; Outputs : FLT_A = quotient
 ; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
 ; =============================================================================
+; =============================================================================
+; FLT_DIV  FLT_A = FLT_A / FLT_B
+;
+; Two-stage 32/16 divide for full 32-bit mantissa precision.
+; Algorithm from MS-BASIC division analysis, adapted to MBF5 memory layout.
+;
+; Pre-shift DX:AX (full 32-bit mant of A) right 1 → DX < BX, no Stage1 overflow.
+; Stage 1 : DX:AX / BX  → Q1(AX), R1(DX)   – high 16-bit quotient word
+; Stage 2 : R1:0000 / BX → Q2(AX), R2(DX)   – low  16-bit quotient word
+;            R1<BX by definition → no overflow
+; Guard   : R2_hi / BH → 8-bit rounding sub-guard (passed as AL to norm_pack)
+; Pack    : BL:DH:DL:AH = Q1_hi:Q1_lo:Q2_hi:Q2_lo → norm_pack
+;
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = quotient (full 32-bit mantissa precision)
+; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
+; =============================================================================
+; =============================================================================
+; FLT_DIV  FLT_A = FLT_A / FLT_B
+;
+; Two-stage 32/16 divide for full 32-bit mantissa precision.
+;
+; Pre-shift DX:AX (full 32-bit mant of A) right 1 -> DX < BX, no overflow.
+; Stage 1 : DX:AX / BX -> Q1(AX), R1(DX)  high 16-bit quotient word
+; Stage 2 : R1:0000 / BX -> Q2(AX), R2(DX) low  16-bit quotient word
+; Always left-shift Q1:Q2 once to compensate for the pre-shift halving.
+;   If CF set after shift (Q1 was >= 0x8000): already normalised, shift back
+;   right and use FLT_ER+1 as exponent.  Otherwise use FLT_ER.
+; Guard   : R2_hi / BH -> 8-bit sub-guard (AL) for norm_pack rounding.
+; Pack    : BL:DH:DL:AH = mant[31:24]:[23:16]:[15:8]:[7:0] -> norm_pack.
+;
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = quotient (full 32-bit mantissa precision)
+; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
+; =============================================================================
 flt_div:
         mov  bl, [FLT_B+0]
         or   bl, bl
@@ -925,66 +1022,68 @@ flt_div:
         and  al, 0x80
         mov  [FLT_SA], al
 
-        ; Load 16-bit mantissas
-        mov  dh, [FLT_A+1]
-        and  dh, 0x7F
-        or   dh, 0x80           ; implied-1 in DH
-        mov  dl, [FLT_A+2]     ; DX = mA hi-word
-
+        ; Divisor: 16-bit high mantissa of B in BX (0x8000..0xFFFF)
         mov  bh, [FLT_B+1]
         and  bh, 0x7F
         or   bh, 0x80
-        mov  bl, [FLT_B+2]     ; BX = mB hi-word
+        mov  bl, [FLT_B+2]     ; BX = mB high word
 
-        ; Divide: (DX:AX) / BX where AX has lower mantissa bytes of A
-        ; Use bytes 1-4 of A for full 32-bit dividend precision
-        mov  ax, [FLT_A+3]     ; AX = FLT_A bytes 3,4 swapped? No: [FLT_A+3]=byte3, byte4
-        xchg al, ah             ; AX = word at FLT_A+3 (AH=byte3, AL=byte4) -- use as-is
-        ; Actually [word at FLT_A+3] = {byte4, byte3} (little-endian) -- swap
-        ; Simpler: just zero AX for now; the lower 2 bytes of A are 0 for most integers
-        xor  ax, ax             ; AX = 0 (lower 32-bit dividend half)
-        shr  dx, 1              ; pre-shift to ensure DX < BX
-        div  bx                 ; AX = quotient, DX = remainder
+        ; Dividend: full 32-bit mantissa of A in DX:AX
+        mov  dh, [FLT_A+1]
+        and  dh, 0x7F
+        or   dh, 0x80           ; implied-1
+        mov  dl, [FLT_A+2]     ; DX = A mant high word
+        mov  ah, [FLT_A+3]
+        mov  al, [FLT_A+4]     ; AX = A mant low word
 
-        ; Normalise quotient: shift AX left until AH bit7 set, counting shifts.
-        ; Each shift left means the mantissa value is doubled, so decrement exponent.
-        xor  cl, cl             ; CL = shift count
-fdiv_norm_lp:
-        test ah, 0x80
-        jnz  fdiv_norm_done
-        shl  ax, 1
-        inc  cl
-        cmp  cl, 16
-        jb   fdiv_norm_lp
-        ; If we reach here, quotient was 0 (shouldn't happen if A!=0)
-        jmp  fdiv_done
-fdiv_norm_done:
-        ; AX = normalised quotient (AH bit7 set). CL = shift count applied.
-        ; FLT_ER = eA-eB+0x80. Pre-shift added 1. Normalise subtracted CL.
-        ; Net: FLT_ER += 1 - CL
-        inc  byte [FLT_ER]
-        sub  [FLT_ER], cl
+        ; Pre-shift DX:AX right 1 (guarantees DX < BX for Stage 1)
+        shr  dx, 1
+        rcr  ax, 1
 
-        ; Save normalised quotient before computing guard (guard calc destroys AX)
-        push ax                 ; save [AH=q_hi, AL=q_lo]
+        ; Stage 1: DX:AX / BX -> AX=Q1, DX=R1
+        div  bx
+        push ax                 ; save Q1
 
-        ; Guard byte from remainder (DX still holds remainder from div)
-        mov  al, dh             ; high byte of remainder
+        ; Stage 2: R1(DX):0000 / BX -> AX=Q2, DX=R2
+        xor  ax, ax             ; DX:AX = R1:0000
+        div  bx                 ; AX=Q2, DX=R2
+
+        ; Save Q2 in CX; compute guard byte from R2 into AL
+        mov  cx, ax             ; CX = Q2
+        mov  al, dh             ; AL = R2 high byte
         xor  ah, ah
-        div  bh                 ; AL = guard byte approximation
-        mov  cl, al             ; CL = guard byte
+        div  bh                 ; AL = guard byte (~ next 8 quotient bits)
+        ; AL=guard. AH=sub-remainder (discard). Pop Q1 into DX (AL untouched).
+        pop  dx                 ; DX = Q1 (DH=Q1_hi, DL=Q1_lo)
 
-        pop  ax                 ; restore normalised quotient: AH=q_hi(bit7 set), AL=q_lo
+        ; Left-shift Q1:Q2 once to compensate for pre-shift halving.
+        ; Use rcl chain: DH:DL:CH:CL left 1, CF receives old bit31.
+        ; If CF set: Q1 was >= 0x8000, already normalised -> rcr back, use FLT_ER+1.
+        ; If CF clear: use FLT_ER.
+        clc
+        rcl  cl, 1             ; Q2 low byte
+        rcl  ch, 1             ; Q2 high byte
+        rcl  dl, 1             ; Q1 low byte
+        rcl  dh, 1             ; Q1 high byte (CF = old bit31 of Q1)
+        jnc  fdiv_shifted_ok
+        ; CF set: was already >= 0.5 -> undo shift and use FLT_ER+1
+        rcr  dh, 1
+        rcr  dl, 1
+        rcr  ch, 1
+        rcr  cl, 1
+        inc  byte [FLT_ER]
 
-        ; Pack to BL:DX:AH:AL for norm_pack
-        ; BL = high mantissa byte (AH, bit7 already set = normalised)
-        ; DH = second byte (AL), DL = 0, AH = guard byte
-        mov  bl, ah             ; BL = high byte (bit7 set, normalised)
-        mov  dh, al             ; DH = second byte
-        xor  dl, dl
-        mov  ah, cl             ; AH = guard byte
+fdiv_shifted_ok:
+        ; Pack DH:DL:CH:CL into BL:DH:DL:AH for norm_pack
+        ; (reuse DX and CX which hold Q1 and Q2 respectively)
+        ; BL = Q1_hi = DH, new DH = Q1_lo = DL, DL = Q2_hi = CH, AH = Q2_lo = CL
+        ; Do the shuffle carefully:
+        mov  bl, dh             ; BL = Q1_hi
+        mov  dh, dl             ; DH = Q1_lo
+        mov  dl, ch             ; DL = Q2_hi
+        mov  ah, cl             ; AH = Q2_lo
         mov  bh, [FLT_ER]
-        xor  al, al
+        ; AL still = guard byte from div bh above
         jmp  norm_pack
 
 fdiv_done: ret
@@ -1233,16 +1332,18 @@ fpar_notdot:
         cmp  al, 9
         ja   fpar_end
         ; AL = digit value (0..9)
+        xor  ah, ah             ; ensure AH=0 so AX=digit for flt_from_int_b
         inc  si
+        mov  [FLT_TS], si       ; save string pointer to RAM (push/pop proved unreliable)
 
         ; Push digit BEFORE calling flt_mul (which clobbers AX)
-        push ax                 ; [sp+0] = digit value
+        push ax                 ; [sp+0] = digit value (AX = 0x00dd)
 
         ; FLT_A = FLT_A * 10
         push bx
         push cx
         mov  ax, 10
-        call flt_from_int_b     ; FLT_B = 10  (FLT_A preserved)
+        call flt_from_int_b     ; FLT_B = 10  (FLT_A preserved; clobbers SI)
         call flt_mul            ; FLT_A = FLT_A * 10
         pop  cx
         pop  bx
@@ -1251,10 +1352,12 @@ fpar_notdot:
         pop  ax                 ; AL = digit
         push bx
         push cx
-        call flt_from_int_b     ; FLT_B = digit  (FLT_A preserved)
+        call flt_from_int_b     ; FLT_B = digit  (FLT_A preserved; clobbers SI)
         call flt_add            ; FLT_A = FLT_A + digit
         pop  cx
         pop  bx
+
+        mov  si, [FLT_TS]       ; restore string pointer from RAM
 
         or   bl, bl             ; after decimal point?
         jz   fpar_lp
@@ -1270,19 +1373,6 @@ fpar_scale:
         mov  ax, 10
         call flt_from_int_b
         call flt_div
-        ; DEBUG after div
-        push cx
-        push si
-        mov  si, FLT_A
-        mov  cx, 5
-fpsdbg: mov  al, [si]
-        call print_hex_byte
-        inc  si
-        loop fpsdbg
-        mov  al, '!'
-        call output
-        pop  si
-        pop  cx
         pop  cx
         dec  cl
         jnz  fpar_scale
