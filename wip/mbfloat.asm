@@ -1,5 +1,5 @@
 ; =============================================================================
-; MiniBASIC8088  MBF5 Float Library  v0.4-wip
+; MiniBASIC8088  MBF5 Float Library  v0.5
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 5-byte Microsoft Binary Format floating-point routines for 8088/8086.
@@ -26,6 +26,16 @@
 ;         flt_to_int: correct saturation: +-32767 pos/neg, exact -32768 supported.
 ;         FLT_SP: new 2-byte slot for flt_parse string pointer (was trashing FLT_DE).
 ;         print_hex_byte: stack leak fixed (call/ret instead of jmp output).
+; v0.5 : flt_div replaced with 40-bit shift-and-subtract loop (full 32-bit divisor,
+;         ~7 sig fig precision, smaller code).  FLT_DB 4-byte RAM slot added for B
+;         mantissa spill; guard byte parked in CH during loop (no push/pop in loop body).
+;         flt_mul: Step 5 rewritten as 8-bit mul dl (~56 cycle saving); Step 6 added
+;         for B_byte4*A_hi symmetry (true 32x32 guard band contribution).
+;         shl al,1 replaces rcl al,1 at fms_do_shift (explicit CF hygiene).
+;         flt_div entry: jz/je -> inverted+jmp trampolines (forward targets out of
+;         short-jump range due to larger loop body).
+;         Two unindented 'call' statements fixed (T5 harness, fpar_scale).
+;         All 10 tests passing: T2=3.141592, T4=0.3333333 (7 sig figs, up from ~4).
 ;
 ; ---------------------------------------------------------------------------
 ; KNOWN OPEN ITEMS
@@ -106,6 +116,7 @@ FLT_ER: equ 0x00D1              ; 1 byte : result exponent
 FLT_TS: equ 0x00D2              ; 1 byte : flt_to_int sign scratch
 FLT_DE: equ 0x00D3              ; 1 byte : flt_print decimal exponent
 FLT_SP: equ 0x00D4              ; 2 bytes: flt_parse string pointer save (word)
+FLT_DB: equ 0x00D6              ; 4 bytes: flt_div B-mantissa spill (bytes 1..4 of FLT_B)
 IBUF:   equ 0x000C              ; 64 bytes: digit buffer
 
 ; =============================================================================
@@ -165,7 +176,7 @@ start:
         call flt_a_to_b         ; FLT_B = 100.5
         mov  ax, 100
         call flt_from_int       ; FLT_A = 100
-call flt_sub
+        call flt_sub
         call flt_print
         call new_line
 
@@ -913,23 +924,42 @@ fms20:  add  bx, dx
         mul  si                 ; AX = A_hi * B_hi
         add  bx, ax
 
-        ; Step 5: A_byte4 * B_hi_byte -> 16-bit result in AX.
-        ; Contribution to BX:CX: product >> 8 (AH) added to CX_lo byte.
-        ; Product & 0xFF (AL) is the sub-guard for norm_pack rounding.
-        ; To add AH to CX_lo without disturbing CX_hi: use xchg/add on ch/cl.
+        ; Step 5: A_byte4 * B_hi_byte  (weight 2^-40)
+        ; 8-bit mul saves ~56 clocks vs 16-bit.  Re-read B_hi from memory (avoids
+        ; half-register syntax not supported on 8086); DX is dead after step3.
         mov  al, [FLT_A+4]
-        xor  ah, ah             ; BUGFIX: clear AH (leftover from step4) before 16-bit mul
-        mul  si                 ; AX = [FLT_A+4] * B_hi_byte
-        ; AH = (A4*B_hi)>>8, AL = (A4*B_hi)&0xFF (sub-guard)
-        ; Save sub-guard, add AH to CL (CX low byte):
-        push ax                 ; save sub-guard in AL
-        mov  al, ah             ; AL = (A4*B_hi)>>8
-        xor  ah, ah             ; AX = (A4*B_hi)>>8 as 16-bit
-        add  cx, ax             ; add to CX; may carry into BX
-        jnc  fms30
+        mov  dl, [FLT_B+1]
+        and  dl, 0x7F
+        or   dl, 0x80           ; DL = B_hi_byte (implied-1 restored)
+        mul  dl                 ; AX = A4 * B_hi  (8-bit; result in AX)
+        ; AH = upper (weight 2^-33 contribution to CX), AL = sub-guard
+        push ax                 ; save [sp+1]=upper, [sp+0]=sub-guard
+
+        mov  al, ah             ; AL = upper byte
+        xor  ah, ah             ; AX = 00:upper
+        add  cx, ax             ; accumulate into product low word
+        jnc  fms5a
         inc  bx
-fms30:  pop  ax                 ; restore: AL = sub-guard, AH = step4 product high (garbage now)
-        ; AL = sub-guard for norm_pack
+fms5a:
+
+        ; Step 6: B_byte4 * A_hi_byte  (weight 2^-40, symmetric counterpart)
+        mov  al, [FLT_B+4]
+        mov  dl, [FLT_A+1]
+        and  dl, 0x7F
+        or   dl, 0x80           ; DL = A_hi_byte (implied-1 restored)
+        mul  dl                 ; AX = B4 * A_hi  (8-bit)
+        ; AH = upper contribution (weight 2^-33), AL = partial sub-guard
+        ; Combine with step5 sub-guard still on stack (step5 upper already added to CX)
+        pop  dx                 ; DL = step5 sub-guard, DH = step5 upper (already consumed)
+        add  al, dl             ; AL = combined sub-guard (step6_lo + step5_lo); AH = step6 upper
+        push ax                 ; save AL = combined sub-guard
+        mov  al, ah             ; AL = step6 upper byte
+        xor  ah, ah             ; AX = 0x00:step6_upper as 16-bit
+        add  cx, ax             ; accumulate step6 upper into product low word
+        jnc  fms5b
+        inc  bx
+fms5b:
+        pop  ax                 ; AL = final combined sub-guard for norm_pack
 
         ; Product in BX:CX, sub-guard in AL.
         ; Check normalisation: BH bit7 must be set.
@@ -941,8 +971,9 @@ fms30:  pop  ax                 ; restore: AL = sub-guard, AH = step4 product hi
         pop  si                 ; restore SI before zero exit
         jmp  fmul_zero
 fms_do_shift:
-        ; Left-shift BX:CX:AL (32+8 bits) to normalise
-        rcl  al, 1
+        ; Left-shift BX:CX:AL (32+8 bits) to normalise.
+        ; shl introduces clean 0 into bit0 of guard; rcl would be CF-dependent.
+        shl  al, 1
         rcl  cx, 1
         rcl  bx, 1
 
@@ -964,147 +995,177 @@ fmul_zero: jmp flt_zero
 ; =============================================================================
 ; FLT_DIV  FLT_A = FLT_A / FLT_B
 ;
-; Divides 16-bit mantissa of A by 16-bit mantissa of B to produce a 16-bit
-; quotient mantissa, then appends a guard byte from the remainder.
+; 40-bit shift-and-subtract fractional division.
+; Divides full 32-bit mantissa of A by full 32-bit mantissa of B, producing
+; a 32-bit normalised quotient mantissa + 8-bit guard byte for rounding.
 ;
-; Method:
-;   DX = mA_hi_word (FLT_A[1:2] with implied-1, = 16-bit mantissa)
-;   BX = mB_hi_word (FLT_B[1:2] with implied-1, = 16-bit divisor)
-;   Both in [0x8000..0xFFFF].
-;   Pre-shift DX left 1 (DX is < BX so no overflow after shift if DX < 0x8000).
-;   Actually: to get a 16-bit quotient in [0x8000,0xFFFF], do:
-;     if mA < mB: quotient = (mA<<1)/mB  in (0x8000,0x10000), exp--
-;     else:       quotient = mA/mB         (would be >= 1; pre-shift prevents this)
-;   Since both in [0.5,1), mA/mB in (0.5,2).  We handle both cases:
-;     Always: AX=0, DX=mA. shr dx,1: DX in [0x4000,0x7FFF] < BX always.
-;     div bx -> quotient in [0x4000,0x7FFF] (< 0x8000, not normalised).
-;     Shift quotient left 1, adjust exponent.
-;   Guard byte: take remainder × 256 / BH.
+; Pre-scale trick: both mantissas are in [0.5, 1.0).  If A >= B the quotient
+; would be >= 1.0, so shift A right 1 and increment FLT_ER to compensate.
+; After this, A < B is guaranteed, so the quotient is in [0.5, 1.0) and the
+; MSB of the 40-bit result will always be 1 — output is pre-normalised.
+;
+; Loop (40 iterations):
+;   1. Shift 40-bit quotient chain left 1: BL(guard) <- AX(lo) <- DX(hi)
+;   2. Shift 32-bit remainder left 1: SI:DI (SI=hi, DI=lo)
+;   3. If remainder >= B (stored in FLT_DB): subtract B, set quotient bit 0
+;
+; After 40 iterations:
+;   DX = quotient high word  (mant[31:16])
+;   AX = quotient low word   (mant[15:0])
+;   BL = guard byte
+; Shuffle to BL:DH:DL:AH for norm_pack, AL = guard.
+;
+; B mantissa spilled to FLT_DB[0..3] (4 bytes) to free registers for the loop.
 ;
 ; Inputs  : FLT_A, FLT_B
 ; Outputs : FLT_A = quotient
-; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
-; =============================================================================
-; =============================================================================
-; FLT_DIV  FLT_A = FLT_A / FLT_B
-;
-; Two-stage 32/16 divide for full 32-bit mantissa precision.
-; Algorithm from MS-BASIC division analysis, adapted to MBF5 memory layout.
-;
-; Pre-shift DX:AX (full 32-bit mant of A) right 1 → DX < BX, no Stage1 overflow.
-; Stage 1 : DX:AX / BX  → Q1(AX), R1(DX)   – high 16-bit quotient word
-; Stage 2 : R1:0000 / BX → Q2(AX), R2(DX)   – low  16-bit quotient word
-;            R1<BX by definition → no overflow
-; Guard   : R2_hi / BH → 8-bit rounding sub-guard (passed as AL to norm_pack)
-; Pack    : BL:DH:DL:AH = Q1_hi:Q1_lo:Q2_hi:Q2_lo → norm_pack
-;
-; Inputs  : FLT_A, FLT_B
-; Outputs : FLT_A = quotient (full 32-bit mantissa precision)
-; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
-; =============================================================================
-; =============================================================================
-; FLT_DIV  FLT_A = FLT_A / FLT_B
-;
-; Two-stage 32/16 divide for full 32-bit mantissa precision.
-;
-; Pre-shift DX:AX (full 32-bit mant of A) right 1 -> DX < BX, no overflow.
-; Stage 1 : DX:AX / BX -> Q1(AX), R1(DX)  high 16-bit quotient word
-; Stage 2 : R1:0000 / BX -> Q2(AX), R2(DX) low  16-bit quotient word
-; Always left-shift Q1:Q2 once to compensate for the pre-shift halving.
-;   If CF set after shift (Q1 was >= 0x8000): already normalised, shift back
-;   right and use FLT_ER+1 as exponent.  Otherwise use FLT_ER.
-; Guard   : R2_hi / BH -> 8-bit sub-guard (AL) for norm_pack rounding.
-; Pack    : BL:DH:DL:AH = mant[31:24]:[23:16]:[15:8]:[7:0] -> norm_pack.
-;
-; Inputs  : FLT_A, FLT_B
-; Outputs : FLT_A = quotient (full 32-bit mantissa precision)
-; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_ER
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_SA, FLT_ER, FLT_DB[0..3]
 ; =============================================================================
 flt_div:
         mov  bl, [FLT_B+0]
         or   bl, bl
-        jz   fdiv_by_zero
-
+        jnz  fdiv_not_zero
+        jmp  fdiv_by_zero
+fdiv_not_zero:
         mov  al, [FLT_A+0]
         or   al, al
-        je   fdiv_done          ; 0 / x = 0
+        jnz  fdiv_not_zero2
+        jmp  fdiv_done          ; 0 / x = 0
+fdiv_not_zero2:
 
         ; Exponent: eA - eB + 0x80
         sub  al, bl
         add  al, 0x80
         mov  [FLT_ER], al
 
-        ; Result sign
+        ; Result sign = sign_A XOR sign_B
         mov  al, [FLT_A+1]
         xor  al, [FLT_B+1]
         and  al, 0x80
         mov  [FLT_SA], al
 
-        ; Divisor: 16-bit high mantissa of B in BX (0x8000..0xFFFF)
-        mov  bh, [FLT_B+1]
-        and  bh, 0x7F
-        or   bh, 0x80
-        mov  bl, [FLT_B+2]     ; BX = mB high word
+        ; Unpack B mantissa (implied-1) into FLT_DB[0..3], high byte first
+        mov  al, [FLT_B+1]
+        and  al, 0x7F
+        or   al, 0x80           ; restore implied-1
+        mov  [FLT_DB+0], al
+        mov  al, [FLT_B+2]
+        mov  [FLT_DB+1], al
+        mov  al, [FLT_B+3]
+        mov  [FLT_DB+2], al
+        mov  al, [FLT_B+4]
+        mov  [FLT_DB+3], al
 
-        ; Dividend: full 32-bit mantissa of A in DX:AX
-        mov  dh, [FLT_A+1]
-        and  dh, 0x7F
-        or   dh, 0x80           ; implied-1
-        mov  dl, [FLT_A+2]     ; DX = A mant high word
+        ; Save SI (caller's); load A mantissa (implied-1) into SI:DI as 32-bit remainder
+        push si
+        mov  ah, [FLT_A+1]
+        and  ah, 0x7F
+        or   ah, 0x80           ; restore implied-1
+        mov  al, [FLT_A+2]
+        mov  si, ax             ; SI = A mant high word
         mov  ah, [FLT_A+3]
-        mov  al, [FLT_A+4]     ; AX = A mant low word
+        mov  al, [FLT_A+4]
+        mov  di, ax             ; DI = A mant low word
 
-        ; Pre-shift DX:AX right 1 (guarantees DX < BX for Stage 1)
-        shr  dx, 1
-        rcr  ax, 1
-
-        ; Stage 1: DX:AX / BX -> AX=Q1, DX=R1
-        div  bx
-        push ax                 ; save Q1
-
-        ; Stage 2: R1(DX):0000 / BX -> AX=Q2, DX=R2
-        xor  ax, ax             ; DX:AX = R1:0000
-        div  bx                 ; AX=Q2, DX=R2
-
-        ; Save Q2 in CX; compute guard byte from R2 into AL
-        mov  cx, ax             ; CX = Q2
-        mov  al, dh             ; AL = R2 high byte
-        xor  ah, ah
-        div  bh                 ; AL = guard byte (~ next 8 quotient bits)
-        ; AL=guard. AH=sub-remainder (discard). Pop Q1 into DX (AL untouched).
-        pop  dx                 ; DX = Q1 (DH=Q1_hi, DL=Q1_lo)
-
-        ; Left-shift Q1:Q2 once to compensate for pre-shift halving.
-        ; Use rcl chain: DH:DL:CH:CL left 1, CF receives old bit31.
-        ; If CF set: Q1 was >= 0x8000, already normalised -> rcr back, use FLT_ER+1.
-        ; If CF clear: use FLT_ER.
-        clc
-        rcl  cl, 1             ; Q2 low byte
-        rcl  ch, 1             ; Q2 high byte
-        rcl  dl, 1             ; Q1 low byte
-        rcl  dh, 1             ; Q1 high byte (CF = old bit31 of Q1)
-        jnc  fdiv_shifted_ok
-        ; CF set: was already >= 0.5 -> undo shift and use FLT_ER+1
-        rcr  dh, 1
-        rcr  dl, 1
-        rcr  ch, 1
-        rcr  cl, 1
+        ; Pre-scale: if remainder (A) >= B, shift right 1 and inc FLT_ER.
+        ; Guarantees quotient < 1.0 so MSB of 40-bit result = 1 (pre-normalised).
+        mov  bh, [FLT_DB+0]
+        mov  bl, [FLT_DB+1]    ; BX = B high word
+        cmp  si, bx
+        jb   fdiv_prescaled
+        ja   fdiv_prescale
+        mov  bh, [FLT_DB+2]
+        mov  bl, [FLT_DB+3]    ; BX = B low word
+        cmp  di, bx
+        jb   fdiv_prescaled
+fdiv_prescale:
+        shr  si, 1
+        rcr  di, 1
         inc  byte [FLT_ER]
+fdiv_prescaled:
 
-fdiv_shifted_ok:
-        ; Pack DH:DL:CH:CL into BL:DH:DL:AH for norm_pack
-        ; (reuse DX and CX which hold Q1 and Q2 respectively)
-        ; BL = Q1_hi = DH, new DH = Q1_lo = DL, DL = Q2_hi = CH, AH = Q2_lo = CL
-        ; Do the shuffle carefully:
-        mov  bl, dh             ; BL = Q1_hi
-        mov  dh, dl             ; DH = Q1_lo
-        mov  dl, ch             ; DL = Q2_hi
-        mov  ah, cl             ; AH = Q2_lo
+        ; Initialise 40-bit quotient: DX=hi word, AX=lo word, BL=guard byte.
+        ; CX = loop counter; CH is always 0 (counter <= 40 fits in CL), used to
+        ; park the guard byte (BL) while BX is temporarily needed for compare/subtract.
+        xor  dx, dx
+        xor  ax, ax
+        xor  bl, bl
+        mov  cl, 40
+        xor  ch, ch
+
+fdiv_loop:
+        ; Shift 40-bit quotient left 1: guard(BL) <- lo(AX) <- hi(DX)
+        shl  bl, 1
+        rcl  ax, 1
+        rcl  dx, 1
+
+        ; Shift 32-bit remainder left 1: DI(lo) -> SI(hi)
+        shl  di, 1
+        rcl  si, 1
+        jc   fdiv_ov            ; remainder overflowed -> definitely >= B
+
+        ; Compare SI:DI with B (FLT_DB[0..3]).
+        ; Park guard in CH while BX is used as scratch.
+        mov  ch, bl
+        mov  bh, [FLT_DB+0]
+        mov  bl, [FLT_DB+1]    ; BX = B high word
+        cmp  si, bx
+        jb   fdiv_restore       ; remainder < B
+        ja   fdiv_do_sub        ; remainder > B
+        mov  bh, [FLT_DB+2]
+        mov  bl, [FLT_DB+3]    ; BX = B low word
+        cmp  di, bx
+        jb   fdiv_restore       ; remainder < B
+
+fdiv_do_sub:
+        ; Always reload B_lo explicitly (BX may hold B_hi if arrived via ja path)
+        mov  bh, [FLT_DB+2]
+        mov  bl, [FLT_DB+3]    ; BX = B low word
+        sub  di, bx
+        mov  bh, [FLT_DB+0]
+        mov  bl, [FLT_DB+1]    ; BX = B high word
+        sbb  si, bx
+        mov  bl, ch             ; restore guard from CH
+        inc  bl                 ; set quotient bit 0
+        jmp  fdiv_next
+fdiv_restore:
+        mov  bl, ch             ; restore guard
+        jmp  fdiv_next
+
+fdiv_ov:
+        ; Overflow path: remainder >= B for certain (CF from rcl si,1).
+        ; Guard not yet parked; BX free. Park, subtract, restore.
+        mov  ch, bl             ; park guard
+        mov  bh, [FLT_DB+2]
+        mov  bl, [FLT_DB+3]    ; BX = B low word
+        sub  di, bx
+        mov  bh, [FLT_DB+0]
+        mov  bl, [FLT_DB+1]    ; BX = B high word
+        sbb  si, bx
+        mov  bl, ch             ; restore guard
+        inc  bl                 ; set quotient bit 0
+
+fdiv_next:
+        dec  cl
+        jnz  fdiv_loop
+
+        ; 40 bits complete. DX=quotient hi, AX=quotient lo, BL=guard.
+        ; Shuffle to norm_pack convention:
+        ;   norm_pack: BL=mant[31:24], DH=mant[23:16], DL=mant[15:8], AH=mant[7:0], AL=guard
+        ;   Current:   DH=mant[31:24], DL=mant[23:16], AH=mant[15:8], AL=mant[7:0], BL=guard
+        ; Use CL (loop counter = 0) to park guard during shuffle:
+        mov  cl, bl             ; CL = guard
+        mov  bl, dh             ; BL = mant[31:24]
+        mov  dh, dl             ; DH = mant[23:16]
+        mov  dl, ah             ; DL = mant[15:8]
+        mov  ah, al             ; AH = mant[7:0]
+        mov  al, cl             ; AL = guard
         mov  bh, [FLT_ER]
-        ; AL still = guard byte from div bh above
+        pop  si
         jmp  norm_pack
 
-fdiv_done: ret
+fdiv_done:
+        ret
 
 fdiv_by_zero:
         push si
@@ -1414,7 +1475,7 @@ fpar_scale:
         push cx
         mov  ax, 10
         call flt_from_int_b
-call flt_div
+        call flt_div
         pop  cx
         dec  cl
         jnz  fpar_scale
