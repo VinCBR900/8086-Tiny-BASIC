@@ -1,15 +1,46 @@
-CC ?= Tcc
-CFLAGS ?= -Wall -O2
+CC ?= cc
+CFLAGS ?= -O2 -Wall -Wextra -std=c11
+BUILD_DIR := build
 
-.PHONY: all clean
+TINYASM_SRC := tinyasm.c tools/ins.c
+TINYASM_BIN := $(BUILD_DIR)/tinyasm
+ROM_ASM := uBASIC8088.asm
+ROM_BIN := $(BUILD_DIR)/uBASIC_rom.bin
 
-all: asm2650 pipbug_wrap
+SIM_SRC := sim_rom.c cpu.c ins.c
+SIM_HDR := cpu.h cpuconf.h config.h i8259.h debuglog.h
+SIM_BIN := $(BUILD_DIR)/sim_rom
 
-asm2650: asm2650.c
-	gcc $(CFLAGS) -o $@ $<
+.PHONY: all rom sim rom-run clean help
 
-pipbug_wrap: pipbug_wrap.c 2650.c aa.h aa_strings.h
-	gcc $(CFLAGS) -DGAMER -o $@ pipbug_wrap.c
+all: rom sim
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(TINYASM_BIN): $(TINYASM_SRC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(TINYASM_SRC)
+
+rom: $(ROM_BIN)
+
+$(ROM_BIN): $(ROM_ASM) $(TINYASM_BIN)
+	$(TINYASM_BIN) -f bin $(ROM_ASM) -o $@
+
+sim: $(SIM_BIN)
+
+$(SIM_BIN): $(SIM_SRC) $(SIM_HDR) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(SIM_SRC)
+
+rom-run: sim
+	$(SIM_BIN) $(ROM_ASM)
 
 clean:
-	rm -f asm2650 pipbug_wrap
+	rm -rf $(BUILD_DIR)
+
+help:
+	@echo "Targets:"
+	@echo "  make all      Build ROM assembler, ROM image, and simulator"
+	@echo "  make rom      Build ROM image ($(ROM_BIN))"
+	@echo "  make sim      Build simulator ($(SIM_BIN); includes cpu.c)"
+	@echo "  make rom-run  Run ROM in simulator from ASM source"
+	@echo "  make clean    Remove build artifacts"
