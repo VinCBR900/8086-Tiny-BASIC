@@ -1,5 +1,10 @@
 ## Tools
-this folder contains Tool used in 8088 Tiny BASIC Development, copied here so CODEX can access them.  
+this folder contains Tool used in 8088 Tiny BASIC Development, copied here so Claude/CODEX can access them.
+
+For Claude, run `Bundle.cmd` to generate `bundle.txt` file that you can tell upload along with `unbundle.sh`.  Tell Claude `Do no Parse the bundle.txt file as it wastes tokens, but unbundle with the Shell file`.  Calude should then have a development environment it can build and test autonimously.
+
+CODEX pulls everything from Github but its strengths like in modern Assembly and 8086 type coding.
+
 
 ### Assembler
 The Assembler is Oscar Toledo's **tinyasm.c** from 
