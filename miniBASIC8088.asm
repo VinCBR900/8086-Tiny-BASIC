@@ -5,9 +5,7 @@
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
 ; floating-point support, CORDIC SIN/COS, and a float-driven showcase
 ; program. Base architecture, hardware/memory map, line-store format,
-; statement/operator set, and build process are otherwise identical to
-; uBASIC8088.asm v1.7.5 -- refer to that file's header for anything not
-; called out below as different.
+; statement/operator set, identical to uBASIC8088.asm v1.7.5
 ;
 ; WHAT'S DIFFERENT FROM v1.7.5:
 ;   - All variables and expression results are 32-bit MBF4 floats, not
@@ -16,14 +14,12 @@
 ;     likewise).
 ;   - New functions: SIN(x), COS(x) (fixed-point Q14 CORDIC internally;
 ;     ~14-bit precision, less than MBF4's native ~23-bit mantissa).
-;   - ROM/RAM widened 2 KB -> 4 KB each (2732 EPROM); ORIGIN/STACK/etc.
-;     shift accordingly -- see RAM LAYOUT below for the full map.
+;   - ROM expanded  2 KB -> 4 KB (2732 EPROM); 
 ;   - SHOWCASE_DATA rewritten to exercise float arithmetic, SIN/COS+TAB
 ;     (sine wave), and a floating-point Mandelbrot.
 ;
 ; Credit: Oscar Toledo G. for bootBASIC inspiration and TinyASM 8086 assembler.
 ;         XTulator CPU core by Mike Chambers.
-;         MBF4 float library merged from mbfloat_v14.asm (same author).
 ;
 ; ---------------------------------------------------------------------------
 ; LANGUAGE REFERENCE  (delta from v1.7.5 only -- see that file for the rest)
@@ -35,311 +31,54 @@
 ;               (v1.7.5: signed 16-bit, -32768..32767)
 ;
 ; ---------------------------------------------------------------------------
-; BUILD INSTRUCTIONS  (same tinyasm/sim_rom toolchain as v1.7.5)
+; BUILD
 ; ---------------------------------------------------------------------------
 ;
-;   tinyasm -f bin miniBASIC8088.asm -o miniBASIC_rom.bin
-;   ./sim_rom miniBASIC8088.asm                 (auto-assembles, then runs)
+; Assemble ROM image:
+;     tinyasm -f bin miniBASIC8088.asm -o miniBASIC_rom.bin
 ;
-; Toolchain build (tinyasm.c, ins.c, sim_rom.c, cpu.c + headers, Makefile):
-;   cc -O2 -o build/tinyasm tinyasm.c ins.c
-;   cc -O2 -o build/sim_rom sim_rom.c cpu.c ins.c
-;   (the supplied Makefile's TINYASM_SRC references "tools/ins.c"; ins.c
-;   actually sits alongside tinyasm.c -- build directly with the command
-;   above, or fix that one path in the Makefile, before running `make`.)
+; Assemble and run in the supplied simulator:
+;     ./sim_rom miniBASIC8088.asm
 ;
-; Assembled size (tinyasm -f bin; ROM_END marks real code end, just
-; before the reset-vector org/padding -- always re-check against a
-; fresh .lst rather than trusting this comment if the code has changed):
-;   ROM variant  (real target, 4096-byte budget): ROM_END = 0xFFCF =
-;     4047 bytes used, 49 bytes free.  (v2.1 was 0xFFAB / 4011 / 85 free;
-;     v2.2 bug fixes cost 36 bytes net.)
-;   YASM/8bitworkshop variant (FREEDOS EXE, no fixed ROM ceiling):
-;     ROM_END = 0xFF88 relative to the same start, 3976 bytes of code
-;     before SHOWCASE_DATA/reset vector (verified via NASM with
-;     -D__YASM_MAJOR__=1 as a proxy; real YASM not available to verify
-;     runtime behaviour, only assembly).  Not re-measured for v2.2.
-;   The ROM variant is the binding constraint for any future feature
-;   (TAN/SQRT/inverse trig etc.) -- 49 bytes is the real budget.
+; See the supplied Makefile for toolchain build details.
 ;
-; Memory map, simulator usage (--trace/--break-at/--watch), and the
-; YASM/8bitworkshop entry path are unchanged from v1.7.5 except for the
-; widened RAM_SIZE/ORIGIN noted above -- see that file's header for full
-; detail, or RAM LAYOUT below for this file's exact equates.
+; ROM budget (4096 bytes)
+;     Current size : 4011 bytes
+;     Free space   : 85 bytes
+;
+; The ROM target is the limiting configuration for future features.
 ;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v2.2   (2026-06-30)  Five logic-bug fixes (static analysis):
-;     - BUG FIX: expr's relational operators (<, =, >, <=, >=, <>) now use
-;       flt_cmp (float-native) instead of truncating both operands to int16.
-;       Old code: "1.5>1.2" returned false (both truncate to 1, compare
-;       equal). Fix: LHS parked as 4-byte float on the real stack; after
-;       RHS eval, flt_a_to_b + flt_cmp replace the old flt_to_int + cmp
-;       bx,ax pair. Mandelbrot escape test (A*A+B*B>4) was also affected.
-;     - BUG FIX: do_list now bounds-checks the token byte against
-;       TK_PRINT+NUM_TOKENS before calling get_token_ptr. Without this,
-;       TK_THEN (0x93) indexed one past the tk_kw_tab sentinel (dereferencing
-;       address 0x0000 -> likely garbage output); TK_TO printed "THEN" and
-;       TK_STEP printed "TO" due to the off-by-one walk into then_tab/to_tab.
-;     - BUG FIX: do_gosub stack overflow now raises ERR_OM (?3) via ins_oom
-;       instead of ERR_SN (?0) -- consistent with do_for's own stack-full
-;       path; a GOSUB stack overflow is not a syntax error.
-;     - DOC FIX: flt_print header comment updated to document that the zero
-;       fast-path (exponent byte = 0x00) tail-calls output directly and does
-;       not reach the pop-restore at fp_print_done. FLT_A is correct (it is
-;       all-zeros on that path) but the stack-restore invariant does not apply.
-;     - COSMETIC: str_banner updated to "miniBASIC 8088 v2.2" (was stale
-;       "uBASIC 8088 v1.7.5" carried over from before the v2.0 rename).
-;     - BUG FIX: THEN/TO/STEP tokenization and LIST detokenization.
-;       (a) tk_kw_tab now includes kw_then/kw_to/kw_step before its sentinel
-;       so manually typed THEN/TO/STEP are tokenized to TK_THEN/TK_TO/TK_STEP.
-;       Previously the tokenizer's sentinel scan stopped before these entries
-;       and left them as plain text in stored lines.
-;       (b) do_list's dl_body now handles TK_THEN/TK_TO/TK_STEP as a second
-;       token range (base: then_tab, index: token-TK_THEN), re-using the
-;       existing get_token_ptr/dp_str path. Previously they fell through to
-;       dl_raw and printed the raw high byte (or worse, a null-deref for
-;       TK_THEN=0x93 which indexed the sentinel word). Unknown tokens above
-;       TK_STEP still fall through to dl_raw as before.
 ;
-;   v2.1   (2026-06-25)  Added SIN(x)/COS(x) via fixed-point (Q14) CORDIC,
-;     converting to/from MBF4 only at the boundary. Chosen over a
-;     float-native CORDIC core after sizing both as standalone
-;     prototypes during design: the float-native version's 14-iteration
-;     loop, threading every shift/add/sub through flt_add/flt_sub plus a
-;     manual exponent-shift helper, measured ~224 bytes for the core
-;     alone (before range reduction or wrappers); the fixed-point
-;     version's loop is plain SAR/ADD/SUB and measured ~143 bytes,
-;     while still only needing two small conversion helpers at the
-;     float<->fixed boundary. Net: SIN+COS complete (range reduction,
-;     14-iteration core, both wrappers, keyword/func_tab wiring) costs
-;     ~410 bytes fully duplicated, ~400 bytes after sharing the
-;     quadrant-recombination logic between SIN and COS in one helper
-;     (CORDIC_PICK) -- ROM_END moved from offset 3592/4096 to ~4003/4096,
-;     leaving ~93 bytes free.
-;     - RAM map: added CORDIC_X/CORDIC_Y/CORDIC_Z/CORDIC_T (4 words, 8
-;       bytes) after FLT_C, before RUNNING/PROG_END/PROGRAM (program
-;       store shrinks by 8 bytes; negligible on a 4 KB system).
-;     - Precision: Q14 (~14 bits, ~4 decimal digits) vs MBF4's native
-;       ~23-bit mantissa (~7 digits) -- a real precision drop for these
-;       two functions specifically, traded for the size win above; fine
-;       for general trig/graphics use, flagged here in case a future use
-;       case needs full float precision from SIN/COS.
-;     - Range reduction (CORDIC_REDUCE) handles any-magnitude input
-;       (mod 2*PI, quadrant 0-3, r in [0,PI/2)) -- verified numerically
-;       against real sin/cos for all 4 quadrants and exact axis
-;       boundaries before writing the assembly, and the quadrant
-;       recombination rule re-verified a second time after a wrong
-;       first guess (see below).
-;     - BUG FOUND (this feature, before first assembly): tinyasm has no
-;       DD directive (DB/DW only) -- the three new float constants
-;       (2*PI, PI/2, the Q14 scale factor) had to be written as explicit
-;       DB byte sequences in MBF4 storage order instead.
-;     - BUG FOUND (this feature, design phase): SIN and COS's quadrant
-;       recombination do NOT share one negate rule. A first attempt
-;       assumed "negate iff quadrant bit1" for both; re-deriving
-;       numerically showed SIN negates on bit1 alone but COS negates on
-;       bit0 XOR bit1 -- the two are genuinely different rules, not a
-;       register relabelling of each other. CORDIC_PICK takes an
-;       explicit CH flag so one shared routine can serve both correctly.
-;     - BUG FOUND (this feature, two separate clobber mistakes in
-;       CORDIC_PICK, both caught only by emulated end-to-end testing --
-;       COS(0) returned 0.984436 instead of 1.0): the first draft
-;       computed the COS negate rule by reading AL/AH for bit math AFTER
-;       AX already held half of the Q14 result word being returned,
-;       silently corrupting it (16383 -> 16129, exactly matching the
-;       observed wrong output once decoded). Fixed by computing the
-;       ENTIRE register-select and negate decision into CL/DL before AX
-;       is loaded with the result at all, so the two pieces of state can
-;       never alias the same register.
-;     - Optimisation pass after first correct assembly: CORDIC_REDUCE's
-;       repeated "copy a 4-byte ROM float constant into FLT_B" pattern
-;       (4 occurrences) factored into a shared LOAD_CONST_B tail call,
-;       and the SI-preservation push/pop around every such copy dropped
-;       (SI is never live across these calls in this code path -- it's
-;       only ever used as the immediate copy source, freshly reloaded
-;       before each use). Recovered ~36 bytes with no behaviour change.
-;     - BUG FOUND (this session, stress-testing a showcase program):
-;       DO_NEXT's matched-frame index (CX, needed by DN_DONE to pop
-;       FOR_SP correctly) was never saved across DO_NEXT's own calls to
-;       FLT_ADD and FLT_CMP, both of which clobber CX per their own
-;       already-correct documented headers. An ordinary FOR/NEXT loop,
-;       after completing normally, left FOR_SP corrupted to a large
-;       garbage value, which then made the NEXT, entirely unrelated FOR
-;       statement in the program fail its stack-full check. Invisible to
-;       every single-feature regression test; only surfaced once a
-;       multi-section program put a FOR/NEXT loop ahead of other
-;       statements. Fixed by saving/restoring CX around both calls (BX
-;       already had the same save/restore around FLT_CMP for the same
-;       reason -- CX needed it too and didn't have it).
-;     - BUG FOUND (this session): CORDIC_REDUCE shared FLT_C with
-;       PREC_ENGINE_F's LHS-park scratch. SIN/COS used as a sub-
-;       expression of a larger arithmetic expression (e.g.
-;       TAB(20+SIN(X))) parks the "20" in FLT_C while evaluating
-;       "SIN(X)" -- CORDIC_REDUCE's own internal use of FLT_C for angle-
-;       reduction bookkeeping silently clobbered the parked "20" before
-;       the addition could complete. Fixed with a new, genuinely
-;       dedicated CORDIC_C scratch (RAM map +4 bytes); FLT_C is now
-;       exclusively prec_engine_f's, as originally intended.
-;     - BUG FOUND (this session): DO_SIN_FUNC/DO_COS_FUNC are reached
-;       via a tail-call chain (EXPR2's E2_FUNC_CALL does "jmp [bx+2]",
-;       not "call"), so SI still holds the real parse position from the
-;       enclosing expression parser on entry, and whoever called the
-;       chain expects it to still hold that position whenever control
-;       eventually returns. CORDIC_PICK (uses SI as an ordinary
-;       parameter) and FX14_TO_FLT (uses SI as its own scratch) both
-;       clobbered it with no relation to the real parse position, so any
-;       function nested inside another function's argument -- not just
-;       SIN/COS, but anything wrapping them, e.g. ABS(SIN(X)) -- broke
-;       the outer call's own closing-paren check with a syntax error.
-;       Fixed by saving the real SI once at DO_SIN_FUNC/DO_COS_FUNC's
-;       entry and restoring it right before their own RET (calling
-;       FX14_TO_FLT properly rather than tail-calling into it, since a
-;       tail-call would clobber SI again after the restore).
-;     - BUG FOUND (this session, pre-existing, not specific to SIN/COS):
-;       DP_TAB's TAB(n) column loop used a bare 8086 LOOP instruction
-;       with no guard for CX=0 or CX negative on entry. LOOP decrements
-;       CX BEFORE testing it, so TAB(0) wrapped CX to 0xFFFF and printed
-;       65536 spaces instead of zero; TAB of any negative value did the
-;       same (negative int16, reinterpreted as unsigned CX, is a huge
-;       count). This is exactly the kind of value SIN(X) produces
-;       routinely (any angle where 20+19*SIN(X) rounds to exactly 0, or
-;       a TAB argument that's simply negative) -- found via emulated
-;       stress-testing the showcase's sine-wave section, where several
-;       iterations silently produced ~65 KB of spurious spaces. Fixed by
-;       treating any count <= 0 as zero spaces before entering the loop.
-;     - BUG FOUND (this session, structural): PREC_ENGINE_F's LHS park
-;       used a single fixed scratch location, FLT_C, but the routine
-;       recurses into ITSELF across precedence levels (expr_add's RHS
-;       sub-call is expr1, itself prec_engine_f-based for the multiply
-;       level) -- "9-1*1" needs the multiply level's own park active
-;       (for "1") while the add level's park is still pending (for "9").
-;       The inner park silently clobbered the outer one before the
-;       outer subtraction could read it back; "9-1*1" computed 0
-;       instead of 8, and the Mandelbrot showcase's own A*A-B*B+C went
-;       wrong for exactly this reason. Found by bisecting a wrong pixel
-;       in a medium-scale Mandelbrot stress test down to this minimal
-;       reproduction. Fixed by parking the LHS on the real CPU stack
-;       instead of a fixed location -- naturally reentrant, since each
-;       nested call gets its own 4 bytes. PARK_FLT_C/UNPARK_FLT_C
-;       deleted (no longer needed); DO_FOR's own, separate, genuinely
-;       non-nested use of FLT_C as a STEP-parsing stash is unaffected
-;       and kept.
-;     - SHOWCASE_DATA replaced end to end: the old integer/fixed-point
-;       Mandelbrot demo is gone, replaced with a program that actually
-;       exercises v2.0/v2.1's new capabilities -- float arithmetic with
-;       multi-item PRINT, all four relational operators, FOR/NEXT
-;       (including float STEP, exercised separately elsewhere), GOSUB/
-;       RETURN, a sine wave drawn with SIN(x) driving TAB(n), and a
-;       floating-point Mandelbrot (native MBF4 arithmetic, no fixed-
-;       point scaling needed at all, unlike the old demo). Validated by
-;       typing the equivalent plain-text BASIC into the real simulator
-;       end to end before hand-encoding the tokenised SHOWCASE_DATA
-;       bytes, then re-decoding those bytes back into BASIC text and
-;       diffing against the validated source to catch transcription
-;       errors before relying on them.
-;     - BUG FOUND (this session, unrelated to the showcase content
-;       itself, exposed only because the file had grown enough to hit
-;       it): the YASM/8bitworkshop branch's reset-vector padding,
-;       "times 0x7F0-($-start) db 0xFF", was a stale fixed constant
-;       left over from when the file was much smaller -- 0x7F0 has no
-;       relationship to RESET_VEC's real required position under YASM
-;       (it's reached only via the trampoline's "mov ax,reset_vec",
-;       never a hardcoded address, so there never was a real constraint
-;       to calibrate this padding against). Assembling under a NASM
-;       __YASM_MAJOR__ proxy failed with "TIMES value negative" once
-;       the v2.0/v2.1 growth (float library, CORDIC, larger showcase)
-;       pushed past the old budget. Removed the padding entirely rather
-;       than recalibrating to a new fixed number that would only go
-;       stale again next time the file grows.
-;   v2.0   (2026-06-23)  MERGE: integrated mbfloat_v14.asm MBF4 float library;
-;     ROM widened 2 KB -> 4 KB (2732), RAM widened 2 KB -> 4 KB.
-;     - RAM map rebuilt: VARS now 26 x 4-byte float slots (was 2-byte int);
-;       FOR_STK frames widened to 12 bytes (var_ptr:2+limit:4+step:4+
-;       loop_ptr:2); FLT_A/FLT_B/FLT_SA/FLT_SB/FLT_ER/FLT_DE/FLT_DB placed
-;       after VARS, ahead of RUNNING/PROG_END/PROGRAM. Old mbfloat RAM map
-;       collided with this file's PROGRAM store and IBUF; not reused as-is.
-;     - mbfloat's test harness, duplicate output/putchar/getchar/new_line,
-;       and its own reset vector deleted (this file's ROM-variant I/O and
-;       reset_vec are the only copies kept).
-;     - mbfloat's fdiv_by_zero no longer prints "DIV0!" to the console;
-;       it now raises ERR_OV (?2) via this file's do_error, matching the
-;       language reference's documented divide-by-zero behaviour.
-;     - expr2's numeric-literal path (was input_number, int-only) replaced
-;       by flt_parse. e2_var/var_store widened to 4-byte float load/store.
-;       e2_neg now calls flt_negate. do_for/do_next frames and comparisons
-;       widened to float (limit/step are float; var += step via flt_add;
-;       exit test via flt_cmp). do_input's final parse is flt_parse.
-;     - prec_engine's arithmetic dispatch (expr_add/expr1 levels) now calls
-;       flt_add/flt_sub/flt_mul/flt_div instead of math_add/math_sub/
-;       math_mul/math_div; LHS is parked in FLT_C (new 4-byte scratch)
-;       across RHS evaluation instead of a 2-byte stack push.
-;     - expr_bitwise level (& | ^) and expr's own relational accumulation
-;       stay int16: each float operand is truncated via flt_to_int on the
-;       way in; bitwise results are promoted back via flt_from_int on the
-;       way out. Relational truth value (0/-1) is unchanged (never a
-;       float).
-;     - PEEK/POKE/OUT/IN/TAB()/CHR$()/ABS()/NOT() arguments truncated to
-;       int16 via flt_to_int at eat_paren_expr's call sites; RND(n)'s
-;       limit likewise. ABS() result re-promoted via flt_abs (float-
-;       native, replaces old do_abs_func). do_goto/do_gosub/do_list's
-;       range parse truncate their expr() result to int16 (line numbers
-;       are always integer).
-;     - do_print's numeric path swapped from output_number to flt_print.
-;       output_number kept (still used for line numbers in do_error/LIST).
-;     - BUG FIX (mbfloat_v14.asm, pre-existing): flt_parse's decimal-point
-;       path double-decremented SI after calling parse_frac, which already
-;       un-consumes its own terminator -- silently truncated every value
-;       with a fractional part by treating the next char as already
-;       consumed (e.g. "1.5+2.25" parsed as just "1.5", dropping "+2.25"
-;       entirely since the truncated SI position made the addition
-;       operator invisible to the level above). Found via emulated
-;       end-to-end testing (Unicorn), not visible from static review.
-;       See flt_parse/fpar_chk_dot's own comments for the fix.
-;     - BUG FIX (v2.0 merge, this file): prec_engine_f's .found case
-;       called park_flt_c (which clobbers DI as a side effect) and then
-;       relied on DI still holding the next-precedence-level function
-;       pointer for the immediately following 'call di' -- it didn't,
-;       so the RHS of every +/-/*//'% expression actually executed
-;       whatever garbage code happened to live at FLT_C's address.
-;       Fixed by reloading DI from [bp] after the call. (park_flt_c/
-;       unpark_flt_c and the FLT_C-based park described here were later
-;       replaced entirely in v2.1 -- see PREC_ENGINE_F's own header for
-;       why FLT_C couldn't safely hold this once nested expressions
-;       were tested.)
-;   v1.7.5 (2026-05-12)  Bug fixes and size optimisations:
-;     - Updated Showcase tokens and rmeoved spaces
-;     - LIST: clean up before/after token spaces
-;     - Removed dead dw 0 sentinel after step_tab (2 bytes saved).
-;     - kw_match: removed redundant '_' boundary check (3 bytes saved).
-;     - do_for: stack overflow now reports ERR_OM (?3) not ERR_SN (?0).
-;     - get_var_addr: removed redundant double-read of [SI].
-;     - Subroutine headers normalised; formatting pass throughout.
-;   v1.7.4 (2026-05-09)  [archived as uBASIC8088-v1.7.4.asm]
-;     eat_paren_expr bugfix.  Size optimisations: STMT dispatcher,
-;     DO_LET/DO_INPUT shared sections.  Added ^ XOR bitwise, NOT()/RND().
-;     Removed INT 0/2h vectors for space.
-;   v1.7.3 (2026-05-09)  eat_paren_expr bugfix, size optimisations.
-;   v1.7.2 (2026-05-02)  Refactored operator table, added & | bitwise ops.
-;     Added PRINT TAB() and ABS(); fixed NEXT error; multi-statement : fixes.
-;   v1.7.1 (2026-05-02)  Size optimisation (11 bytes saved, 67->78 bytes free).
-;   v1.7.0 (2026-05-01)  LIST range, EXPR2 function dispatch table refactor.
-;   v1.6.1 (2026-04-30)  Fix sbb ax,ax clobbering flags before jl (all signed
-;     comparisons were wrong).  Showcase tokens updated for TK_OUT insertion.
-;   v1.6.0 (2026-04-26)  Added IN / OUT; statement dispatch refactor.
-;   v1.5.0 (2026-04-23)  ROM target: bitbang UART, IVT, reset stub, bdly.
-;   v1.4.0 (2026-04-19)  FOR/NEXT/STEP; 4-entry FOR stack; error ?6.
-;   v1.3.1 (2026-04-17)  LIST CR+LF fix; showcase in tokenised form.
-;   v1.3.0 (2026-04-17)  Tokeniser + line-editor refactor.
-;   v1.2.0 (2026-04-17)  GOSUB / RETURN; 8-entry stack; error ?5.
-;   v1.1.0 (2026-04-17)  Bug fixes (relational xor, do_new, tinyasm compat).
-;   v1.0.0 (2026-04-09)  First release: 8088 port of uBASIC 65c02 v17.0.
+; v2.2 (2026-06-30)
+;   - Floating-point relational operators now compare native MBF4 values.
+;   - Fixed LIST token handling for THEN, TO and STEP.
+;   - Fixed GOSUB stack overflow reporting.
+;   - Updated banner and documentation.
 ;
-;   MBF4 float library merge source: mbfloat_v14.asm v0.6-v0.14 history is
-;   retained in full further down, immediately above the spliced-in library
-;   code, so the provenance of every float routine stays traceable.
+; v2.1 (2026-06-25)
+;   - Added SIN() and COS() using a shared fixed-point CORDIC engine.
+;   - Added CORDIC RAM workspace and angle-reduction support.
+;   - Fixed nested-expression reentrancy in the floating-point evaluator.
+;   - Fixed FOR/NEXT stack corruption.
+;   - Fixed nested function-call parsing.
+;   - Fixed TAB(0) and negative TAB() behaviour.
+;   - Replaced the showcase program with floating-point demonstrations.
+;   - Miscellaneous ROM optimisations.
+;
+; v2.0 (2026-06-23)
+;   - Integrated the MBF4 floating-point library.
+;   - Expanded ROM and RAM from 2 KB to 4 KB.
+;   - Converted variables, arithmetic and FOR/NEXT to floating point.
+;   - Updated BASIC functions and I/O to use MBF4 where appropriate.
+;   - Unified floating-point error handling with BASIC runtime errors.
+;   - Fixed merge-related parser and expression-evaluation issues.
+;
+; v1.7.5 (2026-05-12) 2kByte Tiny BasicSigned 16bit
 ; =============================================================================
+
 
         cpu 8086
 
@@ -350,19 +89,10 @@
 ORIGIN:         equ 0xF000              ; ROM base (also YASM segment)
 RAM_BASE:       equ 0x0000
 
-%ifdef __YASM_MAJOR__                   ; 8bitworkshop: YASM defines this
 RAM_SIZE:       equ 4096                ; 4 KB address space
-%else
-RAM_SIZE:       equ 4096                ; 4 KB RAM (2732 ROM variant)
-%endif
 
 ; =============================================================================
 ; RAM LAYOUT  (all offsets relative to RAM_BASE)
-; v2.0: rebuilt for MBF4 float merge. VARS widened to 4 bytes/slot;
-; FOR_STK frames widened to 12 bytes/slot (var_ptr:2+limit:4+step:4+
-; loop_ptr:2). Float scratch (FLT_SA..FLT_B) placed after VARS, ahead of
-; RUNNING/PROG_END/PROGRAM -- mbfloat_v14's own RAM map (FLT_A at 0x00C0)
-; collided with this file's PROGRAM store and IBUF and was not reused.
 ; =============================================================================
 
 DIV0:           equ RAM_BASE + 0x000    ; 4 bytes : divide-by-zero IVT entry
@@ -1013,16 +743,6 @@ dp_top:
 ; bit-7-terminated ROM string up to its terminator -- also called
 ; directly (not just reached via fallthrough) by DO_FREE and by the
 ; boot banner to print a ROM string standalone.
-; Note on returning: the bit-7-terminated path's last character exits
-; via "jmp output" (a tail-call), not an explicit ret -- OUTPUT's own
-; ret then pops whatever return address CALL DP_STR pushed, so control
-; correctly reaches the real caller's next instruction with no extra
-; overhead. Verified by tracing actual execution under the real
-; simulator (sim_rom --trace), not assumed from the byte layout: this
-; is exactly the kind of control-flow trick that looks like it might
-; skip the caller's next instruction on a first read and does not.
-; Inputs  : SI -> string text (quoted body, or bit-7-terminated ROM text)
-; Outputs : (none); SI advanced past the string
 ; Clobbers: AX, SI
 dp_str:
         lodsb
@@ -1191,20 +911,7 @@ spaces:
 
 ; =============================================================================
 ; EXPR  evaluate expression including relational operators
-; v2.0: ALWAYS returns float in FLT_A (this is the key correctness fix --
-; LET A = 3.14 must not lose precision just because LET's value happens
-; to flow through the same entry point that also handles X<Y). When a
-; relational operator IS present, the 0/-1 boolean result is promoted to
-; float via flt_from_int, same as any other value -- do_if is the only
-; caller that needs an int16 boolean and is responsible for truncating
-; FLT_A back via flt_to_int itself (see do_if).
-; Returns true = -1.0, false = 0.0 (as floats, when a relational op is
-; used; otherwise just the arithmetic/bitwise result, also as a float).
-; v2.2 BUG FIX: relational comparison now uses flt_cmp (float-native) instead
-; of truncating both operands to int16 first. The old int16 path made
-; "1.5>1.2" return false (both truncate to 1, compare equal). LHS is now
-; parked on the stack as a 4-byte float across the operator scan and RHS
-; eval, then flt_cmp replaces the old "cmp bx,ax" integer compare.
+; v2.0: ALWAYS returns float in FLT_A 
 ; Inputs  : SI -> expression text
 ; Outputs : FLT_A = result
 ; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B
@@ -1222,9 +929,6 @@ expr:
         ret                      ; no relational operator: FLT_A already
                                   ; holds the correct (float) result
 .has_rel:
-        ; Park LHS as float on the real stack (4 bytes).
-        ; GOTCHA: must NOT truncate to int16 here -- that was the v2.1 bug
-        ; where "1.5>1.2" compared 1 vs 1 and returned false.
         push word [FLT_A+2]
         push word [FLT_A+0]
 
@@ -1304,14 +1008,10 @@ bitwise_xor:
 
 ; =============================================================================
 ; EXPR_BITWISE  bitwise level (& | ^), lowest precedence among binary ops.
-; v2.0: ALWAYS returns float in FLT_A, same correctness fix as expr above.
-; expr_add's float result is left completely untouched when no & | ^
-; operator follows (the overwhelmingly common case) -- only when a
-; bitwise operator IS present does this truncate to int16, run the
+; v2.0: ALWAYS returns float in FLT_A, left  untouched when no & | ^
+; operator follows (thecommon case) -- only when a
+; bitwise operator IS present is  this truncate to int16, run the
 ; integer op, and promote the result back to float before returning.
-; No BASIC dialect has float bitwise operators, so truncation for the
-; operator itself is correct; the bug v2.0 fixes is unconditionally
-; truncating even when no operator was there to require it.
 ; Inputs  : SI -> expression text
 ; Outputs : FLT_A = result
 ; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B, FLT_C
@@ -1518,10 +1218,6 @@ e2_func_call:
 
 ; =============================================================================
 ; EAT_PAREN_EXPR  parse '(' <expr> ')' -> FLT_A
-; v2.0: float-returning (was AX). expr now always returns float in FLT_A
-; directly (see expr's own header), so bitwise/relational operators may
-; still be nested inside a function argument exactly as in v1.x (e.g.
-; PEEK(A&15), CHR$(X>Y)) with no extra promotion step needed here.
 ; Inputs  : SI -> '('
 ; Outputs : FLT_A = expression value, SI advanced past ')'
 ; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B, FLT_C
@@ -1807,30 +1503,7 @@ num_space:
 ;
 ; Four single-character output routines sharing one tail. Each may be
 ; called directly by name for its own character; the fallthrough chain
-; between them is an internal size optimisation, not part of the public
-; calling convention -- each is independently callable and documented
-; below with its own Inputs/Outputs/Clobbers.
-;
-; The "db 0x3D" bytes are NOT executed as their own instruction when
-; falling through. 0x3D is the opcode for "CMP AX,imm16" (3 bytes total:
-; opcode + 2-byte immediate); placed immediately before the next
-; routine's "mov al,imm8" (2 bytes), the CPU decodes db+mov as a single
-; 3-byte CMP that consumes -- and discards the effect of -- that next
-; "mov al,imm8" whole. CMP only sets flags, so the net effect of each
-; fallthrough hop is "skip the next routine's mov al,X instruction
-; entirely, leaving AL exactly as the PREVIOUS routine set it" -- which
-; is exactly what NEW_LINE wants: it sets AL=0x0A and the chain must
-; skip QUESTION's, BACKSP's, and OUTPUT_SPACE's own mov al,X instructions
-; (which would each overwrite AL with the wrong character) without the
-; extra bytes a real conditional/unconditional jmp past each one would
-; cost. The chain lands on OUTPUT_SPACE's "jmp output" tail with AL
-; untouched since NEW_LINE set it. Confirmed by single-instruction trace
-; under the real simulator (sim_rom --trace) rather than assumed from
-; the byte layout alone -- a byte-counting-only read of this block looks
-; at first glance like it should skip QUESTION and BACKSP's bodies AND
-; OUTPUT_SPACE's own "mov al,' '", which would be correct only if the
-; final landing point is OUTPUT_SPACE's "jmp output" tail and not its
-; "mov al,' '" head; it is the former, verified at runtime.
+; between them is an internal size optimisation
 ; =============================================================================
 ; NEW_LINE
 ; Inputs  : (none)
@@ -1840,14 +1513,14 @@ new_line:
         mov  al, 0x0D
         call output
         mov  al, 0x0A
-        db   0x3D
+        db   0x3D	; consume next2 bytes
 ; QUESTION
 ; Inputs  : (none)
 ; Outputs : '?'
 ; Clobbers: AX
 question:
         mov  al, '?'
-        db   0x3D
+        db   0x3D ; consume next2 bytes
 ; BACKSP
 ; Inputs  : (none)
 ; Outputs : backspace (0x08)
@@ -2560,15 +2233,8 @@ tk_kw_tab:
         dw kw_help, kw_gosub, kw_return
         dw kw_for, kw_next, kw_out, kw_delay
         dw kw_then, kw_to, kw_step     ; v2.2: sub-keywords now tokenized
-        dw 0    ; GOTCHA: required sentinel -- tk_try's scan loop (see
-                ; STMT/tokeniser) walks this table until it reads a
-                ; zero word. The three sub-keyword entries above are
-                ; BEFORE the sentinel so tk_try will match them; they
-                ; are AFTER the 19 statement entries so get_token_ptr
-                ; (used by stmt's token fast-path) never reaches them --
-                ; stmt's own upper-bound check (cmp al, TK_PRINT+NUM_TOKENS)
-                ; rejects TK_THEN/TK_TO/TK_STEP before dispatching.
-
+        dw 0    ; GOTCHA: required sentinel 
+        
 ; Sub-keyword pointer entries.
 ; then_tab/to_tab/step_tab double as a detokenizer table for do_list:
 ;   [then_tab + (token - TK_THEN) * 2]  -> correct kw_* pointer.
@@ -2670,18 +2336,6 @@ func_tab:
 ;
 ; v2.0 MERGE-TIME CHANGES TO THIS LIBRARY (everything else below this
 ; header is byte-for-byte mbfloat_v14.asm's library body):
-;   - fdiv_by_zero rewritten: no longer prints "DIV0!" and returns 0.0;
-;     now raises ERR_OV via uBASIC's do_error (?2), matching int divide
-;     by zero's existing behaviour. s_div0 string deleted (no longer
-;     referenced).
-;   - output_int, print_sz, new_line deleted: each was used only by (a)
-;     mbfloat's own test harness (deleted entirely) or (b) the old
-;     fdiv_by_zero console message (deleted above) -- flt_print never
-;     calls any of the three. uBASIC's own output/new_line/dp_str are
-;     used everywhere a float routine needs to emit a character.
-;   - putchar/getchar/output (BIOS INT 10h teletype) deleted: duplicates
-;     of uBASIC's own bitbang-UART routines of the same name, which are
-;     the only copies kept.
 ;
 ; NOTE ON LAYOUT (unchanged from mbfloat_v14.asm): small helpers
 ; (flt_zero, norm_pack, flt_negate, flt_b_to_a, flt_abs, copy helpers)
@@ -3851,11 +3505,8 @@ pfrac_end:
 ; =============================================================================
 do_usr_func:
         call flt_to_int         ; AX = int16(FLT_A) = call address
-        call usr_call_hlp       ; CALL (not JMP) so we return here after
+        call ax       ; CALL (not JMP) so we return here after
         jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
-usr_call_hlp:
-        jmp  ax                 ; tail-call into user routine; its own RET
-                                 ; returns to usr_call_hlp's caller (above)
 
 ; =============================================================================
 ; CORDIC SIN/COS  (v2.1)
@@ -3978,14 +3629,6 @@ fx14_to_flt:
         jmp  flt_div             ; tail-call: FLT_A /= 16384.0
 
 ; =============================================================================
-; CORDIC_REDUCE  reduce FLT_A (any-magnitude radians) to r in [0,PI/2)
-; and report the quadrant.
-; GOTCHA: uses its own dedicated CORDIC_C scratch, not FLT_C -- see
-; FLT_C's RAM-map comment for why.
-; Inputs  : FLT_A = angle in radians
-; Outputs : FLT_A = reduced angle r in [0,PI/2); AL = quadrant (0-3)
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, CORDIC_C
-; =============================================================================
 ; LOAD_CONST_B  copy a 4-byte ROM float constant into FLT_B.
 ; Shared tail for CORDIC_REDUCE's four same-shaped constant loads (was
 ; inlined 4 times at ~13 bytes each; SI is never live across any of
@@ -4002,6 +3645,14 @@ load_const_b:
         movsw
         ret
 
+; =============================================================================
+; CORDIC_REDUCE  reduce FLT_A (any-magnitude radians) to r in [0,PI/2)
+; and report the quadrant.
+; GOTCHA: uses its own dedicated CORDIC_C scratch, not FLT_C -- see
+; FLT_C's RAM-map comment for why.
+; Inputs  : FLT_A = angle in radians
+; Outputs : FLT_A = reduced angle r in [0,PI/2); AL = quadrant (0-3)
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, CORDIC_C
 cordic_reduce:
         ; CORDIC_C = original angle (need it twice: once /2pi for the
         ; quotient, once again for the final subtract)
@@ -4203,24 +3854,10 @@ do_cos_func:
 ROM_END:
 
 ; =============================================================================
-; RESET VECTOR  at 0xFFF0
+; RESET VECTOR  at 0xFFF0 - ROM version
 ; 8086 resets to CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 ; =============================================================================
-%ifdef __YASM_MAJOR__
-        ; v2.1: no padding needed here. RESET_VEC is reached only via
-        ; the trampoline's "mov ax,reset_vec / jmp ax" (see the top of
-        ; this file), never via a hardcoded address -- the old
-        ; "times 0x7F0-($-start) db 0xFF" padding that used to sit here
-        ; was calibrated to land RESET_VEC at a fixed offset purely for
-        ; symmetry with the ROM build's real hardware reset vector,
-        ; which YASM/8bitworkshop has no equivalent requirement for. It
-        ; went stale and started failing ("TIMES value negative") once
-        ; the v2.0/v2.1 additions (float library, CORDIC, larger
-        ; showcase) grew the file well past the budget it assumed.
-        ; Removed rather than recalibrated to a new fixed number, since
-        ; any fixed number here will go stale again the next time the
-        ; file grows.
-%else
+%ifndef __YASM_MAJOR__
         org 0xFFF0
         cld
 %endif
@@ -4233,7 +3870,7 @@ reset_vec:
         out  PORT_A, al
 
 %ifdef __YASM_MAJOR__
-        jmp  start
+        jmp  start	; same segment
 %else
         ; FAR JMP to CS=0xF000 IP=0x0000  (opcode: EA 00 00 00 F0)
         db   0xEA
