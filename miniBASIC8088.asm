@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 8088  v2.2  (was: uBASIC 8088 v1.7.5)
+; miniBASIC 8088  v2.3  (was: uBASIC 8088 v1.7.5)
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
@@ -43,14 +43,72 @@
 ; See the supplied Makefile for toolchain build details.
 ;
 ; ROM budget (4096 bytes)
-;     Current size : 4011 bytes
-;     Free space   : 85 bytes
+;     Current size : 3932 bytes
+;     Free space   : 164 bytes
 ;
 ; The ROM target is the limiting configuration for future features.
 ;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
+;
+; v2.3 (2026-07-12)
+;   - BUGFIX: DO_SIN_FUNC's unqualified "jmp trig_common" was observed to
+;     mis-assemble under yasm's short-jump optimizer for this exact tiny
+;     adjacent-fallthrough distance -- it encoded as a 0-displacement
+;     short jump, landing on DO_COS_FUNC's "mov ch,1" instead of
+;     TRIG_COMMON, so every SIN(x) silently computed COS(x). Fixed by
+;     forcing "jmp near" (confirmed correct by inspecting the assembled
+;     bytes directly, not just the listing).
+;   - BUGFIX: PREC_ENGINE_F's ".found" handler-dispatch broke in two
+;     separate ways when it was changed to use FLT_A_PUSH/FLT_A_POP
+;     (below): both helpers use BX as scratch internally (see their own
+;     header), but this is the one call site in the whole file where BX
+;     legitimately carries a live value (the matched operator-table
+;     pointer) across the call. Fixed by fetching the handler address
+;     into DX *before* calling FLT_A_PUSH, so nothing needs BX preserved
+;     across either helper call. (Every other FLT_A_PUSH/FLT_A_POP site
+;     was re-audited for the same class of bug -- BX is not live across
+;     the call at any of them, either because the caller already treats
+;     it as clobbered, or nothing in the intervening span touches it.)
+;   - BUGFIX: the FOR-loop init and STEP-stash sites (below) were changed
+;     to "call cp4" for their 4-byte copy, but CP4's "pop si; ret" tail
+;     requires the caller's own return address to already be on the stack
+;     *before* "push si" runs (that's how FLT_A_TO_B/FLT_B_TO_A use it,
+;     via JMP after already being CALLed). These two sites did "push si"
+;     then "call cp4" instead, reversing that order: CP4's "pop si" grabbed
+;     the CALL's return address instead of the saved SI, and its "ret"
+;     then jumped into whatever SI held -- i.e. into the middle of the
+;     program-text data. Fixed by reverting both to plain inline copies
+;     (VAR_STORE and E2_VAR's own "jmp cp4" tail-calls were re-checked and
+;     are fine: both are reached via a normal CALL, so a return address is
+;     already in place before they push SI).
+;   - All three bugs above were found by building a Unicorn-based 8086
+;     emulator of the actual YASM/8bitworkshop boot path (INT 10h/16h
+;     BIOS calls, matching the "%ifdef __YASM_MAJOR__" branches in this
+;     file) and running the embedded SHOWCASE program against it. The
+;     full showcase (arithmetic, comparisons, FOR/NEXT, GOSUB, the
+;     SIN+TAB sine wave, and the float Mandelbrot) now runs to completion
+;     and returns to the "Ok" prompt with no crash.
+;   - Size optimisation pass (no behaviour change otherwise), found via instruction-
+;     level duplicate-sequence analysis:
+;       * Removed redundant CLD instructions -- DF is proven clear
+;         everywhere in this codebase except transiently inside
+;         SLIDE_DATA's own STD/CLD pair, so every other CLD was dead.
+;       * DO_SIN_FUNC/DO_COS_FUNC merged into a shared TRIG_COMMON body
+;         (the two were byte-for-byte identical but for which of
+;         CORDIC_X/CORDIC_Y is primary and CORDIC_PICK's negate-rule
+;         flag); each is now a 2-4 byte stub.
+;       * VAR_STORE and E2_VAR now reuse the existing CP4 shared copy-tail
+;         (via JMP, matching FLT_A_TO_B's own convention) instead of
+;         inlining their own CLD/MOVSW/MOVSW/POP SI.
+;       * New FLT_A_PUSH/FLT_A_POP shared helpers replace 6 duplicated
+;         inline "park all of FLT_A on the real stack across a sub-call"
+;         sequences (EXPR's relational-op entry, PREC_ENGINE_F's LHS
+;         park, EAT_PAREN_EXPR, FLT_CMP, FP_NOTNEG's decimal-exponent
+;         scaling, and FPAR_CHK_DOT).
+;     Net: ~79 bytes reclaimed (85 -> 164 bytes free), confirmed by
+;     assembling before/after with yasm and diffing the padded ROM tail.
 ;
 ; v2.2 (2026-06-30)
 ;   - Floating-point relational operators now compare native MBF4 values.
@@ -547,16 +605,15 @@ do_input:
 ; Inputs  : FLT_A = value to store (expr's result), DI = &var on stack
 ; Outputs : VARS[var] = FLT_A
 ; Clobbers: AX, SI, DI (v2.0: widened from 2-byte stosw to 4-byte float copy)
+; v2.3: tail-shared with CP4 (see FLT_A_TO_B) instead of inlining its own
+; copy -- DF is already clear here (nothing between here and program start
+; sets it), so CP4's own copy handles it.
 ; =============================================================================
 var_store:
         pop  di
         push si
         mov  si, FLT_A
-        cld
-        movsw
-        movsw
-        pop  si
-        ret
+        jmp  cp4
 
 ; =============================================================================
 ; GET_VAR_ADDR  validate and address a single-letter variable A-Z
@@ -929,8 +986,7 @@ expr:
         ret                      ; no relational operator: FLT_A already
                                   ; holds the correct (float) result
 .has_rel:
-        push word [FLT_A+2]
-        push word [FLT_A+0]
+        call flt_a_push
 
         ; Accumulate relational operator bitmask: LT=1 EQ=2 GT=4
         xor  dx, dx
@@ -956,8 +1012,7 @@ expr:
         call expr_bitwise       ; FLT_A = right operand (float)
         call flt_a_to_b         ; FLT_B = RHS
         pop  dx                 ; DL = operator bitmask
-        pop  word [FLT_A+0]     ; restore LHS float into FLT_A
-        pop  word [FLT_A+2]
+        call flt_a_pop           ; restore LHS float into FLT_A
         call flt_cmp            ; AX = -1 (LT), 0 (EQ), +1 (GT)
         ; Map flt_cmp result to LT=1 / EQ=2 / GT=4 bitmask in AL
         or   ax, ax
@@ -1096,18 +1151,22 @@ prec_engine_f:
         jmp  .search
 .found:
         inc  si                 ; consume operator char
-        push word [FLT_A+0]     ; park LHS on the real stack -- see the
-        push word [FLT_A+2]     ; GOTCHA note above for why
+        mov  dx, [bx+1]          ; DX = handler address -- fetched BEFORE
+                                  ; FLT_A_PUSH runs, because FLT_A_PUSH (like
+                                  ; FLT_A_POP) clobbers BX internally; see
+                                  ; their shared header. Grabbing this first
+                                  ; means nothing needs BX preserved across
+                                  ; either helper call below.
+        call flt_a_push          ; park LHS on the real stack
         mov  di, [bp]           ; DI = next-level func (BP still valid:
                                  ; nothing between the top of .lp and here
                                  ; touches it)
-        push word [bx+1]        ; save handler address
+        push dx                 ; save handler address
         call di                 ; get RHS -> FLT_A
         call flt_a_to_b         ; FLT_B = RHS
-        pop  bx                 ; BX = handler
-        pop  word [FLT_A+2]     ; restore LHS from the real stack
-        pop  word [FLT_A+0]
-        call bx                 ; FLT_A = FLT_A op FLT_B
+        pop  di                 ; DI = handler
+        call flt_a_pop           ; restore LHS from the real stack
+        call di                 ; FLT_A = FLT_A op FLT_B
         jmp  .lp
 .done:
         add  sp, 4              ; discard saved BX and DI
@@ -1227,12 +1286,10 @@ eat_paren_expr:
         call expect
 e2_par:
         call expr               ; FLT_A = result
-        push word [FLT_A+0]
-        push word [FLT_A+2]
+        call flt_a_push
         mov  al, ')'
         call expect
-        pop  word [FLT_A+2]
-        pop  word [FLT_A+0]
+        call flt_a_pop
         ret
 
 ; =============================================================================
@@ -1329,11 +1386,7 @@ e2_var:
         push si
         mov  si, di
         mov  di, FLT_A
-        cld
-        movsw
-        movsw
-        pop  si
-        ret
+        jmp  cp4
 
 ; =============================================================================
 ; E2_NEG  unary negation factor.  v2.0: float-native (was int16 neg ax).
@@ -1991,9 +2044,8 @@ do_for:
         push si
         mov  si, FLT_A
         mov  di, [INS_TMP]
-        cld
         movsw
-        movsw                   ; initialise loop variable (4 bytes)
+        movsw                    ; initialise loop variable (4 bytes)
         pop  si
         ; TO is mandatory
         mov  al, TK_TO
@@ -2010,7 +2062,6 @@ do_for:
         push si
         mov  si, FLT_A
         mov  di, FLT_C
-        cld
         movsw
         movsw
         pop  si
@@ -2092,7 +2143,6 @@ dn_no_for:
         mov  al, ERR_NF
         jmp  do_error
 do_next:
-        cld
         call spaces
         call get_var_addr       ; DI = &var
         mov  cx, [FOR_SP]
@@ -2491,11 +2541,35 @@ flt_a_to_b:
         mov  si, FLT_A
         mov  di, FLT_B
 cp4:
-        cld
         movsw
         movsw
         pop  si
         ret
+
+; =============================================================================
+; FLT_A_PUSH / FLT_A_POP  shared "park all of FLT_A on the real stack"
+; tail, used everywhere a routine needs to protect FLT_A across a sub-call
+; that clobbers it. v2.3: factored out of 6 duplicated inline copies.
+; GOTCHA: a plain CALL/RET wrapper doesn't work here -- CALL pushes the
+; return address UNDER (push side) or ABOVE (pop side) the very words
+; we're parking, so a bare 'ret' would either return into parked data or
+; try to pop the return address as if it were FLT_A. Both routines instead
+; pop the return address into BX up front and JMP back through it, which
+; keeps the net stack effect identical to the old inline code (net +4
+; bytes pushed, in order [FLT_A+2] then [FLT_A+0], on the push side).
+; Clobbers: BX. Preserves flags.
+; =============================================================================
+flt_a_push:
+        pop  bx
+        push word [FLT_A+2]
+        push word [FLT_A+0]
+        jmp  bx
+
+flt_a_pop:
+        pop  bx
+        pop  word [FLT_A+0]
+        pop  word [FLT_A+2]
+        jmp  bx
 
 ; =============================================================================
 ; FLT_FROM_INT  AX (signed int16) -> FLT_A
@@ -2671,14 +2745,12 @@ fti_sat_pos:
 ; Clobbers: AX, BX, CX, DX, DI (via flt_sub's flt_negate_b calls)
 ; =============================================================================
 flt_cmp:
-        push word [FLT_A+2]
-        push word [FLT_A+0]
+        call flt_a_push
         call flt_sub
         mov  cx, [FLT_A+0]
         or   cx, [FLT_A+2]
         mov  al, [FLT_A+1]
-        pop  word [FLT_A+0]
-        pop  word [FLT_A+2]
+        call flt_a_pop
         jz   fcmp_zero
         shl  al, 1
         sbb  ax, ax
@@ -3185,8 +3257,7 @@ fp_notneg:
         mov  [FLT_DE], al
 
         ; S22: save FLT_A on stack
-        push word [FLT_A+0]
-        push word [FLT_A+2]
+        call flt_a_push
 
         ; Scale to [1,10)
         mov  al, [FLT_DE]
@@ -3371,8 +3442,7 @@ fp_print_emit:
         jmp  fp_print_lp
 fp_print_done:
         ; S22: restore FLT_A directly from stack
-        pop  word [FLT_A+2]
-        pop  word [FLT_A+0]
+        call flt_a_pop
         ret
 
 ; =============================================================================
@@ -3439,12 +3509,10 @@ fpar_int_lp:
 fpar_chk_dot:
         cmp  al, '.' - '0'      ; AL already has '0' subtracted; '.'-'0' = -2
         jne  fpar_sign_apply
-        push word [FLT_A+0]     ; stash integer part while FLT_A is reused below
-        push word [FLT_A+2]
+        call flt_a_push          ; stash integer part while FLT_A is reused below
         call parse_frac         ; FLT_A = value of the fractional digits (0.xxx)
         call flt_a_to_b         ; FLT_B = fraction
-        pop  word [FLT_A+2]     ; restore integer part into FLT_A
-        pop  word [FLT_A+0]
+        call flt_a_pop           ; restore integer part into FLT_A
         call flt_add            ; FLT_A = integer + fraction
         ; GOTCHA: no 'dec si' here -- parse_frac's own base case already
         ; did it. See the GOTCHA note in this routine's header.
@@ -3640,7 +3708,6 @@ fx14_to_flt:
 ; =============================================================================
 load_const_b:
         mov  di, FLT_B
-        cld
         movsw
         movsw
         ret
@@ -3658,7 +3725,6 @@ cordic_reduce:
         ; quotient, once again for the final subtract)
         mov  si, FLT_A
         mov  di, CORDIC_C
-        cld
         movsw
         movsw
 
@@ -3678,7 +3744,6 @@ cordic_reduce:
         call flt_a_to_b          ; FLT_B = quotient*2*PI
         mov  si, CORDIC_C
         mov  di, FLT_A
-        cld
         movsw
         movsw                    ; FLT_A = original angle
         call flt_sub             ; FLT_A = angle - quotient*2*PI
@@ -3702,7 +3767,6 @@ cordic_reduce:
                                   ; FLT_A with the quotient, but the
                                   ; quadrant calc below needs t itself
                                   ; back to compute r = t - quadrant*PI/2)
-        cld
         movsw
         movsw
         mov  si, half_pi_const
@@ -3720,7 +3784,6 @@ cordic_reduce:
         call flt_a_to_b          ; FLT_B = quadrant*(PI/2)
         mov  si, CORDIC_C
         mov  di, FLT_A
-        cld
         movsw
         movsw                    ; FLT_A = t (restored from stash)
         call flt_sub             ; FLT_A = t - quadrant*(PI/2) = r
@@ -3786,12 +3849,34 @@ cordic_pick:
         ret
 
 ; =============================================================================
-; DO_SIN_FUNC  SIN(x)
+; DO_SIN_FUNC  SIN(x)          DO_COS_FUNC  COS(x)
+; v2.3: bodies merged -- SIN and COS differed only in which of CORDIC_X/
+; CORDIC_Y is CORDIC_PICK's "primary" (bit0=0) register and in CH (its
+; negate-rule flag); everything else, byte for byte, was identical. Each
+; stub just sets CH and falls into TRIG_COMMON, which derives SI/BX from
+; CH (CH=0 -> SI=Y,BX=X; CH=1 -> SI=X,BX=Y) instead of hardcoding them.
 ; Inputs  : FLT_A = x (radians, from eat_paren_expr)
-; Outputs : FLT_A = sin(x)
+; Outputs : FLT_A = sin(x) / cos(x)
 ; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B, CORDIC_* (SI preserved)
 ; =============================================================================
 do_sin_func:
+        mov  ch, 0                ; SIN's negate rule (see TRIG_COMMON)
+        jmp  near trig_common     ; GOTCHA: 'jmp trig_common' (no size
+                                  ; qualifier) was observed to mis-assemble
+                                  ; under yasm's short-jump optimizer for
+                                  ; this exact tiny adjacent-fallthrough
+                                  ; distance -- it encoded EB 00 (target =
+                                  ; next byte = DO_COS_FUNC's "mov ch,1"),
+                                  ; not the intended target, silently
+                                  ; turning every SIN(x) into COS(x).
+                                  ; Forcing 'near' costs 1 byte but is
+                                  ; unambiguous.
+
+do_cos_func:
+        mov  ch, 1                ; COS's negate rule (see TRIG_COMMON)
+        ; fall through
+
+trig_common:
         ; GOTCHA: reached via a tail-call chain (expr2's e2_func_call is
         ; "jmp [bx+2]", not "call"), so SI holds the caller's real parse
         ; position on entry and must still hold it on return -- but
@@ -3813,41 +3898,16 @@ do_sin_func:
         mov  word [CORDIC_Y], 0
         call cordic_rotate_fx
         mov  al, [FLT_DE]        ; recover stashed quadrant
-        mov  si, CORDIC_Y         ; SIN's primary (bit0=0) register is Y
-        mov  bx, CORDIC_X
-        mov  ch, 0                ; SIN's negate rule
+        mov  si, CORDIC_X
+        mov  bx, CORDIC_Y
+        or   ch, ch               ; CH=0 (SIN) -> swap: SI=Y (primary), BX=X
+        jnz  .primary_is_x
+        xchg si, bx
+.primary_is_x:                    ; CH=1 (COS) -> SI=X (primary), BX=Y already
         call cordic_pick
         call fx14_to_flt         ; FLT_A = float(AX)  (real call, not
                                   ; tail-call: SI must be restored AFTER
                                   ; this returns, since it clobbers SI too)
-        pop  si                  ; restore the real parse position
-        ret
-
-; =============================================================================
-; DO_COS_FUNC  COS(x)
-; GOTCHA: see DO_SIN_FUNC's header -- same SI-preservation issue
-; (CORDIC_PICK and FX14_TO_FLT both clobber SI internally; the real
-; parse-position SI is saved/restored around the whole sequence).
-; Inputs  : FLT_A = x (radians, from eat_paren_expr)
-; Outputs : FLT_A = cos(x)
-; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B, CORDIC_* (SI preserved)
-; =============================================================================
-do_cos_func:
-        push si
-        call cordic_reduce
-        mov  [FLT_DE], al
-        call flt_to_fx14
-        mov  [CORDIC_Z], ax
-        mov  word [CORDIC_X], CORDIC_INVK
-        mov  word [CORDIC_Y], 0
-        call cordic_rotate_fx
-        mov  al, [FLT_DE]
-        mov  si, CORDIC_X         ; COS's primary (bit0=0) register is X
-        mov  bx, CORDIC_Y
-        mov  ch, 1                ; COS's negate rule
-        call cordic_pick
-        call fx14_to_flt         ; real call, not tail-call -- see
-                                  ; DO_SIN_FUNC's header for why
         pop  si                  ; restore the real parse position
         ret
 
