@@ -1,9 +1,151 @@
 /*
- ** TinyASM - 8086/8088 assembler for DOS
+ ** TinyASM - 8086/8088 assembler for DOS  (v1.2, Jul 2026)
  **
- ** by Oscar Toledo G.
+ ** by Oscar Toledo G. (creation date: Oct/01/2019); portability and
+ ** documentation maintained by Vincent Crabtree for local project use.
  **
- ** Creation date: Oct/01/2019.
+ ** Build (standalone):
+ **   gcc -O2 -o tinyasm tinyasm.c ins.c
+ **   tcc      -o tinyasm tinyasm.c ins.c
+ **
+ **   (ins.c supplies the instruction_set[] opcode table; tinyasm.c will
+ **    not link without it.)
+ **
+ ** Usage:
+ **   tinyasm -f bin|com <input.asm> -o <output.bin> [-l <listing.lst>]
+ **           [-DNAME=VALUE ...]
+ **
+ ** Options:
+ **   -f bin|com     Output format (required).
+ **                    bin : raw binary, ORG/default start address = 0
+ **                    com : raw binary, default start address = 0x100
+ **                          (classic DOS .COM layout)
+ **                  Either way, the actual load/link address of any given
+ **                  byte is still whatever ORG directives in the source
+ **                  say -- this only sets the address assumed before the
+ **                  first ORG.
+ **   -o <file>      Output binary filename (required).
+ **   -l <file>      Optional listing filename. Written only once the
+ **                  multi-pass address resolution has fully stabilized
+ **                  (no output at all if assembly fails). Contains, in
+ **                  order: one line per source line showing address / up
+ **                  to 4 emitted bytes / source line number / source
+ **                  text; an ERRORS/WARNINGS FOUND summary; a PROGRAM
+ **                  BYTES total; and a final "LABEL   VALUE/ADDRESS"
+ **                  symbol table (sorted by name) -- sim_rom's ASM-mode
+ **                  getchar/putchar/--break-at/--watch label lookups
+ **                  read *only* that final symbol table, not the
+ **                  per-line listing above it.
+ **   -DNAME=VALUE   Predefine a label from the command line, as if the
+ **                  source contained "NAME EQU VALUE" before line 1.
+ **                  No space between -D and NAME (attach it, NASM-style:
+ **                  -DFOO=1, not -D FOO=1). VALUE must be a constant
+ **                  expression with no forward references. -DNAME with
+ **                  no "=value" is accepted but does NOT define anything
+ **                  (silently a no-op) -- always give a value.
+ **
+ ** Supported syntax:
+ **   Directives : ORG expr              set assembly address
+ **                EQU expr              define a constant label (see
+ **                                      Labels below); "NAME EQU expr"
+ **                DB val[,val,...]      define bytes; val may be a
+ **                                      constant/label expression or a
+ **                                      "double-quoted string"
+ **                DW val[,val,...]      define little-endian 16-bit words
+ **                TIMES n <statement>   repeat one statement n times
+ **                                      (e.g. TIMES 16 DB 0)
+ **                ALIGN n               pad with 0x90 (NOP) up to the
+ **                                      next multiple of n; note this
+ **                                      always advances at least one
+ **                                      byte, even if already aligned
+ **                INCBIN "file"         splice in a raw binary file
+ **                %IFDEF NAME / %IFNDEF NAME
+ **                %ELSE
+ **                %ENDIF                conditional assembly, NASM-style,
+ **                                      arbitrarily nestable. NAME is a
+ **                                      label defined via EQU, a plain
+ **                                      (valueless) label, or -D on the
+ **                                      command line -- there is no
+ **                                      separate preprocessor symbol
+ **                                      table, "defined" means "exists
+ **                                      as a label". No %IF/%ELIF with
+ **                                      an arbitrary expression, and no
+ **                                      %DEFINE text-substitution macros.
+ **   Labels     : GLOBAL:                a normal label
+ **                .LOCAL:                local label, scoped to the
+ **                                      most recently defined non-dot
+ **                                      ("global") label; stored/looked
+ **                                      up internally as GLOBAL.LOCAL,
+ **                                      so the same .LOCAL name (e.g.
+ **                                      .DONE, .OK, .LOOP) can be reused
+ **                                      under every different global
+ **                                      label without colliding. A local
+ **                                      label reference is only valid
+ **                                      after its global label has been
+ **                                      seen (textually) in the source.
+ **   Registers  : 8-bit  : AL CL DL BL AH CH DH BH
+ **                16-bit : AX CX DX BX SP BP SI DI
+ **                segment: CS DS ES SS -- usable as MOV operands
+ **                        (MOV AX,DS / MOV DS,AX etc.) AND, separately,
+ **                        as one-byte segment-override PREFIXES written
+ **                        as their own statement on the line before the
+ **                        instruction they modify (same style as LOCK
+ **                        and the REP family below) -- e.g.:
+ **                            ES
+ **                            MOV AL, [DI]      ; reads from ES:[DI]
+ **                        There is no inline "ES:[DI]" NASM-style syntax.
+ **   Addressing : register direct              e.g. MOV AX, BX
+ **                immediate                    e.g. MOV AX, 5
+ **                direct memory   [addr]        e.g. MOV AX, [COUNT]
+ **                reg indirect    [BX] [SI] [DI] [BP]
+ **                indexed         [BX+disp] [SI+disp] [DI+disp] [BP+disp]
+ **                based-indexed   [BX+SI] [BX+DI] [BP+SI] [BP+DI]
+ **                                (+ an optional displacement on any of
+ **                                the four, e.g. [BX+SI+2])
+ **                BYTE / WORD     explicit size override where the
+ **                                operand size is otherwise ambiguous,
+ **                                e.g. CMP BYTE [SI], 0  /  MOV WORD [BX], 0
+ **                Prefix instructions (own statement, like ES/CS/DS/SS
+ **                above): LOCK, REP, REPE/REPZ, REPNE/REPNZ.
+ **   Expressions: 123            decimal
+ **                0x1F  $1F      hexadecimal (0x-prefix is preferred;
+ **                                $-prefix is NASM-style and only
+ **                                recognised when followed by a digit,
+ **                                since bare $ / $$ below take priority)
+ **                0b1010         binary (underscores allowed as
+ **                                separators, e.g. 0b1010_0101)
+ **                'A'                     character constant
+ **                $                       current assembly address
+ **                $$                      start address (of this ORG)
+ **                + - * / %               add/sub/mul/div/mod
+ **                << >>                   shift left/right
+ **                & ^ |                   bitwise AND/XOR/OR
+ **                ( )                     grouping
+ **                (precedence, low to high: | , ^ , & , << >> , + - , * / %)
+ **   Comments   : ; to end of line
+ **
+ ** Not supported (will error or misparse if used): macros (%MACRO),
+ ** %INCLUDE (INCBIN only), STRUC/segments, SEGMENT/ASSUME, and any
+ ** expression inside %IFDEF/%IFNDEF beyond a bare label name.
+ **
+ ** -----------------------------------------------------------------------
+ ** VERSION HISTORY (Vincent Crabtree's fork, for use with sim_rom)
+ ** -----------------------------------------------------------------------
+ ** v1.2 : Header Documentation only - No functional change.
+ **        Rewrote file header to fully document supported command line 
+ **        options, directives, labels, registers, addressing modes,
+ **        and expression syntax. The built-in -h/--help output is unchanged; 
+ **        this is the reference for anyone reading or editing the source.
+ ** v1.1 : Explicitly strip trailing '\r' (in addition to '\n') when
+ **        cleaning up each input line. Source files saved with CRLF line
+ **        endings (e.g. edited on Windows) previously relied only on
+ **        incidental isspace()-skipping of the leftover '\r' -- correct
+ **        in every case tested, but fragile. Belt-and-suspenders fix for
+ **        cross-platform (Win11/TCC and Linux) portability; no behaviour
+ **        change on already-clean LF-only input.
+ ** v1.0 : Baseline as received -- Oscar Toledo G.'s TinyASM 8086/8088
+ **        assembler, unmodified apart from local project use.
+ ** -----------------------------------------------------------------------
  */
 
 #include <stdio.h>
@@ -1347,6 +1489,8 @@ void do_assembly(fname)
             p++;
         }
         if (p > line && *(p - 1) == '\n')
+            p--;
+        if (p > line && *(p - 1) == '\r')  /* v1.1: explicit CRLF handling */
             p--;
         *p = '\0';
 
