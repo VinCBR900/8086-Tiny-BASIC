@@ -1,114 +1,115 @@
 ; =============================================================================
-; miniBASIC 8088  v2.3  (was: uBASIC 8088 v1.7.5)
+; miniBASIC 8088  v3.5  (was: uBASIC 8088 v1.7.5)
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
-; floating-point support, CORDIC SIN/COS, and a float-driven showcase
-; program. Base architecture, hardware/memory map, line-store format,
-; statement/operator set, identical to uBASIC8088.asm v1.7.5
-;
-; WHAT'S DIFFERENT FROM v1.7.5:
-;   - All variables and expression results are 32-bit MBF4 floats, not
-;     16-bit ints (bitwise/relational ops and PEEK/POKE/IN/OUT/TAB/CHR$
-;     arguments truncate to int16 at the point of use; RND(n)'s limit
-;     likewise).
-;   - New functions: SIN(x), COS(x) (fixed-point Q14 CORDIC internally;
-;     ~14-bit precision, less than MBF4's native ~23-bit mantissa).
-;   - ROM expanded  2 KB -> 4 KB (2732 EPROM); 
-;   - SHOWCASE_DATA rewritten to exercise float arithmetic, SIN/COS+TAB
-;     (sine wave), and a floating-point Mandelbrot.
+; floating-point support, a rational/polynomial trig library (SIN, COS,
+; TAN, ATN, ASIN, ACOS, SQRT).
 ;
 ; Credit: Oscar Toledo G. for bootBASIC inspiration and TinyASM 8086 assembler.
 ;         XTulator CPU core by Mike Chambers.
 ;
-; ---------------------------------------------------------------------------
-; LANGUAGE REFERENCE  (delta from v1.7.5 only -- see that file for the rest)
-; ---------------------------------------------------------------------------
+; KNOWN LIMITATIONS
+;   - Multi-statement lines (':'-separated statements) removed in v2.7 to
+;     reclaim ROM bytes and eliminate REM/PRINT interaction bugs that
+;     arose from colon-splitting. One statement per line only.
 ;
-; Functions   : adds COS(x), SIN(x) to v1.7.5's ABS/IN/NOT/PEEK/RND/USR
-; Variables   : A..Z, 32-bit MBF4 float (v1.7.5: signed 16-bit)
-; Numbers     : 32-bit MBF4 float, ~6-7 significant decimal digits
-;               (v1.7.5: signed 16-bit, -32768..32767)
+;   - TAB(n) prints n literal space characters relative to the current
+;     cursor position -- it does NOT move to absolute column n like
+;     classic BASIC's TAB. Code ported from a dialect with absolute TAB
+;     semantics (e.g. "PRINT TAB(C);..." inside a loop where C is the
+;     running column) will produce cumulative, ever-widening spacing
+;     instead of column alignment; use a fixed per-iteration TAB(k)
+;     (e.g. TAB(1) to advance one column per printed item) instead.
 ;
-; ---------------------------------------------------------------------------
-; BUILD
-; ---------------------------------------------------------------------------
-;
-; Assemble ROM image:
-;     tinyasm -f bin miniBASIC8088.asm -o miniBASIC_rom.bin
-;
-; Assemble and run in the supplied simulator:
-;     ./sim_rom miniBASIC8088.asm
-;
-; See the supplied Makefile for toolchain build details.
-;
-; ROM budget (4096 bytes)
-;     Current size : 3932 bytes
-;     Free space   : 164 bytes
-;
-; The ROM target is the limiting configuration for future features.
+;   - FLT_ADD's internal "put the larger-magnitude operand first" swap does
+;     not restore FLT_B's original identity afterward.  If |FLT_B|>|FLT_A| on
+;     entry, FLT_B ends up holding mangled remnants of the swap rather than
+;     its own original value.
 ;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
 ;
+; v3.5 (2026-07-19)
+;   - BUGFIX: EDITLN corrupted the stored line number when replacing an
+;     existing line (DELINE clobbers DX internally; EDITLN read it again
+;     afterward without saving/restoring it). Caused permanently orphaned,
+;     unreachable duplicate lines on re-edit. Fixed with a push/pop.
+;   - BUGFIX: FLT_PI_B/FLT_2PI_B's byte-overlap self-modifying-code trick
+;     (DB 0x3B) crashed/reset the interpreter for SIN/COS near PI and 2*PI.
+;     Replaced with an equally compact, verified shared-tail merge.
+;   - BUGFIX: showcase VORTEX demo used PRINT TAB(C) assuming classic
+;     absolute-column TAB semantics; this interpreter's TAB(n) prints n
+;     literal spaces relative to the current cursor (see KNOWN LIMITATIONS
+;     history), so C growing 0..60 every row produced cumulative,
+;     ever-widening space runs instead of column alignment. Changed to
+;     TAB(1) for correct single-space-per-column advancement.
+;   - FEATURE: INPUT_LINE now sounds BELL (0x07) on each keystroke once the
+;     62-char line limit is hit, instead of silently dropping the input.
+;   - Code golf: FLT_MUL, FLT_DIV, FLT_ADD, FOR_PTR_HLP, EXPECT_TOKEN_OR_KW,
+;     DO_NEXT, FLT_PRINT micro-optimized (word-load+xchg tricks, 3-op
+;     two's-complement negate, disp8-vs-disp16 pointer reuse, dead-code
+;     removal, 8-bit IMUL, inc/dec+jz/jnz idioms -- see individual routine
+;     headers for details). New shared ONE_MINUS_MUL helper deduped an
+;     identical 5-instruction sequence in FLT_ASIN/FLT_SIN.
+;   - Net effect: ~104 bytes free (ROM variant), up from ~25, despite
+;     adding the BELL feature. All changes verified via assemble + trace +
+;     full regression pass (showcase, arithmetic, trig incl. domain edges,
+;     FOR/NEXT, line insert/replace/delete/out-of-order, 60+ line program).
+;
+; v3.4 (2026-07-16)
+;   - Added TAN() and its underlying floating-point implementation.
+;   - Replaced the showcase program with a "vortex" demo exercising all trig functions.
+;   - Cleaned up residual CORDIC RAM definitions and documentation.
+;   - Verified trigonometric functions consistently use radians.
+;
+; v3.3 (2026-07-15)
+;   - Fixed an infinite recursion bug when parsing bare parenthesized expressions.
+;
+; v3.2 (2026-07-15)
+;   - Fixed a divide-by-zero error in ASIN() and ACOS() when evaluating 1 or -1.
+;
+; v3.1 (2026-07-15)
+;   - Exposed SQRT() as a standard BASIC keyword.
+;   - Updated the version banner and showcase intro strings.
+;
+; v3.0 (2026-07-14)
+;   - Refactored SIN() and COS() CORDIC implementations with a polynomial approximation.
+;   - Added float-truncation support and new math constants.
+;   - Fixed a bug in float-to-integer conversion where fractional values failed to truncate to zero.
+;
+; v2.9 (2026-07-14)
+;   - Added ASIN() and ACOS() functions and their underlying floating-point implementations.
+;   - Micro-optimised ATAN() and extracted common PI/2 loading code to save space.
+;   - Identified a known bug with ASIN() and ACOS() boundary values.
+;
+; v2.8 (2026-07-14)
+;   - Replaced the CORDIC-based ATN() implementation with a rational approximation.
+;   - Noted a minor precision reduction in ATN() in exchange for significant byte savings.
+;   - Identified a pre-existing bug where COS() incorrectly mirrored SIN().
+;
+; v2.7 (2026-07-14)
+;   - Removed partial multi-statement line support (colon separator) to reclaim ROM space.
+;   - Updated the showcase program to use single-statement lines.
+;
+; v2.6 (2026-07-14)
+;   - Added a floating-point square root routine using Newton-Raphson approximation.
+;   - Fixed a variable-copying bug in the ported square root source.
+;   - Removed bitwise operators (&, |, ^) to reclaim ROM space.
+;
+; v2.5 (2026-07-13)
+;   - Fixed a bug where relational operators always evaluated to false due to register clobbering.
+;
+; v2.4 (2026-07-13)
+;   - Added ATN() using the CORDIC engine's vectoring mode.
+;   - Extracted duplicate operator-table scans and line-target parsing into shared routines.
+;
 ; v2.3 (2026-07-12)
-;   - BUGFIX: DO_SIN_FUNC's unqualified "jmp trig_common" was observed to
-;     mis-assemble under yasm's short-jump optimizer for this exact tiny
-;     adjacent-fallthrough distance -- it encoded as a 0-displacement
-;     short jump, landing on DO_COS_FUNC's "mov ch,1" instead of
-;     TRIG_COMMON, so every SIN(x) silently computed COS(x). Fixed by
-;     forcing "jmp near" (confirmed correct by inspecting the assembled
-;     bytes directly, not just the listing).
-;   - BUGFIX: PREC_ENGINE_F's ".found" handler-dispatch broke in two
-;     separate ways when it was changed to use FLT_A_PUSH/FLT_A_POP
-;     (below): both helpers use BX as scratch internally (see their own
-;     header), but this is the one call site in the whole file where BX
-;     legitimately carries a live value (the matched operator-table
-;     pointer) across the call. Fixed by fetching the handler address
-;     into DX *before* calling FLT_A_PUSH, so nothing needs BX preserved
-;     across either helper call. (Every other FLT_A_PUSH/FLT_A_POP site
-;     was re-audited for the same class of bug -- BX is not live across
-;     the call at any of them, either because the caller already treats
-;     it as clobbered, or nothing in the intervening span touches it.)
-;   - BUGFIX: the FOR-loop init and STEP-stash sites (below) were changed
-;     to "call cp4" for their 4-byte copy, but CP4's "pop si; ret" tail
-;     requires the caller's own return address to already be on the stack
-;     *before* "push si" runs (that's how FLT_A_TO_B/FLT_B_TO_A use it,
-;     via JMP after already being CALLed). These two sites did "push si"
-;     then "call cp4" instead, reversing that order: CP4's "pop si" grabbed
-;     the CALL's return address instead of the saved SI, and its "ret"
-;     then jumped into whatever SI held -- i.e. into the middle of the
-;     program-text data. Fixed by reverting both to plain inline copies
-;     (VAR_STORE and E2_VAR's own "jmp cp4" tail-calls were re-checked and
-;     are fine: both are reached via a normal CALL, so a return address is
-;     already in place before they push SI).
-;   - All three bugs above were found by building a Unicorn-based 8086
-;     emulator of the actual YASM/8bitworkshop boot path (INT 10h/16h
-;     BIOS calls, matching the "%ifdef __YASM_MAJOR__" branches in this
-;     file) and running the embedded SHOWCASE program against it. The
-;     full showcase (arithmetic, comparisons, FOR/NEXT, GOSUB, the
-;     SIN+TAB sine wave, and the float Mandelbrot) now runs to completion
-;     and returns to the "Ok" prompt with no crash.
-;   - Size optimisation pass (no behaviour change otherwise), found via instruction-
-;     level duplicate-sequence analysis:
-;       * Removed redundant CLD instructions -- DF is proven clear
-;         everywhere in this codebase except transiently inside
-;         SLIDE_DATA's own STD/CLD pair, so every other CLD was dead.
-;       * DO_SIN_FUNC/DO_COS_FUNC merged into a shared TRIG_COMMON body
-;         (the two were byte-for-byte identical but for which of
-;         CORDIC_X/CORDIC_Y is primary and CORDIC_PICK's negate-rule
-;         flag); each is now a 2-4 byte stub.
-;       * VAR_STORE and E2_VAR now reuse the existing CP4 shared copy-tail
-;         (via JMP, matching FLT_A_TO_B's own convention) instead of
-;         inlining their own CLD/MOVSW/MOVSW/POP SI.
-;       * New FLT_A_PUSH/FLT_A_POP shared helpers replace 6 duplicated
-;         inline "park all of FLT_A on the real stack across a sub-call"
-;         sequences (EXPR's relational-op entry, PREC_ENGINE_F's LHS
-;         park, EAT_PAREN_EXPR, FLT_CMP, FP_NOTNEG's decimal-exponent
-;         scaling, and FPAR_CHK_DOT).
-;     Net: ~79 bytes reclaimed (85 -> 164 bytes free), confirmed by
-;     assembling before/after with yasm and diffing the padded ROM tail.
+;   - Fixed a jump-encoding bug that caused SIN() to silently compute COS().
+;   - Fixed expression-evaluator register corruption.
+;   - Fixed stack-corruption bugs in FOR loop initialization and STEP handling.
+;   - Optimised ROM size by removing redundant instructions and merging duplicate sequences.
 ;
 ; v2.2 (2026-06-30)
 ;   - Floating-point relational operators now compare native MBF4 values.
@@ -124,7 +125,7 @@
 ;   - Fixed nested function-call parsing.
 ;   - Fixed TAB(0) and negative TAB() behaviour.
 ;   - Replaced the showcase program with floating-point demonstrations.
-;   - Miscellaneous ROM optimisations.
+;   - Miscellaneous size optimisations.
 ;
 ; v2.0 (2026-06-23)
 ;   - Integrated the MBF4 floating-point library.
@@ -180,22 +181,28 @@ FLT_B:          equ RAM_BASE + 0x105    ; 4 bytes : secondary float operand
 FLT_C:          equ RAM_BASE + 0x109    ; 4 bytes : LHS park for
                                          ;   prec_engine_f's float dispatch.
                                          ;   GOTCHA: reserved exclusively for
-                                         ;   that use -- do not share with
-                                         ;   CORDIC_C (see below); they were
-                                         ;   merged once and that was a bug.
-CORDIC_X:       equ RAM_BASE + 0x10D    ; word    : CORDIC Q14 fixed-point X
-CORDIC_Y:       equ RAM_BASE + 0x10F    ; word    : CORDIC Q14 fixed-point Y
-CORDIC_Z:       equ RAM_BASE + 0x111    ; word    : CORDIC Q14 fixed-point Z (angle)
-CORDIC_T:       equ RAM_BASE + 0x113    ; word    : CORDIC shifted-X scratch
-                                         ;   (SIN/COS, see CORDIC section)
-CORDIC_C:       equ RAM_BASE + 0x115    ; 4 bytes : CORDIC_REDUCE's own angle/t
-                                         ;   stash. GOTCHA: must stay separate
-                                         ;   from FLT_C -- see FLT_C's comment
-                                         ;   above and the v2.1 change history
-                                         ;   for why merging them is a bug.
-RUNNING:        equ RAM_BASE + 0x119    ; byte    : 0=immediate mode, 1=running
-PROG_END:       equ RAM_BASE + 0x11A    ; word    : one past last program byte
-PROGRAM:        equ RAM_BASE + 0x11C    ; program store start
+                                         ;   that use -- was also once
+                                         ;   accidentally shared with a
+                                         ;   CORDIC scratch of the same
+                                         ;   role, which was a bug (see the
+                                         ;   v2.1 change history); that
+                                         ;   scratch (and the rest of
+                                         ;   CORDIC's RAM workspace) is gone
+                                         ;   now anyway -- CORDIC removed
+                                         ;   entirely in v3.0.
+ATN_FLAGS:      equ RAM_BASE + 0x10D    ; byte    : FLT_ATAN scratch
+                                         ;   (was DO_ATN_FUNC's before
+                                         ;   v2.8); 0x80=original sign,
+                                         ;   0x01=was range-reduced via 1/x
+SQRT_S:         equ RAM_BASE + 0x10E    ; 4 bytes : FLT_SQRT scratch: original S
+SQRT_X:         equ RAM_BASE + 0x112    ; 4 bytes : FLT_SQRT scratch: current x_n
+TAN_C:          equ RAM_BASE + 0x116    ; 4 bytes : FLT_TAN scratch: cos(x), parked
+                                         ;   across the FLT_SIN call (which clobbers
+                                         ;   FLT_B, so cos(x) can't be parked there)
+
+RUNNING:        equ RAM_BASE + 0x11A    ; byte    : 0=immediate mode, 1=running
+PROG_END:       equ RAM_BASE + 0x11B    ; word    : one past last program byte
+PROGRAM:        equ RAM_BASE + 0x11D    ; program store start
 STACK_TOP:      equ RAM_BASE + RAM_SIZE ; initial SP (grows downward)
 PROGRAM_TOP:    equ STACK_TOP - 0x100   ; 256-byte stack reserve
 
@@ -264,7 +271,6 @@ TK_STEP:        equ 0x95
 ; =============================================================================
 ; ROM BITBANG SERIAL  (Intel 8755 Port A, 4800 baud @ 5 MHz)
 ; =============================================================================
-
 PORT_A:         equ 0x00        ; 8755 Port A data register
 DDR_A:          equ 0x02        ; 8755 Port A direction register
 TX:             equ 0x01        ; Port A bit 0 = TX (output)
@@ -295,7 +301,7 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 
 SHOWCASE_DATA:
         ; ── Feature demos: arithmetic, comparisons, FOR/NEXT, GOSUB ───────────────
-        db 0x0A,0x00, 0x87, "miniBASIC 8088 v2.1 showcase", 0x0D ; 10  REM
+        db 0x0A,0x00, 0x87, "miniBASIC 8088 v3.5 showcase", 0x0D ; 10  REM
         db 0x14,0x00, 0x80, 0x22, "--- ARITHMETIC ---", 0x22, 0x0D ; 20  PRINT
         db 0x1E,0x00, 0x80, 0x22, "2+3=", 0x22, ";2+3;", 0x22, "  6*7=", 0x22, ";6*7", 0x0D ; 30  PRINT
         db 0x28,0x00, 0x80, 0x22, "20/4=", 0x22, ";20/4;", 0x22, "  17%5=", 0x22, ";17%5", 0x0D ; 40  PRINT
@@ -316,18 +322,54 @@ SHOWCASE_DATA:
         db 0xBE,0x00, 0x8D, "550", 0x0D            ; 190 GOSUB 550
         db 0xC8,0x00, 0x80, 0x22, "5!=", 0x22, ";F", 0x0D ; 200 PRINT
         db 0xD2,0x00, 0x80, 0x22, 0x22, 0x0D       ; 210 PRINT ""
-        ; ── Sine wave: CORDIC SIN(x) driving TAB(n) ─────────────────────────────
-        db 0xDC,0x00, 0x80, 0x22, "--- SINE WAVE (SIN+TAB) ---", 0x22, 0x0D ; 220 PRINT
-        db 0xE6,0x00, 0x8F, "I=0", 0x94, "24", 0x0D ; 230 FOR I=0 TO(0x94) 24
-        db 0xF0,0x00, "X=I*6.2832/24", 0x0D        ; 240 X=I*6.2832/24
-        db 0xFA,0x00, 0x80, "TAB(20+19*SIN(X));", 0x22, "*", 0x22, 0x0D ; 250 PRINT TAB(...);"*"
-        db 0x04,0x01, 0x90, "I", 0x0D              ; 260 NEXT I
-        db 0x0E,0x01, 0x80, 0x22, 0x22, 0x0D       ; 270 PRINT ""
+        ; ── Vortex: trig-library stress test (SIN, COS, TAN, ASIN, ACOS, ATN, ─
+        ; SQRT), replaced the old CORDIC sine-wave demo in v3.4.
+        db 0xDC,0x00, 0x87, "============================================", 0x0D ; 220  REM
+        db 0xDD,0x00, 0x87, "VORTEX.BAS V1.0 - TRIG LIBRARY STRESS TEST", 0x0D ; 221  REM
+        db 0xDE,0x00, 0x87, "RENDERS A WARPED 3D SPIRAL VORTEX TO TEST:", 0x0D ; 222  REM
+        db 0xDF,0x00, 0x87, "SIN, COS, TAN, ASIN, ACOS, ATN, SQRT", 0x0D ; 223  REM
+        db 0xE0,0x00, 0x87, "============================================", 0x0D ; 224  REM
+        db 0xE1,0x00, "H=27", 0x0D ; 225
+        db 0xE2,0x00, "V=13", 0x0D ; 226
+        db 0xE3,0x00, 0x8F, "R=0", 0x94, "26", 0x0D ; 227 FOR R=0 TO(0x94) 26
+        db 0xE4,0x00, 0x8F, "C=0", 0x94, "60", 0x0D ; 228 FOR C=0 TO(0x94) 60
+        db 0xE5,0x00, "X=(C-30)/H", 0x0D ; 229
+        db 0xE6,0x00, "Y=(R-13)/V", 0x0D ; 230
+        db 0xE7,0x00, "D=SQRT(X*X+Y*Y)", 0x0D ; 231
+        db 0xE8,0x00, 0x81, "D>1.2", 0x93, 0x82, "255", 0x0D ; 232 IF THEN(0x93) GOTO(0x82) 255
+        db 0xE9,0x00, 0x81, "X=0", 0x93, 0x82, "236", 0x0D ; 233 IF THEN(0x93) GOTO(0x82) 236
+        db 0xEA,0x00, "T=ATN(Y/X)", 0x0D ; 234
+        db 0xEB,0x00, 0x82, "237", 0x0D ; 235 GOTO 237
+        db 0xEC,0x00, "T=1.5708", 0x0D ; 236
+        db 0xED,0x00, 0x87, "--- TEST SIN/COS ---", 0x0D ; 237  REM
+        db 0xEE,0x00, "W=SIN(6*D-3*T)", 0x0D ; 238
+        db 0xEF,0x00, 0x87, "--- TEST TAN ---", 0x0D ; 239  REM
+        db 0xF0,0x00, "U=TAN(W*0.5)", 0x0D ; 240
+        db 0xF1,0x00, 0x87, "--- BOUND VALUE TO [-0.99, 0.99] ---", 0x0D ; 241  REM
+        db 0xF2,0x00, "P=COS(U)*0.99", 0x0D ; 242
+        db 0xF3,0x00, 0x87, "--- TEST ASIN/ACOS ---", 0x0D ; 243  REM
+        db 0xF4,0x00, "A=ACOS(P)", 0x0D ; 244
+        db 0xF5,0x00, "B=ASIN(P)", 0x0D ; 245
+        db 0xF6,0x00, 0x87, "--- MATH SHADE VALUE ---", 0x0D ; 246  REM
+        db 0xF7,0x00, "Z=(A-B)/3.1416", 0x0D ; 247
+        db 0xF8,0x00, 0x87, "--- MAP TO ASCII CHARS (recalibrated -- see change history) ---", 0x0D ; 248  REM
+        db 0xF9,0x00, "S=32", 0x0D ; 249
+        db 0xFA,0x00, 0x81, "Z>-0.36", 0x93, "S=46", 0x0D ; 250 IF THEN(0x93) S=46
+        db 0xFB,0x00, 0x81, "Z>-0.3", 0x93, "S=43", 0x0D ; 251 IF THEN(0x93) S=43
+        db 0xFC,0x00, 0x81, "Z>-0.24", 0x93, "S=79", 0x0D ; 252 IF THEN(0x93) S=79
+        db 0xFD,0x00, 0x81, "Z>-0.18", 0x93, "S=64", 0x0D ; 253 IF THEN(0x93) S=64
+        db 0xFE,0x00, 0x80, "CHR$(S);", 0x0D ; 254 PRINT
+        db 0xFF,0x00, 0x90, "C", 0x0D ; 255 NEXT C
+        db 0x00,0x01, 0x80, 0x0D ; 256 PRINT
+        db 0x01,0x01, 0x90, "R", 0x0D ; 257 NEXT R
+        db 0x02,0x01, 0x88, 0x0D ; 258 END
         ; ── Mandelbrot: native MBF4 float, no fixed-point scaling needed ─────
         db 0x18,0x01, 0x80, 0x22, "--- MANDELBROT (FLOAT) ---", 0x22, 0x0D ; 280 PRINT
         db 0x22,0x01, 0x8F, "I=-1", 0x94, "1 ", 0x95, "0.18", 0x0D ; 290 FOR I=-1 TO(0x94) 1 STEP(0x95) 0.18
         db 0x2C,0x01, 0x8F, "C=-2", 0x94, "0.5 ", 0x95, "0.045", 0x0D ; 300 FOR C=-2 TO(0x94) 0.5 STEP(0x95) 0.045
-        db 0x36,0x01, "A=C:B=I:E=0", 0x0D          ; 310
+        db 0x36,0x01, "A=C", 0x0D                  ; 310
+        db 0x37,0x01, "B=I", 0x0D                  ; 311
+        db 0x38,0x01, "E=0", 0x0D                  ; 312
         db 0x40,0x01, 0x8F, "N=1", 0x94, "16", 0x0D ; 320 FOR N=1 TO(0x94) 16
         db 0x4A,0x01, "T=A*A-B*B+C", 0x0D          ; 330
         db 0x54,0x01, "B=2*A*B+I", 0x0D            ; 340
@@ -427,7 +469,9 @@ main_loop:
         call input_number       ; parse optional line number -> AX
         or   ax, ax
         jne  ml_numbered
-        call stmt_line          ; no line number: execute immediately
+        call stmt                ; no line number: execute immediately
+                                  ; (was stmt_line -- multi-statement colon
+                                  ; support removed v2.7, see change history)
         jmp  short main_loop
 ml_numbered:
         call editln             ; numbered line: store/edit in program
@@ -455,20 +499,6 @@ do_error_nl:
         jmp  main_loop
 
 ; =============================================================================
-; STMT_LINE  execute ':'-separated statements from SI
-; Inputs  : SI -> statement text (tokenised or raw)
-; Outputs : (none)
-; Clobbers: AX, BX, CX, DX, SI, DI (via stmt)
-; =============================================================================
-stmt_line:
-        call stmt
-        call spaces
-        cmp  byte [si], ':'
-        jne  sl_ret
-        inc  si                 ; consume ':'
-        jmp  stmt_line
-
-; =============================================================================
 ; DO_IF_FALSE  skip remainder of line (IF condition was false)
 ; Inputs  : SI -> chars after condition
 ; Outputs : SI -> CR (not consumed)
@@ -482,15 +512,17 @@ do_if_false:
         ; fall through to peek_line
 
 ; =============================================================================
-; PEEK_LINE  test whether SI is at end-of-statement (CR or ':')
+; PEEK_LINE  test whether SI is at end-of-line (CR)
+; v2.7: was "end-of-statement (CR or ':')" -- ':' dropped along with
+; multi-statement colon support, see change history. Label kept as
+; 'sl_ret' for its single RET (was also STMT_LINE's return point before
+; that routine was removed in the same change; name is now just legacy).
 ; Inputs  : SI -> current position
-; Outputs : ZF=1 at CR or ':', ZF=0 otherwise
+; Outputs : ZF=1 at CR, ZF=0 otherwise
 ; Clobbers: (none)
 ; =============================================================================
 peek_line:
         call spaces
-        cmp  byte [si], ':'
-        je   sl_ret
         cmp  byte [si], 0x0D
 sl_ret:
         ret
@@ -974,7 +1006,7 @@ spaces:
 ; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B
 ; =============================================================================
 expr:
-        call expr_bitwise       ; FLT_A = left operand (full float precision)
+        call expr_add            ; FLT_A = left operand (full float precision)
         call spaces
         mov  al, [si]
         cmp  al, '<'
@@ -1009,11 +1041,22 @@ expr:
 .not_gt:
         dec  si                 ; back up: non-relational char
         push dx                 ; save bitmask across RHS eval
-        call expr_bitwise       ; FLT_A = right operand (float)
+        call expr_add            ; FLT_A = right operand (float)
         call flt_a_to_b         ; FLT_B = RHS
         pop  dx                 ; DL = operator bitmask
         call flt_a_pop           ; restore LHS float into FLT_A
+        push dx                  ; DX (operator bitmask) must survive
+                                  ; across FLT_CMP -- FLT_CMP documents DX
+                                  ; as clobbered (see its own header), and
+                                  ; this was previously left to chance:
+                                  ; DL ended up 0 here every time, so the
+                                  ; "test al,dl" below always saw a zero
+                                  ; mask and every comparison evaluated
+                                  ; false. See change history.
         call flt_cmp            ; AX = -1 (LT), 0 (EQ), +1 (GT)
+        pop  dx                  ; restore operator bitmask (POP doesn't
+                                  ; touch flags, so the comparison result
+                                  ; tested just below survives intact)
         ; Map flt_cmp result to LT=1 / EQ=2 / GT=4 bitmask in AL
         or   ax, ax
         mov  ax, 2              ; assume equal
@@ -1043,78 +1086,28 @@ div_err:
         jmp  do_error
 
 ; =============================================================================
-; BITWISE_AND / BITWISE_OR / BITWISE_XOR
-; Inputs  : AX = left operand, CX = right operand  (int16; truncated from
-;           float at expr_bitwise's boundary, see below)
-; Outputs : AX = result
-; Clobbers: (none beyond AX)
+; TAB_SEARCH  shared linear scan for a char(1)+handler_ptr(2) operator
+; table, terminated by a 0x00 sentinel char. Used by PREC_ENGINE_F (was
+; also used by EXPR_BITWISE before bitwise operators were removed -- see
+; v2.6 change history).
+; Inputs  : BX -> table, DL = char to find
+; Outputs : found:     BX -> matching entry, CF=0
+;           not found: BX -> sentinel entry, CF=1
+; Clobbers: none else
 ; =============================================================================
-bitwise_and:
-        and  ax, cx
-        ret
-
-bitwise_or:
-        or   ax, cx
-        ret
-
-bitwise_xor:
-        xor  ax, cx
-        ret
-
-; =============================================================================
-; EXPR_BITWISE  bitwise level (& | ^), lowest precedence among binary ops.
-; v2.0: ALWAYS returns float in FLT_A, left  untouched when no & | ^
-; operator follows (thecommon case) -- only when a
-; bitwise operator IS present is  this truncate to int16, run the
-; integer op, and promote the result back to float before returning.
-; Inputs  : SI -> expression text
-; Outputs : FLT_A = result
-; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B, FLT_C
-; =============================================================================
-expr_bitwise:
-        call expr_add            ; FLT_A = left operand (full float precision)
-        call spaces
-        mov  dl, [si]
-        cmp  dl, '&'
-        je   .has_op
-        cmp  dl, '|'
-        je   .has_op
-        cmp  dl, '^'
-        je   .has_op
-        ret                      ; no bitwise operator: FLT_A already
-                                  ; holds the correct (float) result
-.has_op:
-        call flt_to_int          ; AX = int16(FLT_A) = left operand
-.lp:
-        call spaces
-        mov  bx, tab_bitwise
-.search:
+tab_search:
         cmp  byte [bx], 0
-        je   .done
+        je   .notfound
         cmp  [bx], dl
         je   .found
         add  bx, 3
-        jmp  .search
+        jmp  tab_search
+.notfound:
+        stc
+        ret
 .found:
-        inc  si                  ; consume operator char
-        push ax                  ; save running int16 LHS
-        push word [bx+1]         ; save handler address
-        call expr_add            ; FLT_A = next operand (float)
-        call flt_to_int          ; AX = int16(FLT_A)
-        xchg cx, ax              ; CX = RHS
-        pop  bx                  ; BX = handler
-        pop  ax                  ; AX = LHS
-        call bx                  ; AX = AX op CX
-        call spaces
-        mov  dl, [si]            ; peek next operator char (may be none)
-        cmp  dl, '&'
-        je   .lp
-        cmp  dl, '|'
-        je   .lp
-        cmp  dl, '^'
-        je   .lp
-.done:
-        jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
+        clc
+        ret
 
 ; =============================================================================
 ; PREC_ENGINE_F  generic left-associative FLOAT binary operator evaluator.
@@ -1142,14 +1135,8 @@ prec_engine_f:
         mov  bx, [bp+2]         ; BX = operator table
         call spaces
         mov  dl, [si]           ; peek operator char
-.search:
-        cmp  byte [bx], 0
-        je   .done
-        cmp  [bx], dl
-        je   .found
-        add  bx, 3              ; next entry: char(1) + handler_ptr(2)
-        jmp  .search
-.found:
+        call tab_search
+        jc   .done
         inc  si                 ; consume operator char
         mov  dx, [bx+1]          ; DX = handler address -- fetched BEFORE
                                   ; FLT_A_PUSH runs, because FLT_A_PUSH (like
@@ -1247,7 +1234,22 @@ expr2:
         call spaces
         mov  al, [si]
         cmp  al, '('
-        je   e2_par
+        jne  .not_paren
+        ; v3.3 BUG FIX: this used to be a plain 'je e2_par', jumping
+        ; straight into E2_PAR without ever consuming the '(' -- E2_PAR
+        ; is also reached from EAT_PAREN_EXPR, which DOES consume it
+        ; first via its own 'mov al,"(" / call expect' (that's why
+        ; function calls like SIN(x) always worked: they go through
+        ; EAT_PAREN_EXPR, not this path). A bare '(expr)' used outside
+        ; a function call landed here instead, called EXPR with SI still
+        ; pointing at the same unconsumed '(', which recursed straight
+        ; back into this same branch -- genuine infinite recursion,
+        ; confirmed via a live trace (SI stuck, SP decreasing ~16
+        ; bytes/level) rather than a deliberate "not supported" syntax
+        ; error. Fixed by consuming '(' here too before jumping in.
+        inc  si
+        jmp  e2_par
+.not_paren:
         cmp  al, '-'
         jne  .not_neg
         jmp  e2_neg              ; out of short-jump range
@@ -1293,15 +1295,6 @@ e2_par:
         ret
 
 ; =============================================================================
-; DO_ABS_FUNC  ABS(n) -> absolute value.  v2.0: float-native (was int16).
-; Inputs  : FLT_A = value (from eat_paren_expr)
-; Outputs : FLT_A = |value|
-; Clobbers: AX
-; =============================================================================
-do_abs_func:
-        jmp  flt_abs            ; tail-call
-
-; =============================================================================
 ; DO_PEEK_FUNC  PEEK(addr) -> byte at memory address
 ; v2.0: argument truncated to int16 (address), result promoted back to
 ; float so it composes with the float expression chain above expr2.
@@ -1331,33 +1324,6 @@ do_in_func:
         jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
 
 ; do_usr_func is placed near the reset vector (acts as space filler); see below.
-
-; =============================================================================
-; DO_NOT_FUNC  NOT(n) -> bitwise complement
-; v2.0: argument truncated to int16, result promoted back to float.
-; Inputs  : FLT_A = value (from eat_paren_expr)
-; Outputs : FLT_A = ~int16(value), as a float
-; Clobbers: AX, FLT_A
-; =============================================================================
-do_not_func:
-        call flt_to_int         ; AX = int16(FLT_A)
-        not  ax
-        jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
-
-; =============================================================================
-; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
-; v2.0: limit n truncated to int16, result promoted back to float.
-; Inputs  : FLT_A = limit n (from eat_paren_expr)
-; Outputs : FLT_A = value in range [0, n), as a float
-; Clobbers: AX, BX, CX, DX, FLT_A
-; =============================================================================
-do_rnd_func:
-        call flt_to_int         ; AX = int16(FLT_A) = limit
-        push ax                 ; save limit
-        call rnd_shuffle        ; advance LFSR -> AX
-        pop  cx                 ; CX = limit
-        call math_mod           ; AX = AX % CX
-        jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
 
 ; =============================================================================
 ; RND_SHUFFLE  advance 16-bit Galois LFSR and return new seed value
@@ -1468,7 +1434,11 @@ ipl_nbs:
         cmp  al, 0x0D           ; CR?
         je   ipl_cr
         cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
-        jnb  ipl_lp
+        jb   ipl_store
+        mov  al, 0x07           ; BELL -- audible "line full" feedback
+        call output
+        jmp  ipl_lp
+ipl_store:
         call output
         stosb
         inc  cx
@@ -1698,9 +1668,19 @@ el_ldone:
         call find_line          ; DI = insertion point
         cmp  [di], dx
         jne  el_noex
+        ; BUGFIX (ported from prior audit): DELINE documents DX as
+        ; clobbered (reused internally as SLIDE_DATA's byte-shift amount)
+        ; but EDITLN still needs DX (the real line number) below at
+        ; 'mov ax,dx'. Without this save/restore, replacing an existing
+        ; line stores a garbage line number (the negated byte-length of
+        ; the just-deleted old entry) instead of the real one -- e.g.
+        ; editing line 20 a second time shows up as e.g. "-7" in LIST and
+        ; becomes a permanently orphaned, unreachable duplicate entry.
+        push dx
         push cx
         call deline             ; delete existing line
         pop  cx
+        pop  dx
 el_noex:
         pop  bx
         cmp  byte [bx], 0x0D   ; empty body = delete only
@@ -1829,10 +1809,20 @@ dg_ret:
 ; Inputs  : SI -> line number expression (GOTO) or program start (RUN)
 ; Clobbers: AX, BX, CX, DX, DI, FLT_A
 ; =============================================================================
+; =============================================================================
+; PARSE_LINE_TARGET  shared "parse a line-number expression, look it up"
+; tail for DO_GOTO and DO_GOSUB, which otherwise both inlined an identical
+; "call expr / call flt_to_int / call find_line" sequence.
+; Outputs : AX = target line# (int16), DI -> line >= AX (via FIND_LINE)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A
+; =============================================================================
+parse_line_target:
+        call expr                ; FLT_A = target line#
+        call flt_to_int          ; AX = int16(FLT_A)
+        jmp  find_line           ; DI -> line >= AX; tail-call, ret goes to caller
+
 do_goto:
-        call expr
-        call flt_to_int          ; AX = int16(FLT_A) = target line#
-        call find_line
+        call parse_line_target
         cmp  [di], ax
         je   dg_common
 JERRUL:
@@ -1862,7 +1852,8 @@ run_loop:
         mov  [CURLN], ax
         call next_line_ptr      ; DI -> start of next line
         mov  [RUN_NEXT], di
-        call stmt_line
+        call stmt                ; (was stmt_line -- multi-statement colon
+                                  ; support removed v2.7)
         jmp  short run_loop
 
 ; =============================================================================
@@ -1874,9 +1865,7 @@ run_loop:
 ; Clobbers: AX, BX, CX, DX, DI, FLT_A
 ; =============================================================================
 do_gosub:
-        call expr               ; FLT_A = target line#
-        call flt_to_int          ; AX = int16(FLT_A)
-        call find_line          ; DI -> line >= AX
+        call parse_line_target
         cmp  [di], ax
         jne  JERRUL
         mov  bx, [GOSUB_SP]
@@ -2105,12 +2094,12 @@ df_have_step:
 ; Clobbers: AX, BX
 ; =============================================================================
 for_ptr_hlp:
-        mov  bx, cx
-        add  bx, bx             ; * 2  no `shl rX, n` on 8086
-        add  bx, bx             ; * 4
-        mov  ax, bx             ; AX = depth * 4
-        add  bx, ax
-        add  bx, ax             ; BX = depth*4 + depth*4 + depth*4 = depth*12
+        ; depth is always <= 3 (FOR stack capped at 4 slots, checked in
+        ; DO_FOR), so AL*12 never exceeds AH=0 -- 8-bit MUL replaces the
+        ; old shift-add sequence.
+        mov  al, 12
+        mul  cl                 ; AX = CL * 12 (AH stays 0, CL<=3)
+        xchg ax, bx
         add  bx, FOR_STK
         ret
 
@@ -2121,14 +2110,17 @@ for_ptr_hlp:
 ; Clobbers: AX, DI, DL
 ; =============================================================================
 expect_token_or_kw:
+        ; CMP with equal operands guarantees CF=0, and INC never touches
+        ; CF (8086 quirk, so multi-word increment loops don't disturb an
+        ; in-flight carry chain) -- so the explicit CLC on the match path
+        ; is redundant and dropped.
         call spaces
         cmp  byte [si], al
         je   etk_match
         call kw_match
         ret
 etk_match:
-        inc  si
-        clc
+        inc  si                 ; CF still 0 from the CMP above
         ret
 
 ; =============================================================================
@@ -2160,19 +2152,20 @@ dn_search:
         push cx                 ; save frame index across flt_add/flt_cmp
 
         ; var += step  (FLT_A = var, FLT_B = step, result -> var)
+        ; BX (frame pointer) is never touched by the movsw setup below,
+        ; so a single push/pop around just the flt_add call (which does
+        ; clobber BX) is enough -- no need to also save/restore it
+        ; around the FLT_A load.
         push di                 ; &var
-        push bx                 ; &frame
         mov  si, di
         mov  di, FLT_A
         movsw
         movsw                   ; FLT_A = var
-        pop  bx
-        push bx
-        mov  si, bx
-        add  si, 6              ; &frame.step
+        lea  si, [bx+6]         ; &frame.step
         mov  di, FLT_B
         movsw
         movsw                   ; FLT_B = step
+        push bx
         call flt_add            ; FLT_A = var + step
         pop  bx
         pop  di                 ; &var
@@ -2183,8 +2176,7 @@ dn_search:
         ; Exit test: positive step -> exit when var > limit
         ;            negative step -> exit when var < limit
         ; flt_cmp(var, limit): AX = -1/0/1 (var<limit / == / var>limit)
-        mov  si, bx
-        add  si, 2              ; &frame.limit
+        lea  si, [bx+2]         ; &frame.limit
         mov  di, FLT_B
         movsw
         movsw                   ; FLT_B = limit  (FLT_A already = var)
@@ -2192,25 +2184,25 @@ dn_search:
         call flt_cmp            ; AX = sign(var - limit)
         pop  bx                 ; restore frame ptr
         pop  cx                 ; restore frame index (see GOTCHA above)
-        push ax                 ; save comparison result
-        mov  al, [bx+7]         ; step's sign byte: frame.step is at
+
+        ; AX (the -1/0/1 result) is used directly -- inc/dec + jz/jnz
+        ; replaces the old push-ax/pop-dx + cmp-against-1-or-0xFF
+        ; cascade. AX==1 (positive step, var>limit) makes 'dec ax' hit
+        ; zero; AX==-1 (negative step, var<limit) makes 'inc ax' hit zero.
+        mov  dl, [bx+7]         ; step's sign byte: frame.step is at
                                  ; bx+6..bx+9, MBF4 byte+1 holds the sign
                                  ; bit (bit 7), so bx+6+1 = bx+7
-        pop  dx                 ; DX(low byte) = comparison result
-        test al, 0x80
-        jnz  dn_neg_step
-        ; positive step: exit when var > limit  (cmp result == 1)
-        cmp  dl, 1
-        je   dn_done
-        jmp  dn_loop
-dn_neg_step:
-        ; negative step: exit when var < limit  (cmp result == -1/0xFF)
-        cmp  dl, 0xFF
-        je   dn_done
+        test dl, 0x80
+        jz   dn_pos_step
+        inc  ax
+        jz   dn_done
 dn_loop:
         mov  ax, [bx+10]
         mov  [RUN_NEXT], ax     ; jump back to top of loop
         ret
+dn_pos_step:
+        dec  ax
+        jnz  dn_loop
 dn_done:
         mov  [FOR_SP], cx       ; pop frame (CX = correct new depth)
         ret
@@ -2272,6 +2264,11 @@ kw_rnd:     db 0x52,0x4E,T_D                  ; RND
 kw_not:     db 0x4E,0x4F,T_T                  ; NOT
 kw_sin:     db 0x53,0x49,T_N                  ; SIN
 kw_cos:     db 0x43,0x4F,T_S                  ; COS
+kw_tan:     db 0x54,0x41,T_N                  ; TAN
+kw_atn:     db 0x41,0x54,T_N                  ; ATN
+kw_asin:    db 0x41,0x53,0x49,T_N             ; ASIN
+kw_acos:    db 0x41,0x43,0x4F,T_S             ; ACOS
+kw_sqrt:    db 0x53,0x51,0x52,T_T             ; SQRT
         db 0                                    ; sentinel
 
 ; =============================================================================
@@ -2299,7 +2296,7 @@ tab_tab:    dw kw_tab
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "miniBASIC 8088 v2.2"
+str_banner: db "miniBASIC 8088 v3.5"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -2330,15 +2327,6 @@ tab_mul:                        ; multiplicative level (v2.0: float, except %)
         dw flt_mod
         db 0
 
-tab_bitwise:                    ; bitwise level (lowest among binary operators)
-        db '&'                  ; v2.0: still int16-typed; truncated/promoted
-        dw bitwise_and           ; in expr_bitwise itself (only when an
-        db '|'                  ; operator is actually present -- see
-        dw bitwise_or            ; expr_bitwise's header)
-        db '^'
-        dw bitwise_xor
-        db 0
-
 ; =============================================================================
 ; FUNCTION DISPATCH TABLE  {kw_ptr(2), handler_ptr(2), ...}, dw 0 sentinel
 ; =============================================================================
@@ -2347,10 +2335,14 @@ func_tab:
         dw kw_peek, do_peek_func
         dw kw_in,   do_in_func
         dw kw_usr,  do_usr_func
-        dw kw_abs,  do_abs_func
-        dw kw_not,  do_not_func
+        dw kw_abs,  flt_abs
         dw kw_sin,  do_sin_func
         dw kw_cos,  do_cos_func
+        dw kw_tan,  do_tan_func
+        dw kw_atn,  do_atn_func
+        dw kw_asin, do_asin_func
+        dw kw_acos, do_acos_func
+        dw kw_sqrt, do_sqrt_func
         dw 0
 
 ; (ROM_END moved below, after the MBF4 float library -- see merge note)
@@ -2480,33 +2472,11 @@ np_pack:
         ret
 
 ; =============================================================================
-; FLT_NEGATE / FLT_NEGATE_B  flip the sign of FLT_A or FLT_B in place
-; FLT_ABS  clear the sign of FLT_A in place (force positive)
-;
-; v0.13 design note: flt_negate/flt_negate_b are merged via a DI
-; destination parameter (same pattern as v0.12's flt_from_int_b). This
-; adds DI to flt_negate_b's clobber set, and transitively flt_sub's and
-; flt_cmp's -- but DI is already fair-game scratch throughout this
-; codebase (a documented clobber of flt_parse, flt_mul, flt_div, and
-; flt_print already), so this is consistent with the existing
-; convention, not a new constraint.
-;
-; Inputs  : FLT_A (flt_negate, flt_abs) or FLT_B (flt_negate_b)
-; Outputs : same location, sign flipped (negate) or cleared (abs)
-; Clobbers: flt_negate/flt_abs: nothing. flt_negate_b: DI.
+; DO_ABS_FUNC  ABS(n) -> absolute value.  v2.0: float-native (was int16).
+; Inputs  : FLT_A = value (from eat_paren_expr)
+; Outputs : FLT_A = |value|
+; Clobbers: AX
 ; =============================================================================
-flt_negate:
-        mov  di, FLT_A
-        jmp  short fneg_tail
-flt_negate_b:
-        mov  di, FLT_B
-fneg_tail:
-        cmp  byte [di], 0
-        je   flt_neg_r
-        xor  byte [di+1], 0x80
-flt_neg_r:
-        ret
-
 flt_abs:
         and  byte [FLT_A+1], 0x7F
         ret
@@ -2571,6 +2541,74 @@ flt_a_pop:
         pop  word [FLT_A+2]
         jmp  bx
 
+; FLT_B_POP  mirror of FLT_A_POP, pops into FLT_B instead. Added v3.0 for
+; FLT_SIN, which parks values with FLT_A_PUSH but needs them back in
+; FLT_B (as the second operand for a following FLT_MUL) rather than A.
+flt_b_pop:
+        pop  bx
+        pop  word [FLT_B+0]
+        pop  word [FLT_B+2]
+        jmp  bx
+
+; =============================================================================
+; LOAD_HALF_PI_A  FLT_A = PI/2 (as MBF4)
+; v2.9: factored out of 2 duplicated inline copies (FLT_ATAN's reciprocal
+; branch, FLT_ACOS) -- found by asmdup.py after the ASIN/ACOS port.
+; Inputs  : (none)
+; Outputs : FLT_A = PI/2
+; Clobbers: DI, SI
+; =============================================================================
+load_half_pi_a:
+        mov  di, FLT_A
+        mov  si, half_pi_const
+        jmp cp5
+
+; =============================================================================
+; FLT_PI_2_B / FLT_PI_B / FLT_2PI_B  load PI/2, PI, or 2*PI into FLT_B
+; v3.0, added for FLT_SIN's range reduction. PI and 2*PI are derived from
+; PI/2 via the exponent-byte INC trick (same idea FLT_SQRT already uses
+; for halving, just incrementing instead) rather than stored as their
+; own MBF4 constants -- avoids adding two more 4-byte tables when the
+; existing HALF_PI_CONST already gets us there for free.
+; Inputs  : (none)
+; Outputs : FLT_B = PI/2, PI, or 2*PI respectively
+; Clobbers: DI, SI
+; =============================================================================
+flt_pi_2_b:
+        mov  di, FLT_B
+        mov  si, half_pi_const
+cp5:        
+        movsw
+        movsw
+        ret
+
+; Do not Split flt_2pi_b from flt_pi_b
+flt_pi_b:
+        call flt_pi_2_b
+        jmp  short pi_inc          ; PI/2 -> PI (shared with flt_2pi_b below)
+
+flt_2pi_b:
+        call flt_pi_b              ; FLT_B = PI, falls through for the
+                                    ; 2nd increment
+pi_inc:
+        inc  byte [FLT_B+0]        ; exponent+1 -> value*2
+        ret
+
+; =============================================================================
+; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
+; v2.0: limit n truncated to int16, result promoted back to float.
+; Inputs  : FLT_A = limit n (from eat_paren_expr)
+; Outputs : FLT_A = value in range [0, n), as a float
+; Clobbers: AX, BX, CX, DX, FLT_A
+; =============================================================================
+do_rnd_func:
+        call flt_to_int         ; AX = int16(FLT_A) = limit
+        push ax                 ; save limit
+        call rnd_shuffle        ; advance LFSR -> AX
+        pop  cx                 ; CX = limit
+        call math_mod           ; AX = AX % CX
+        ;jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
+        ; drop through
 ; =============================================================================
 ; FLT_FROM_INT  AX (signed int16) -> FLT_A
 ; FLT_FROM_INT_B  AX (signed int16) -> FLT_B  (preserves FLT_A and SI)
@@ -2589,11 +2627,11 @@ flt_a_pop:
 ; Outputs : FLT_A (flt_from_int) or FLT_B (flt_from_int_b)
 ; Clobbers: AX, BX, CX, DI
 ; =============================================================================
-flt_from_int_b:
-        mov  di, FLT_B
-        jmp  short ffi_main
 flt_from_int:
         mov  di, FLT_A
+        DB 0x3B ; consume next 3 bytes
+flt_from_int_b:
+        mov  di, FLT_B
 ffi_main:
         or   ax, ax
         je   ffi_zero
@@ -2683,7 +2721,24 @@ flt_to_int:
         or   al, al
         jz   fti_zero
         sub  al, 0x80           ; true exponent
-        jle  fti_zero           ; |value| < 1
+        ; v3.0 BUG FIX: was a single 'jle fti_zero' here. For AL<0x80
+        ; (any fractional magnitude, true_exp<0), SUB AL,0x80 sets OF=1
+        ; *and* SF=1 together (0x80 read as -128 for signed-overflow
+        ; purposes conflicts with its intended use as a +128 bias), so
+        ; JLE's SF!=OF test never fires and this fast path was silently
+        ; skipped for every |value|<1 input -- unreachable until FLT_SIN
+        ; (v3.0) became the first caller to ever pass flt_to_int a
+        ; sub-1-magnitude value; every prior caller (PEEK/POKE/TAB/RND
+        ; args) always passed magnitude >=1. Confirmed via a live
+        ; single-step trace (SIN(0.00001) computing x/2*PI, which should
+        ; truncate to 0, instead fell through into the shift-based path
+        ; with a negative true_exp and came out with a large nonzero
+        ; garbage AX). Root cause verified by hand from the standard
+        ; x86 subtraction-overflow flag formula, not guessed. Splitting
+        ; into ZF/SF-only checks (no OF) sidesteps the conflict; costs
+        ; 2 bytes over the single JLE.
+        jz   fti_zero           ; true_exp == 0 -> |value| < 1 (boundary)
+        js   fti_zero           ; true_exp < 0  -> |value| < 1
         cmp  al, 16
         jg   fti_sat
         mov  bh, [FLT_A+1]
@@ -2723,6 +2778,30 @@ fti_sat_neg:
 fti_sat_pos:
         mov  ax, 32767
         ret
+
+; =============================================================================
+; FLT_INT  FLT_A = truncate(FLT_A) toward zero, staying a float.
+; v3.0, added for FLT_SIN's range reduction (needs floor(x/2*PI) as a
+; float again, to multiply back by 2*PI and subtract). Trivial
+; composition of two routines that already existed (this codebase had
+; no float->float truncation before -- no BASIC INT() keyword either,
+; unlike the codebase the ported FLT_SIN's "Reuses your BASIC's INT"
+; comment assumed).
+; GOTCHA: FLT_TO_INT saturates at +/-32767 rather than erroring, so
+; |FLT_A| > 32767 silently truncates to a saturated value here too --
+; same int16 ceiling this codebase's PEEK/POKE/TAB/etc. args already
+; live with (see the file header), not a new limitation. FLT_SIN only
+; ever calls this on x/2*PI after taking |x|, so this caps the usable
+; input angle magnitude at a bit over 32767*2*PI (~205887) before SIN's
+; range reduction itself goes wrong -- more than enough for realistic
+; BASIC programs, but worth knowing.
+; Inputs  : FLT_A
+; Outputs : FLT_A = truncate(FLT_A)
+; Clobbers: AX, BX, CX, DX, DI
+; =============================================================================
+flt_int:
+        call flt_to_int          ; AX = int16(FLT_A), truncated
+        jmp  flt_from_int         ; tail-call: FLT_A = float(AX)
 
 ; =============================================================================
 ; FLT_CMP  compare FLT_A with FLT_B (signed)
@@ -2770,7 +2849,35 @@ fcmp_zero:
 flt_sub:
         call flt_negate_b
         call flt_add
-        jmp  flt_negate_b       ; restore FLT_B (tail-call)
+       ; jmp  flt_negate_b       ; restore FLT_B (tail-call)
+        ; drop through
+; =============================================================================
+; FLT_NEGATE / FLT_NEGATE_B  flip the sign of FLT_A or FLT_B in place
+; FLT_ABS  clear the sign of FLT_A in place (force positive)
+;
+; v0.13 design note: flt_negate/flt_negate_b are merged via a DI
+; destination parameter (same pattern as v0.12's flt_from_int_b). This
+; adds DI to flt_negate_b's clobber set, and transitively flt_sub's and
+; flt_cmp's -- but DI is already fair-game scratch throughout this
+; codebase (a documented clobber of flt_parse, flt_mul, flt_div, and
+; flt_print already), so this is consistent with the existing
+; convention, not a new constraint.
+;
+; Inputs  : FLT_A (flt_negate, flt_abs) or FLT_B (flt_negate_b)
+; Outputs : same location, sign flipped (negate) or cleared (abs)
+; Clobbers: flt_negate/flt_abs: nothing. flt_negate_b: DI.
+; =============================================================================
+flt_negate_b:
+        mov  di, FLT_B
+        DB 0x3B ; 
+flt_negate:
+        mov  di, FLT_A
+fneg_tail:
+        cmp  byte [di], 0
+        je   flt_neg_r
+        xor  byte [di+1], 0x80
+flt_neg_r:
+        ret
 
 ; =============================================================================
 ; FLT_ADD  FLT_A = FLT_A + FLT_B
@@ -2791,13 +2898,19 @@ flt_sub:
 ; Clobbers: AX, BX, CX, DX, FLT_SA, FLT_SB
 ; =============================================================================
 flt_add:
-        mov  al, [FLT_A+0]
-        or   al, al
+        ; BX doubles as a structural pointer to FLT_A for the early loads
+        ; below ([bx+n] is a disp8 ref vs [FLT_A+n]'s disp16). AL/AH are
+        ; also kept live across the fa_chkb/fa_both_nz jump (both are
+        ; pure fall-through paths), removing the old redundant
+        ; reload-and-recompare at fa_both_nz.
+        mov  bx, FLT_A
+        mov  al, [bx]
+        test al, al
         jnz  fa_chkb
         jmp  flt_b_to_a         ; A=0 -> result=B
 fa_chkb:
-        mov  al, [FLT_B+0]
-        or   al, al
+        mov  ah, [FLT_B+0]
+        test ah, ah
         jnz  fa_both_nz
         ret                     ; B=0 -> result=A unchanged
 
@@ -2806,37 +2919,36 @@ fa_both_nz:
         ; the routine only has to handle ONE case ("FLT_A is the larger-or-
         ; equal operand"). This replaces what used to be two near-mirror
         ; 19-instruction load blocks with one swap (18 bytes) + one block.
-        mov  al, [FLT_A+0]
-        mov  ah, [FLT_B+0]
         cmp  al, ah
         jnb  fa_signs           ; FLT_A already >= FLT_B, no swap needed
 
-        mov  ax, [FLT_A+0]
+        mov  ax, [bx]
         xchg ax, [FLT_B+0]
-        mov  [FLT_A+0], ax
-        mov  ax, [FLT_A+2]
+        mov  [bx], ax
+        mov  ax, [bx+2]
         xchg ax, [FLT_B+2]
-        mov  [FLT_A+2], ax
+        mov  [bx+2], ax
 
 fa_signs:
         ; FLT_A is now guaranteed the larger-or-equal operand.
-        mov  al, [FLT_A+1]
+        mov  al, [bx+1]
         and  al, 0x80
         mov  [FLT_SA], al       ; sign of larger
         mov  al, [FLT_B+1]
         and  al, 0x80
         mov  [FLT_SB], al       ; sign of smaller
 
-        ; Load larger (FLT_A) mantissa into CH:DX. The exponent (normally
-        ; cached in BH) is instead reloaded from [FLT_A+0] at the 3 points
-        ; it's actually needed below (fa_norm_reload, the carry-bump path,
-        ; fa_smaller_gone) -- [FLT_A+0] stays valid/unchanged in memory
-        ; throughout, and this frees BH for the smaller operand's mid
-        ; byte, below.
-        mov  ch, [FLT_A+1]
+        ; Load larger (FLT_A) mantissa into CH:DX. Word-load+xchg gets
+        ; DH:DL (mid:lo) from one word load instead of two byte loads.
+        mov  dx, [bx+2]
+        xchg dh, dl
+        mov  ch, [bx+1]
         or   ch, 0x80
-        mov  dh, [FLT_A+2]
-        mov  dl, [FLT_A+3]
+
+        ; Shift count (expA - expB) -- grab expA via BX before it's
+        ; repurposed as the smaller operand's mantissa, below.
+        mov  cl, [bx]
+        sub  cl, [FLT_B+0]
 
         ; Load smaller (FLT_B) mantissa directly into AL(hi):BX(mid:lo) --
         ; no FLT_T memory scratch needed. The natural little-endian word
@@ -2847,11 +2959,8 @@ fa_signs:
         mov  al, [FLT_B+1]
         or   al, 0x80           ; al=B_hi, implied-1 restored
 
-        mov  cl, [FLT_A+0]
-        sub  cl, [FLT_B+0]      ; shift count = expA - expB
-
 fa_align:
-        or   cl, cl
+        test cl, cl
         jz   fa_addorsub
         cmp  cl, 25             ; shift >= 25: smaller vanishes
         jb   fa_do_align
@@ -2867,7 +2976,7 @@ fa_byte_lp:
         mov  bl, bh
         mov  bh, al
         xor  al, al
-        or   cl, cl
+        test cl, cl
         jnz  fa_byte_lp
         jmp  fa_addorsub
 
@@ -2891,23 +3000,23 @@ fa_addorsub:
         cmp  cl, [FLT_SB]
         je   fa_same_sign
 
-        ; Different signs: subtract smaller from larger. Direct register-
-        ; register sub/sbb -- no memory operand at all now.
-        sub  dl, bl
-        sbb  dh, bh
+        ; Different signs: subtract smaller from larger. DX/BX share the
+        ; same mid:lo byte-order convention (both built via the word-load+
+        ; xchg trick above), so the low/high halves line up and a single
+        ; 16-bit sub/sbb replaces the old 3x byte-wise sub/sbb/sbb.
+        sub  dx, bx
         sbb  ch, al
         jnc  fa_norm_reload
 
-        ; Borrow out: two's-complement negate result, flip sign
-        not  dl
-        not  dh
-        not  ch
-        inc  dl
-        adc  dh, 0
+        ; Borrow out: two's-complement negate the 24-bit CH:DX value in 3
+        ; instructions (neg DX sets CF iff DX!=0; adc folds that carry
+        ; into CH; neg CH completes it), then flip sign.
+        neg  dx
         adc  ch, 0
-        or   ch, ch
+        neg  ch
+        test ch, ch
         jnz  fa_flip_sign
-        or   dx, dx
+        test dx, dx
         jz   fa_zero
 fa_flip_sign:
         xor  byte [FLT_SA], 0x80
@@ -2916,8 +3025,7 @@ fa_flip_sign:
 fa_same_sign:
         ; Add with carry chain (LSB first). Register-register, same
         ; reasoning as the subtract path above.
-        add  dl, bl
-        adc  dh, bh
+        add  dx, bx
         adc  ch, al
         jnc  fa_norm_reload
         ; Carry out of CH: shift right 1, bump exponent (no guard byte).
@@ -2930,13 +3038,22 @@ fa_same_sign:
         jz   fa_zero
         jmp  fa_norm            ; skip the (now-redundant) reload below
 
+fa_smaller_gone:
 fa_norm_reload:
         mov  bh, [FLT_A+0]      ; reload exponent (BH held smaller's mid
-                                 ; byte through the add/sub above)
+                                 ; byte through the add/sub above, or is
+                                 ; still garbage on the fa_smaller_gone
+                                 ; early-exit path)
 fa_norm:
-        or   ch, ch
+        ; fa_smaller_gone now falls through here instead of duplicating
+        ; its own "mov bh,[FLT_A+0]/xor al,al/jmp norm_pack" tail. CH:DX
+        ; on that path is always FLT_A's original (nonzero, since A was
+        ; checked nonzero at entry) mantissa, so the zero-test below is
+        ; always false there -- harmless, and it de-duplicates ~5 bytes
+        ; of tail code at the cost of two untaken tests on that one path.
+        test ch, ch
         jnz  fa_np
-        or   dx, dx
+        test dx, dx
         jz   fa_zero
 fa_np:
         xor  al, al
@@ -2944,12 +3061,6 @@ fa_np:
 
 fa_zero:
         jmp  flt_zero           ; backward jump - safe
-fa_smaller_gone:
-        mov  bh, [FLT_A+0]      ; reload exponent (never touched BH yet
-                                 ; on this early-exit path, but BH still
-                                 ; holds garbage from fa_signs' B_mid load)
-        xor  al, al
-        jmp  norm_pack          ; backward jump - safe
 
 ; =============================================================================
 ; FLT_MUL  FLT_A = FLT_A * FLT_B
@@ -2994,20 +3105,27 @@ fmul_bnz:
 
         ; Result sign = sign_A XOR sign_B (shared helper)
         call sign_xor
+
+        ; Word-load + xchg replaces two byte-loads for both mantissa lo
+        ; words below -- mem[n]/mem[n+1] land as AL/AH (or DL/DH) in the
+        ; "wrong" (lo-byte-first) half via the natural little-endian
+        ; word load; xchg swaps them back into the mid:lo order the
+        ; multiply steps expect. 1 byte cheaper per pair than two
+        ; separate byte moves.
+        mov  dx, [FLT_B+2]
+        xchg dh, dl              ; DX = B_lo
         mov  bl, [FLT_B+1]
         or   bl, 0x80           ; dead 'and bl,0x7F' removed
         xor  bh, bh
-        mov  si, bx             ; SI = 0x00:BL
-        mov  dh, [FLT_B+2]
-        mov  dl, [FLT_B+3]     ; DX = B_lo
+        mov  si, bx             ; SI = 0x00:B_hi
 
         ; Load A mantissa: DI=00:A_hi (byte in LOW position), AX=A_lo
+        mov  ax, [FLT_A+2]
+        xchg ah, al              ; AX = A_lo
         mov  cl, [FLT_A+1]
         or   cl, 0x80           ; dead 'and cl,0x7F' removed
         xor  ch, ch
         mov  di, cx             ; DI = 0x00:CL
-        mov  ah, [FLT_A+2]
-        mov  al, [FLT_A+3]     ; AX = A_lo
 
         push di                 ; push 00:A_hi (for step 2 restore)
         push ax                 ; push A_lo    (for step 1)
@@ -3023,21 +3141,19 @@ fmul_bnz:
         ; Step 2: A_lo * B_hi
         mul  si                 ; DX:AX = A_lo * B_hi
         add  cx, ax
-        jnc  fms10
-        inc  dx
-fms10:
+        adc  dx, 0
         mov  bx, dx
         pop  dx                 ; restore DX = 00:A_hi
 
         ; Step 3: B_lo * A_hi  (B_lo re-read; DX = 00:A_hi)
-        mov  ah, [FLT_B+2]
-        mov  al, [FLT_B+3]     ; AX = B_lo
+        mov  ax, [FLT_B+2]
+        xchg ah, al              ; AX = B_lo
         mul  dx                 ; DX:AX = B_lo * A_hi
         add  cx, ax
-        jnc  fms20
-        inc  dx
-fms20:
-        add  bx, dx
+        adc  bx, dx              ; carry from the add above folds
+                                  ; straight into BX along with DX --
+                                  ; replaces the old jnc/inc/add-bx,dx
+                                  ; three-step
 
         ; Step 4: A_hi * B_hi  (DI=00:A_hi, SI=00:B_hi; product fits in AX)
         mov  ax, di
@@ -3113,13 +3229,26 @@ flt_div:
         mov  bl, [FLT_B+0]
         or   bl, bl
         jnz  fdiv_bnz
-        jmp  fdiv_by_zero
+        ; Float divide by zero raises the same ?2 error as integer divide
+        ; by zero, via do_error -- see ERR_OV. Inlined: only ever reached
+        ; from here, so the extra jmp to a separate label was overhead.
+        mov  al, ERR_OV
+        jmp  do_error            ; tail-call into uBASIC's error handler
 fdiv_bnz:
         mov  al, [FLT_A+0]
         or   al, al
         jnz  fdiv_anz
         ret                     ; 0 / x = 0
 fdiv_anz:
+        push di                 ; DI = pointer into FLT_DB for the rest
+                                 ; of this routine -- [di+n] is a disp8
+                                 ; reference vs [FLT_DB+n]'s disp16, and
+                                 ; FLT_DB is read/written ~10 times below,
+                                 ; so this nets a real saving even after
+                                 ; the push/pop. DI restored before
+                                 ; return, so the documented clobber list
+                                 ; is unaffected.
+
         ; Exponent: eA - eB + 0x80
         sub  al, bl
         add  al, 0x80
@@ -3127,28 +3256,31 @@ fdiv_anz:
 
         ; Result sign = sign_A XOR sign_B (shared helper)
         call sign_xor
+        mov  di, FLT_DB
         mov  dl, [FLT_B+1]
-        or   dl, 0x80           ; dl = B_hi, implied-1 restored
-        mov  [FLT_DB+2], dl     ; B_hi at +2 (little-endian layout below)
+        or   dl, 0x80           ; dl = B_hi, implied-1 restored; kept
+                                 ; live on purpose -- reused by the
+                                 ; prescale compare below instead of a
+                                 ; reload
+        mov  [di+2], dl         ; B_hi at +2 (little-endian layout below)
         mov  ax, [FLT_B+2]      ; al=B_mid, ah=B_lo (raw word load)
         xchg al, ah              ; al=B_lo, ah=B_mid
-        mov  [FLT_DB+0], ax     ; DB+0=B_lo, DB+1=B_mid -- as a 16-bit
+        mov  [di+0], ax         ; DB+0=B_lo, DB+1=B_mid -- as a 16-bit
                                  ; word this equals B_mid*256+B_lo, the
                                  ; same packing BX already uses for A's
                                  ; mid:lo bytes below
 
         ; Load A mantissa: CH = A_hi (8-bit), BX = A_bytes2:3 (16-bit)
+        mov  bx, [FLT_A+2]
+        xchg bh, bl              ; BX = A mid:lo
         mov  ch, [FLT_A+1]
         or   ch, 0x80           ; dead 'and ch,0x7F' removed
-        mov  bh, [FLT_A+2]
-        mov  bl, [FLT_A+3]
 
         ; Pre-scale: if A >= B shift right 1, inc exponent
-        cmp  ch, dl             ; DL still holds FLT_DB+2(B_hi); no reload
+        cmp  ch, dl             ; DL still holds B_hi; no reload
         jb   fdiv_prescaled
         ja   fdiv_prescale
-        cmp  bx, [FLT_DB+0]     ; single word compare (was 2 byte loads
-                                 ; + cmp, before the FLT_DB reorder)
+        cmp  bx, [di]           ; single word compare
         jb   fdiv_prescaled
 fdiv_prescale:
         shr  ch, 1
@@ -3171,30 +3303,25 @@ fdiv_loop:
         shl  bl, 1
         rcl  bh, 1
         rcl  ch, 1
-        jc   fdiv_ov            ; 25th-bit overflow: remainder unconditionally >= B
+        jnc  fdiv_no_ov          ; no 25th-bit overflow -> speculative path
 
-        ; Speculative subtract: CH:BX -= B (word+byte, direct memory
-        ; operands, no scratch register needed -- AX/DX, the live 32-bit
-        ; quotient, are never touched). If the final byte borrows, the
-        ; remainder was < B; undo by adding B back (restore). Otherwise
-        ; commit and set the bit.
-        sub  bx, [FLT_DB+0]
-        sbb  ch, [FLT_DB+2]
-        jc   fdiv_restore        ; borrowed -> remainder was < B -> undo below
-        or   al, 1               ; no borrow -> commit, set quotient bit 0
-        jmp  fdiv_next
+        ; 25th-bit overflow: remainder unconditionally >= B, commit
+        sub  bx, [di]
+        sbb  ch, [di+2]
+fdiv_set_bit:
+        inc  ax                 ; sets AX's LSB (AX's low bit is always 0
+                                 ; here, just shifted in by 'shl ax,1' above)
+        jmp  short fdiv_next
 
-fdiv_restore:
-        ; Undo the speculative subtract (add B back)
-        add  bx, [FLT_DB+0]
-        adc  ch, [FLT_DB+2]
-        jmp  fdiv_next
-
-fdiv_ov:
-        ; S20: 25th-bit overflow guarantees remainder >= B; commit unconditionally
-        sub  bx, [FLT_DB+0]
-        sbb  ch, [FLT_DB+2]
-        or   al, 1
+fdiv_no_ov:
+        ; Speculative subtract: CH:BX -= B. If the final byte borrows,
+        ; the remainder was < B; undo by adding B back. Otherwise commit
+        ; and set the bit.
+        sub  bx, [di]
+        sbb  ch, [di+2]
+        jnc  fdiv_set_bit        ; no borrow -> commit (shared with above)
+        add  bx, [di]            ; borrowed -> restore
+        adc  ch, [di+2]
 
 fdiv_next:
         dec  cl
@@ -3208,15 +3335,415 @@ fdiv_next:
         mov  dh, ah              ; DH = old DL (via the xchg stash above)
         ; AL already holds the guard byte (old AL) - leave unchanged
         mov  bh, [FLT_ER]
+        pop  di
         jmp  norm_pack          ; backward jump - safe
 
-fdiv_by_zero:
-        ; v2.0: was push si/mov si,s_div0/call print_sz/pop si/jmp flt_zero
-        ; (printed "DIV0!" to the console and returned 0.0). Float divide
-        ; by zero now raises the same ?2 error as integer divide by zero,
-        ; via uBASIC's do_error -- see language reference / ERR_OV.
-        mov  al, ERR_OV
-        jmp  do_error            ; tail-call into uBASIC's error handler
+; =============================================================================
+; FLT_SQRT  FLT_A = sqrt(FLT_A), Newton-Raphson, 5 iterations
+;
+; Ported from the 65C02 uBASIC6502 float library's FLT_SQRT. Initial guess:
+; halve the biased exponent byte and re-bias by +64. Valid here because
+; this codebase's MBF4 format is excess-128 biased with mantissa in
+; [0.5,1) -- cross-checked against DO_ATN_FUNC's own exponent-byte
+; threshold (biased exponent 0x82 <=> value 2.0, which only holds under
+; that convention), not just assumed from the source this was ported from.
+; Iterates x_(n+1) = (S/x_n + x_n) / 2, halving via exponent decrement
+; rather than a real divide-by-2 (same trick as the source).
+;
+; BUG FIXED from the ported source: the original 6502 draft's comment said
+; "JSR COPY_A_TO_B ; Move x_n from T_X into FLT_B", but COPY_A_TO_B copies
+; FLT_A (not T_X) into FLT_B -- and FLT_A had just been reloaded with S at
+; that point, so as literally written it would have computed S/S=1 every
+; iteration instead of S/x_n. A second comment further down ("Restore x_n
+; into FLT_B from T_X") had no code under it at all -- never implemented in
+; the source. Fixed here by copying x_n from T_X into FLT_B directly. Only
+; one such copy is needed (not one per FLT_DIV/FLT_ADD call) because neither
+; FLT_DIV nor FLT_ADD documents FLT_B as clobbered -- both leave it
+; unchanged in memory, confirmed against their own header comments.
+;
+; BUG FIXED (v3.1, found v2.9): FLT_SQRT(0) -- reached whenever ASIN/ACOS
+; hit exactly |x|=1, where 1-x^2 is exact zero -- produced garbage
+; instead of 0. The exponent-halving seed step below doesn't understand
+; MBF4's exact-zero sentinel (exponent byte 0x00 means "this is zero",
+; not "a tiny normalized value"); blindly halving-and-rebiasing 0x00
+; produced a nonzero "quasi-zero" seed (0x40), and 5 Newton-Raphson
+; iterations on that converge to a large garbage value, not 0. FLT_ASIN
+; then divided x by that quasi-zero -- small enough to blow up the
+; result, but not exactly zero, so FLT_DIV's real divide-by-zero check
+; never caught it. Confirmed via ASIN(0.99)/ASIN(0.999)/ASIN(0.9999),
+; which all correctly trended toward PI/2 -- this was specifically the
+; exact-zero case, not general imprecision near the boundary. Fixed
+; with an explicit zero check before the seed step; FLT_A is already
+; all-zero bytes in that case, so returning immediately is exact, not
+; approximate.
+;
+; Domain: FLT_A assumed non-negative otherwise; no further error check
+; (caller's responsibility, same as the ported source).
+;
+; Inputs  : FLT_A = S (value to take the square root of)
+; Outputs : FLT_A = sqrt(S)
+; Clobbers: AX, BX, CX, DX, DI, SQRT_S, SQRT_X
+; =============================================================================
+flt_sqrt:
+        cmp  byte [FLT_A+0], 0
+        je   fsqrt_zero          ; exact zero: sqrt(0)=0, FLT_A is
+                                  ; already correct as-is
+        push si
+        mov  si, FLT_A
+        mov  di, SQRT_S
+        movsw
+        movsw                     ; T_S = S (original input, preserved
+                                   ; across all 5 iterations)
+
+        shr  byte [FLT_A+0], 1    ; halve the biased exponent
+        add  byte [FLT_A+0], 64   ; re-bias -> fast initial guess x_0
+
+        mov  cx, 5                ; 5 iterations: plenty for a 24-bit mantissa
+fsqrt_nr:
+        mov  si, FLT_A
+        mov  di, SQRT_X
+        movsw
+        movsw                     ; T_X = x_n (current guess, backed up)
+        mov  si, SQRT_S
+        mov  di, FLT_A
+        movsw
+        movsw                     ; FLT_A = S
+        mov  si, SQRT_X
+        mov  di, FLT_B
+        movsw
+        movsw                     ; FLT_B = x_n
+
+        push cx
+        call flt_div               ; FLT_A = S / x_n (FLT_B still x_n --
+                                    ; neither FLT_DIV nor FLT_ADD clobbers it)
+        call flt_add               ; FLT_A = (S / x_n) + x_n
+        dec  byte [FLT_A+0]        ; /2 via exponent decrement
+        pop  cx
+        loop fsqrt_nr
+
+        pop  si
+fsqrt_zero:
+        ret
+
+; =============================================================================
+; FLT_ATAN  FLT_A = atan(FLT_A), full domain, rational approximation
+;
+; Ported from the 65C02 uBASIC6502 float library's FLT_ATAN:
+; atan(x) = x / (1 + 0.28086*x^2), a minimax rational approximation
+; valid for |x|<=1 (max error ~0.005 rad in that range). This is a
+; straight port with no bug to fix (unlike FLT_SQRT) -- the 6502
+; source's FLT_ATAN was correct as written.
+;
+; Extended here to the full domain via the same reciprocal identity the
+; CORDIC-based DO_ATN_FUNC this replaces already used: for |x|>=1.0,
+; atan(x) = sign(x) * (PI/2 - atan(1/|x|)). This extension isn't just
+; nice-to-have: FLT_ASIN (added alongside this, see change history)
+; evaluates atan(x/sqrt(1-x^2)), whose argument grows without bound as
+; |x| -> 1, so ATAN needs to stay accurate well past |x|=1 for ASIN/
+; ACOS's accuracy near the domain edges.
+;
+; GOTCHA: the |x|>=1.0 test is a raw exponent-byte compare, not a call
+; to FLT_CMP, for the same reason DO_ATN_FUNC's own |x|>=2.0 test was --
+; FLT_ADD's larger-operand swap doesn't restore FLT_B's identity (see
+; the RESIDUAL QUIRK note at the top of the file). Biased exponent 0x81
+; <=> value 1.0 under this codebase's excess-128/[0.5,1)-mantissa MBF4
+; convention (same convention DO_ATN_FUNC's own 0x82<=>2.0 test relies
+; on).
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = atan(x), radians, range (-PI/2, PI/2)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS
+; =============================================================================
+flt_atan:
+        push si
+        mov  al, [FLT_A+1]
+        and  al, 0x80              ; AL = original sign bit
+        mov  [ATN_FLAGS], al
+        call flt_abs                ; FLT_A = |x|
+        cmp  byte [FLT_A+0], 0x81   ; exponent >= 0x81 <=> |x| >= 1.0
+        jb   fatan_have_arg
+        call flt_a_to_b             ; FLT_B = |x|
+        mov  ax, 1
+        call flt_from_int           ; FLT_A = 1.0
+        call flt_div                ; FLT_A = 1.0 / |x|
+        inc  byte [ATN_FLAGS]      ; set bit0 ("was range-reduced"); safe
+                                    ; as INC (not OR 0x01) because bit0 is
+                                    ; guaranteed clear here -- ATN_FLAGS was
+                                    ; just set to the sign bit alone (0x00
+                                    ; or 0x80) a few lines up
+fatan_have_arg:
+        call flt_a_push             ; protect the argument across FLT_MUL
+        call flt_a_to_b             ; FLT_B = x
+        call flt_mul                ; FLT_A = x^2
+        mov  di, FLT_B
+        mov  si, const_0_28086
+        movsw
+        movsw                      ; FLT_B = 0.28086
+        call flt_mul                ; FLT_A = 0.28086 * x^2
+        mov  ax, 1
+        call flt_from_int_b         ; FLT_B = 1.0
+        call flt_add                ; FLT_A = 1.0 + 0.28086*x^2  [denom]
+        call flt_a_to_b             ; FLT_B = denom
+        call flt_a_pop              ; FLT_A = x (or 1/|x|)
+        call flt_div                ; FLT_A = x / denom  (rational approx)
+
+        test byte [ATN_FLAGS], 0x01
+        jz   fatan_sign
+        call flt_a_to_b             ; FLT_B = atan(1/|x|)
+        call load_half_pi_a         ; FLT_A = PI/2
+        call flt_sub                ; FLT_A = PI/2 - atan(1/|x|)
+fatan_sign:
+        test byte [ATN_FLAGS], 0x80
+        jz   fatan_done
+        call flt_negate
+fatan_done:
+        pop  si
+        ret
+
+; =============================================================================
+; FLT_ASIN  FLT_A = asin(FLT_A), radians, range (-PI/2, PI/2)
+;
+; Ported from the 65C02 uBASIC6502 float library's FLT_ASIN, unchanged
+; logic -- no bug found here (unlike FLT_SQRT in v2.6):
+; asin(x) = atan(x / sqrt(1-x^2)).
+;
+; Domain: |x|<=1. |x|>1 not checked -- same as FLT_SQRT and the ported
+; source, out-of-domain input silently produces a meaningless result
+; rather than an error (FLT_SQRT has no sign check, so 1-x^2<0 just
+; gets sqrt'd as if positive). Matches this codebase's existing level
+; of rigor for SIN/COS/ATN, none of which validate their domain either.
+;
+; BUG FIXED (v3.2, found via a real test program hitting it every run):
+; |x|==1 exactly used to divide by zero (v3.1: clean ?2 error) or worse
+; (v2.9: FLT_SQRT(0) garbage). asin(+-1) is a well-defined limit
+; (+-PI/2) even though the general x/sqrt(1-x^2) formula can't reach it
+; (1-x^2 is exact zero there). The v3.1 fix (making FLT_SQRT(0) exact
+; instead of garbage) turned this into an honest error rather than
+; silent garbage, which seemed sufficient at the time -- but a
+; symmetric raster-sphere test program hit x==1 at its exact center
+; pixel on every single run, not as a rare edge case, making "clean
+; error" impractical in practice. Short-circuits here instead, before
+; ever reaching FLT_SQRT/FLT_DIV.
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = asin(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
+;           SQRT_X (via FLT_SQRT/FLT_ATAN)
+; NOTE: does NOT self-preserve SI (unlike FLT_SQRT/FLT_ATAN) -- its only
+; callers (DO_ASIN_FUNC, FLT_ACOS) already wrap the whole call in their
+; own push/pop si, so a second layer here is dead weight. If a future
+; caller needs SI preserved across FLT_ASIN without wrapping it itself,
+; add the wrap back.
+; =============================================================================
+; =============================================================================
+; ONE_MINUS_MUL  FLT_A = 1.0 - (FLT_A * FLT_B)
+; Factored out of FLT_ASIN and FLT_SIN's polynomial phase -- both had this
+; exact 5-instruction sequence inline.
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = 1.0 - (FLT_A * FLT_B)
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_SA, FLT_SB
+;           (union of FLT_MUL's, FLT_FROM_INT's, and FLT_SUB's own clobbers)
+; =============================================================================
+one_minus_mul:
+        call flt_mul
+        call flt_a_to_b
+        mov  ax, 1
+        call flt_from_int
+        jmp  flt_sub             ; tail-call: FLT_A = 1.0 - FLT_B
+
+flt_asin:
+        call flt_a_push           ; park x on the real stack
+        call flt_a_to_b           ; FLT_B = x
+        call one_minus_mul        ; FLT_A = 1.0 - x^2
+        cmp  byte [FLT_A+0], 0     ; exact zero <=> |x|==1 boundary
+        jne  fasin_general
+        call flt_a_pop             ; FLT_A = original x (need its sign)
+        mov  al, [FLT_A+1]
+        and  al, 0x80              ; AL = sign of x
+        push ax
+        call load_half_pi_a        ; FLT_A = PI/2
+        pop  ax
+        or   al, al
+        jz   fasin_boundary_done   ; x>=0: asin(1) = +PI/2
+        xor  byte [FLT_A+1], 0x80  ; x<0:  asin(-1) = -PI/2
+fasin_boundary_done:
+        ret
+fasin_general:
+        call flt_sqrt               ; FLT_A = sqrt(1 - x^2)
+        call flt_a_to_b           ; FLT_B = sqrt(1 - x^2)  [denominator]
+        call flt_a_pop             ; FLT_A = x
+        call flt_div                ; FLT_A = x / sqrt(1 - x^2)
+        jmp  flt_atan                ; tail-call: FLT_A = atan(result) = asin(x)
+
+; =============================================================================
+; FLT_ACOS  FLT_A = acos(FLT_A), radians, range (0, PI)
+;
+; Ported from the 65C02 uBASIC6502 float library's FLT_ACOS, unchanged
+; logic -- acos(x) = PI/2 - asin(x). Same domain caveat as FLT_ASIN.
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = acos(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
+;           SQRT_X (via FLT_ASIN)
+; NOTE: does NOT self-preserve SI, same reasoning as FLT_ASIN -- its
+; only caller (DO_ACOS_FUNC) already wraps the call.
+; =============================================================================
+flt_acos:
+        call flt_asin              ; FLT_A = asin(x)
+        call flt_a_to_b            ; FLT_B = asin(x)
+        call load_half_pi_a        ; FLT_A = PI/2
+        jmp  flt_sub                ; tail-call: FLT_A = PI/2 - asin(x)
+
+; =============================================================================
+; FLT_SIN  FLT_A = sin(FLT_A), radians, full domain
+;
+; Ported from a 65C02 trig library (2-term minimax polynomial, accurate
+; on [0,PI/2] after range reduction mod 2*PI and quadrant folding).
+; Straight port, no bug found -- traced the real-stack depth through
+; every branch (FLT_A_PUSH/FLT_A_POP/FLT_B_POP's 4-byte float parks,
+; interleaved with a 1-word sign-tracker push/pop) and it balances on
+; every path, matching the source's own PHA/PLA + PUSH_FLT_A/POP_FLT_A
+; interleaving. Replaces CORDIC (v3.0 -- see change history); the
+; polynomial is plausibly *more* precise than CORDIC's ~14-bit
+; fixed-point, not just smaller, though not independently re-derived
+; here -- accuracy is only as good as the source's own claim.
+;
+; GOTCHA: the sign tracker lives in AX on the real stack (AL=0x00 or
+; 0x80, AH don't-care) rather than a byte push, since 8086 has no
+; byte-sized push/pop -- pushed once at entry, popped+flipped+re-pushed
+; once (net stack-depth-neutral) if x lands past PI during folding, and
+; popped for good at the very end.
+;
+; Domain: magnitude of x limited by FLT_INT's int16 saturation on
+; x/(2*PI) -- see FLT_INT's own header for the ceiling. Not checked
+; beyond that, matching this codebase's existing rigor for its other
+; trig functions.
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = sin(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B
+; =============================================================================
+flt_sin:
+        mov  al, [FLT_A+1]
+        and  al, 0x80              ; AL = sign tracker (0x00 or 0x80)
+        push ax
+        call flt_abs                ; FLT_A = |x|
+
+        call flt_a_push             ; park |x|
+        call flt_2pi_b              ; FLT_B = 2*PI
+        call flt_div                 ; FLT_A = |x| / 2*PI
+        call flt_int                  ; FLT_A = INT(|x| / 2*PI)
+        call flt_2pi_b                 ; FLT_B = 2*PI
+        call flt_mul                    ; FLT_A = INT(...) * 2*PI
+        call flt_a_to_b                  ; FLT_B = INT(...) * 2*PI
+        call flt_a_pop                    ; FLT_A = |x|
+        call flt_sub                       ; FLT_A = |x| mod 2*PI
+
+        call flt_pi_b                       ; FLT_B = PI
+        call flt_sub                         ; FLT_A = x' - PI
+        test byte [FLT_A+1], 0x80
+        jz   fsin_gt_pi
+        call flt_pi_b                         ; x' <= PI: restore x' by
+        call flt_add                          ; adding PI back
+        jmp  fsin_check_pi_2
+fsin_gt_pi:
+        pop  ax                                ; x' > PI: flip sign tracker
+        xor  al, 0x80                          ; (net stack depth unchanged)
+        push ax
+fsin_check_pi_2:
+        call flt_a_to_b                         ; FLT_B = x'
+        call load_half_pi_a                      ; FLT_A = PI/2
+        call flt_sub                              ; FLT_A = PI/2 - x'
+        test byte [FLT_A+1], 0x80
+        jz   fsin_le_pi_2
+        call flt_pi_2_b                            ; x' > PI/2:
+        call flt_add                                ; x' = PI/2 + (PI/2-x')
+        jmp  fsin_eval_poly
+fsin_le_pi_2:
+        call flt_a_to_b                              ; x' <= PI/2:
+        call load_half_pi_a                           ; restore
+        call flt_sub                                   ; x' = PI/2-(PI/2-x')
+fsin_eval_poly:
+        ; sin(x') ~= x' * (1 - x'^2 * (0.16605 - 0.00761 * x'^2))
+        call flt_a_push               ; park x'
+        call flt_a_to_b
+        call flt_mul                   ; FLT_A = x'^2
+        call flt_a_push                 ; park x'^2
+
+        mov  di, FLT_B
+        mov  si, const_c2
+        movsw
+        movsw                            ; FLT_B = 0.00761
+        call flt_mul                      ; FLT_A = 0.00761 * x'^2
+        call flt_a_to_b
+        mov  di, FLT_A
+        mov  si, const_c1
+        movsw
+        movsw                              ; FLT_A = 0.16605
+        call flt_sub                        ; FLT_A = 0.16605 - 0.00761*x'^2
+
+        call flt_b_pop                       ; FLT_B = x'^2
+        call one_minus_mul                    ; FLT_A = 1.0 - x'^2*(...)
+
+        call flt_b_pop                           ; FLT_B = x'
+        call flt_mul                              ; FLT_A = x' * (...)
+
+        pop  ax                                    ; sign tracker
+        xor  [FLT_A+1], al
+        ret
+
+; =============================================================================
+; FLT_COS  FLT_A = cos(FLT_A) = sin(PI/2 - FLT_A)
+; Ported from the same 65C02 trig library. Straight port, trivial.
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = cos(x)
+; Clobbers: same as FLT_SIN (tail-calls it)
+; =============================================================================
+flt_cos:
+        call flt_a_to_b            ; FLT_B = x
+        call load_half_pi_a        ; FLT_A = PI/2
+        call flt_sub                ; FLT_A = PI/2 - x
+        jmp  flt_sin                 ; tail-call: FLT_A = sin(PI/2 - x)
+
+; =============================================================================
+; FLT_TAN  FLT_A = tan(FLT_A) = sin(x) / cos(x)
+;
+; Ported from the same 65C02 trig library. The source parks cos(x) via a
+; 6-byte manual shuffle into its own T_X scratch (presumably to conserve
+; the 6502's tiny 256-byte hardware stack); on 8088 the real stack has
+; much more headroom, so this reimplements the same idea with a plain
+; scratch RAM slot (TAN_C) rather than replicating the shuffle -- cos(x)
+; can't be parked via FLT_A_PUSH/the stack the way it works elsewhere in
+; this file, because FLT_SIN (called next, to get sin(x)) clobbers FLT_B
+; internally, and the stack-park mechanism here only has one slot (FLT_A)
+; to round-trip through -- a second parked value needs real memory.
+;
+; Domain: not checked. tan(x) is undefined at x=+-PI/2, +-3PI/2, etc.,
+; where cos(x)=0 -- FLT_DIV's own divide-by-zero check (?2) will catch
+; the exact-zero case; near-zero cos(x) (x close to but not exactly the
+; singularity) will just produce a very large but finite result, same
+; level of rigor as this codebase's other trig functions.
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = tan(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, TAN_C (and everything
+;           FLT_SIN/FLT_COS/FLT_DIV clobber)
+; =============================================================================
+flt_tan:
+        call flt_a_push            ; park x
+        call flt_cos                 ; FLT_A = cos(x)
+        mov  si, FLT_A
+        mov  di, TAN_C
+        movsw
+        movsw                        ; TAN_C = cos(x) (safe: FLT_SIN never
+                                      ; touches this scratch)
+        call flt_a_pop               ; FLT_A = x
+        call flt_sin                   ; FLT_A = sin(x)
+        mov  si, TAN_C
+        mov  di, FLT_B
+        movsw
+        movsw                        ; FLT_B = cos(x)
+        jmp  flt_div                   ; tail-call: FLT_A = sin(x) / cos(x)
 
 ; =============================================================================
 ; FLT_PRINT  print FLT_A as decimal to terminal
@@ -3241,20 +3768,25 @@ flt_print:
 fp_notzero:
         test byte [FLT_A+1], 0x80
         jz   fp_notneg
-        push ax
         mov  al, '-'
         call output
-        pop  ax
-        call flt_abs
+        call flt_abs             ; dropped the push ax/pop ax that used
+                                  ; to bracket this -- the AL value it
+                                  ; preserved was never read; the very
+                                  ; next line reloads AL from [FLT_A+0]
+                                  ; regardless. flt_abs itself touches no
+                                  ; registers (see its header).
 fp_notneg:
         ; Decimal exponent estimate: de = (exp - 0x80) * 77 >> 8
+        ; 8-bit IMUL (AX = AL*CL) needs no preceding CBW and no 16-bit
+        ; immediate load for CX -- AL is already the signed byte being
+        ; scaled, so AL*77 (8x8->16) equals the old CBW-then-16x16
+        ; result exactly, just cheaper to set up.
         mov  al, [FLT_A+0]
         sub  al, 0x80
-        cbw
-        mov  cx, 77
-        imul cx
-        mov  al, ah
-        mov  [FLT_DE], al
+        mov  cl, 77
+        imul cl
+        mov  [FLT_DE], ah
 
         ; S22: save FLT_A on stack
         call flt_a_push
@@ -3323,14 +3855,19 @@ fp_no_clamp:
         pop  di
         pop  ax
         add  al, '0'
-        mov  [di], al
-        inc  di
-        cmp  di, IBUF+7
-        je   fp_dig_done
+        stosb                    ; writes AL to [DI], DI++
+
         push di
-        call mul_by_ten
+        call mul_by_ten          ; safe to run on the 7th iteration too --
+                                  ; the result is never used (FLT_A is
+                                  ; restored from FLT_A_PUSH at
+                                  ; fp_print_done regardless), and
+                                  ; flt_mul/mul_by_ten never traps on
+                                  ; overflow (only flt_div's div-by-zero
+                                  ; does)
         pop  di
-        jmp  fp_dig_lp
+        cmp  di, IBUF+7
+        jne  fp_dig_lp
 
 fp_dig_done:
         ; Round: digit[6] >= '5' -> round up. Either way, digit[6] itself
@@ -3564,9 +4101,6 @@ pfrac_end:
 ; own contract is unchanged (still receives nothing in particular, still
 ; returns its result in AX as plain int16 machine-code convention) -- only
 ; the BASIC-side argument and return value are now float at the boundary.
-; (Relocated here from its old spot as a filler between the reset vector
-; and the final ROM pad -- this routine grew from 2 to 11 bytes for the
-; float conversion and no longer fits in that 2-byte gap.)
 ; Inputs  : FLT_A = call address (from eat_paren_expr)
 ; Outputs : FLT_A = float(AX), where AX = return value from called routine
 ; Clobbers: AX, whatever the called routine clobbers
@@ -3577,338 +4111,118 @@ do_usr_func:
         jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
 
 ; =============================================================================
-; CORDIC SIN/COS  (v2.1)
-;
-; Computes SIN(x) and COS(x) for any real x in radians via fixed-point
-; (Q14: 1 sign + 1 integer + 14 fraction bits, range +-1.99994) rotation-
-; mode CORDIC, converted to/from MBF4 float only at the boundary. The
-; iteration loop itself is plain 16-bit integer shift/add/sub -- this is
-; substantially smaller than a float-native CORDIC core (measured via a
-; standalone prototype during design: ~143 bytes fixed-point core vs
-; ~224 bytes float-native, despite paying for both float<->fixed
-; conversions either way) because each of the 14 iterations avoids a
-; flt_add/flt_sub call in favour of one SAR/ADD/SUB triple.
-;
-; ALGORITHM
-;   1. Reduce x to t = x mod 2*PI, t in [0, 2*PI).
-;   2. quadrant = floor(t / (PI/2)), 0-3;  r = t - quadrant*(PI/2), r in
-;      [0, PI/2).
-;   3. Convert r to Q14 fixed-point (Z0); seed X0 = 1/K (Q14, K = CORDIC
-;      gain for 14 iterations), Y0 = 0 -- this bakes the gain correction
-;      into the seed for free, so no post-multiply is needed.
-;   4. Run 14 rotation-mode iterations: X=cos(r), Y=sin(r) in Q14.
-;   5. Recombine per quadrant (verified against real sin/cos numerically
-;      for all 4 quadrants and exact axis boundaries before writing this):
-;        Q0: sin=Y      cos=X
-;        Q1: sin=X      cos=-Y
-;        Q2: sin=-Y     cos=-X
-;        Q3: sin=-X     cos=Y
-;   6. Convert the selected Q14 result back to float.
-;
-; Precision: ~14 bits (~4 decimal digits), noticeably less than MBF4's
-; ~23-bit mantissa (~7 digits) -- fine for general use (graphics, basic
-; trig); flag this if a program ever needs full float precision from
-; SIN/COS specifically.
+; Shared float constants (MBF4). half_pi_const used by FLT_ATAN, FLT_ASIN
+; (via LOAD_HALF_PI_A), FLT_ACOS, FLT_SIN, FLT_COS (via FLT_PI_2_B/
+; FLT_PI_B/FLT_2PI_B). const_0_28086 is FLT_ATAN's rational-approximation
+; coefficient; const_c1/const_c2 are FLT_SIN's polynomial coefficients.
+; All three non-trivial constants were generated and verified via this
+; ROM's own flt_parse (A=<value>, then PEEK'd back out of VARS), not
+; hand-derived -- see v2.8/v3.0 change history.
+; NOTE (v3.0): this block used to sit between CORDIC_ATAN_TAB and
+; CORDIC_ROTATE_FX; relocated here, unchanged, when CORDIC was removed
+; -- these four are the only things from that stretch of the file that
+; were still needed.
 ; =============================================================================
-
-CORDIC_N:       equ 14          ; iteration count
-CORDIC_INVK:    equ 9949        ; 1/K in Q14, K = gain for 14 iterations
-
-; 14 entries x 2 bytes = 28 bytes: atan(2^-i) in Q14, i=0..13
-cordic_atan_tab:
-        dw 12868, 7596, 4014, 2037, 1023, 512, 256
-        dw 128, 64, 32, 16, 8, 4, 2
-
-two_pi_const:  db 0x83, 0x49, 0x0F, 0xDB  ; 2*PI as MBF4
 half_pi_const: db 0x81, 0x49, 0x0F, 0xDB  ; PI/2 as MBF4
-fx14_scale:    db 0x8F, 0x00, 0x00, 0x00  ; 16384.0 as MBF4 (Q14 scale factor)
-
-; =============================================================================
-; CORDIC_ROTATE_FX  fixed-point Q14 rotation-mode CORDIC core.
-; Inputs  : CORDIC_X, CORDIC_Y, CORDIC_Z preloaded (Q14)
-; Outputs : CORDIC_X, CORDIC_Y updated in place (CORDIC_Z left ~0, unused
-;           by callers here)
-; Clobbers: AX, BX, CX
-; =============================================================================
-cordic_rotate_fx:
-        xor  cx, cx              ; CL doubles as iteration index AND shift
-                                  ; count (always < 16, so CH staying 0
-                                  ; throughout is harmless)
-.loop:
-        mov  ax, [CORDIC_X]
-        sar  ax, cl              ; AX = X >> i  (arithmetic: sign-preserving)
-        mov  [CORDIC_T], ax       ; T = X >> i  (need the OLD X for Y's update)
-
-        mov  ax, [CORDIC_Y]
-        sar  ax, cl               ; AX = Y >> i
-
-        push cx                  ; table lookup needs BX; stash CX first
-        mov  bx, cx
-        add  bx, bx
-        add  bx, cordic_atan_tab
-        pop  cx
-
-        cmp  word [CORDIC_Z], 0
-        jl   .neg
-
-        sub  word [CORDIC_X], ax ; X -= (Y>>i)
-        mov  ax, [CORDIC_T]
-        add  word [CORDIC_Y], ax ; Y += (X_old>>i)
-        mov  ax, [bx]
-        sub  word [CORDIC_Z], ax ; Z -= atan(i)
-        jmp  .next
-
-.neg:
-        add  word [CORDIC_X], ax ; X += (Y>>i)
-        mov  ax, [CORDIC_T]
-        sub  word [CORDIC_Y], ax ; Y -= (X_old>>i)
-        mov  ax, [bx]
-        add  word [CORDIC_Z], ax ; Z += atan(i)
-
-.next:
-        inc  cx
-        cmp  cx, CORDIC_N
-        jb   .loop
-        ret
-
-; =============================================================================
-; FLT_TO_FX14  convert FLT_A (already range-reduced to [0,PI/2)) to a
-; Q14 fixed-point word.
-; Inputs  : FLT_A
-; Outputs : AX = Q14 value
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B
-; =============================================================================
-flt_to_fx14:
-        mov  si, fx14_scale
-        call load_const_b
-        call flt_mul             ; FLT_A *= 16384.0
-        jmp  flt_to_int          ; tail-call: AX = int16(FLT_A)
-
-; =============================================================================
-; FX14_TO_FLT  convert a Q14 fixed-point word back to float.
-; Inputs  : AX = Q14 value
-; Outputs : FLT_A = AX / 16384.0
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B
-; =============================================================================
-fx14_to_flt:
-        call flt_from_int        ; FLT_A = float(AX)
-        mov  si, fx14_scale
-        call load_const_b
-        jmp  flt_div             ; tail-call: FLT_A /= 16384.0
-
-; =============================================================================
-; LOAD_CONST_B  copy a 4-byte ROM float constant into FLT_B.
-; Shared tail for CORDIC_REDUCE's four same-shaped constant loads (was
-; inlined 4 times at ~13 bytes each; SI is never live across any of
-; those call sites in CORDIC_REDUCE, so the push/pop si those inline
-; copies used for caller-safety was pure overhead here -- dropped).
-; Inputs  : SI -> 4-byte ROM float constant
-; Outputs : FLT_B = that constant
-; Clobbers: AX, DI
-; =============================================================================
-load_const_b:
-        mov  di, FLT_B
-        movsw
-        movsw
-        ret
-
-; =============================================================================
-; CORDIC_REDUCE  reduce FLT_A (any-magnitude radians) to r in [0,PI/2)
-; and report the quadrant.
-; GOTCHA: uses its own dedicated CORDIC_C scratch, not FLT_C -- see
-; FLT_C's RAM-map comment for why.
-; Inputs  : FLT_A = angle in radians
-; Outputs : FLT_A = reduced angle r in [0,PI/2); AL = quadrant (0-3)
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, CORDIC_C
-cordic_reduce:
-        ; CORDIC_C = original angle (need it twice: once /2pi for the
-        ; quotient, once again for the final subtract)
-        mov  si, FLT_A
-        mov  di, CORDIC_C
-        movsw
-        movsw
-
-        ; FLT_A = angle / (2*PI)
-        mov  si, two_pi_const
-        call load_const_b
-        call flt_div
-        call flt_to_int          ; AX = int16(angle / 2pi), truncated toward 0
-
-        ; FLT_A = quotient * 2*PI
-        call flt_from_int
-        mov  si, two_pi_const
-        call load_const_b
-        call flt_mul
-
-        ; FLT_A = original_angle - quotient*2*PI  (= t, in (-2pi,2pi))
-        call flt_a_to_b          ; FLT_B = quotient*2*PI
-        mov  si, CORDIC_C
-        mov  di, FLT_A
-        movsw
-        movsw                    ; FLT_A = original angle
-        call flt_sub             ; FLT_A = angle - quotient*2*PI
-
-        ; If still negative, add 2*PI once to land in [0, 2*PI). Exact
-        ; zero has byte[0]==0 (the MBF4 zero encoding) and never sets
-        ; bit 7 of byte[1] in this library's convention, so testing bit
-        ; 7 directly is sufficient -- no separate exact-zero case needed.
-        test byte [FLT_A+1], 0x80
-        jz   .nonneg
-        mov  si, two_pi_const
-        call load_const_b
-        call flt_add
-.nonneg:
-        ; quadrant = floor(t / (PI/2)); since t is now in [0,2*PI), plain
-        ; truncation toward zero IS floor here (no negative case left).
-        ; flt_div computes FLT_A/FLT_B -> FLT_A, so FLT_A must be t and
-        ; FLT_B must be PI/2 -- t is already in FLT_A; just load FLT_B.
-        mov  si, FLT_A
-        mov  di, CORDIC_C        ; stash t again (flt_div will overwrite
-                                  ; FLT_A with the quotient, but the
-                                  ; quadrant calc below needs t itself
-                                  ; back to compute r = t - quadrant*PI/2)
-        movsw
-        movsw
-        mov  si, half_pi_const
-        call load_const_b
-        call flt_div             ; FLT_A = t / (PI/2)
-        call flt_to_int          ; AL = quadrant (0-3; t in [0,2pi) so
-                                  ; this is always exactly 0,1,2, or 3)
-
-        ; r = t - quadrant*(PI/2)
-        push ax                  ; save quadrant across flt_from_int/mul
-        call flt_from_int        ; FLT_A = float(quadrant)
-        mov  si, half_pi_const
-        call load_const_b
-        call flt_mul             ; FLT_A = quadrant * (PI/2)
-        call flt_a_to_b          ; FLT_B = quadrant*(PI/2)
-        mov  si, CORDIC_C
-        mov  di, FLT_A
-        movsw
-        movsw                    ; FLT_A = t (restored from stash)
-        call flt_sub             ; FLT_A = t - quadrant*(PI/2) = r
-        pop  ax                  ; AL = quadrant (restored)
-        ret
-
-; =============================================================================
-; CORDIC_PICK  shared quadrant recombination for DO_SIN_FUNC/DO_COS_FUNC.
-; Register selection (which of CORDIC_X/CORDIC_Y) alternates on quadrant
-; bit0 for BOTH functions -- confirmed against the verified quadrant
-; table (q0..q3: sin=[Y,X,Y,X], cos=[X,Y,X,Y], i.e. always opposite
-; parity from each other, same "bit0 selects" rule). The NEGATE rule is
-; NOT the same for both, though -- re-derived numerically rather than
-; assumed, since a first attempt at this guessed wrong:
-;   SIN negates when quadrant bit1 = 1            (q2,q3)
-;   COS negates when quadrant bit0 XOR bit1 = 1    (q1,q2)
-; The ENTIRE negate decision is computed into DL before AX is loaded
-; with the result word at all -- two earlier drafts of this routine
-; each clobbered half of AX (first AH, then AL, via an 'and al,1' that
-; forgot AL already held the low byte of the loaded result) while
-; computing this decision after the load. Confirmed via emulated
-; testing: COS(0) returned 0.984436 instead of 1.0 because of exactly
-; this (16383 corrupted to 16129 by a stray 'and al,1'). DL is never
-; touched by the [bx]/[si] load (that only writes AX), so there is no
-; register left whose "still holds quadrant bits, not yet the result"
-; state could be confused with "now holds half the result" -- the two
-; pieces of data physically cannot collide on the same register this way.
-; Inputs  : AL = quadrant (0-3)
-;           SI = THIS function's bit0=0 (primary) register address
-;                (DX cannot address memory on 8086 -- only BX/BP/SI/DI
-;                can -- an earlier draft of this routine used DX here
-;                and tinyasm correctly rejected it)
-;           BX = THIS function's bit0=1 (secondary) register address
-;           CH = 0 for SIN's negate rule, 1 for COS's negate rule
-; Outputs : AX = selected, correctly-signed Q14 result
-; Clobbers: AX, CL, DL
-; =============================================================================
-cordic_pick:
-        ; Compute everything from the quadrant FIRST, entirely in
-        ; CL/DL, before AX is touched at all.
-        mov  cl, al
-        and  cl, 1               ; CL = bit0(quadrant) -- register select
-        mov  dl, al
-        shr  dl, 1
-        and  dl, 1               ; DL = bit1(quadrant)
-        test ch, ch
-        jz   .have_negate        ; CH=0 (SIN): negate rule is bit1 alone
-        xor  dl, cl              ; CH=1 (COS): negate rule is bit0 XOR bit1
-.have_negate:
-        ; Now safe to load the result -- CL/DL hold everything needed,
-        ; and neither AL's nor AH's prior content matters any more.
-        test cl, 1
-        jz   .primary
-        mov  ax, [bx]
-        jmp  .test
-.primary:
-        mov  ax, [si]
-.test:
-        test dl, 1
-        jz   .done
-        neg  ax
-.done:
-        ret
+const_0_28086: db 0x7F, 0x0F, 0xCC, 0xE2  ; 0.28086 as MBF4
+const_c1:      db 0x7E, 0x2A, 0x09, 0x02  ; 0.16605 as MBF4
+const_c2:      db 0x79, 0x79, 0x5D, 0x4D  ; 0.00761 as MBF4
 
 ; =============================================================================
 ; DO_SIN_FUNC  SIN(x)          DO_COS_FUNC  COS(x)
-; v2.3: bodies merged -- SIN and COS differed only in which of CORDIC_X/
-; CORDIC_Y is CORDIC_PICK's "primary" (bit0=0) register and in CH (its
-; negate-rule flag); everything else, byte for byte, was identical. Each
-; stub just sets CH and falls into TRIG_COMMON, which derives SI/BX from
-; CH (CH=0 -> SI=Y,BX=X; CH=1 -> SI=X,BX=Y) instead of hardcoding them.
+; v3.0: thin wrappers around FLT_SIN/FLT_COS's minimax-polynomial
+; implementation -- replaces the CORDIC engine entirely (CORDIC_ROTATE_FX,
+; CORDIC_REDUCE, CORDIC_PICK, FLT_TO_FX14, FX14_TO_FLT, and the old
+; merged TRIG_COMMON dispatch, ~360 bytes total including CORDIC_ATAN_TAB
+; and FX14_SCALE). See v3.0 change history for the full accounting.
 ; Inputs  : FLT_A = x (radians, from eat_paren_expr)
 ; Outputs : FLT_A = sin(x) / cos(x)
-; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B, CORDIC_* (SI preserved)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B
 ; =============================================================================
 do_sin_func:
-        mov  ch, 0                ; SIN's negate rule (see TRIG_COMMON)
-        jmp  near trig_common     ; GOTCHA: 'jmp trig_common' (no size
-                                  ; qualifier) was observed to mis-assemble
-                                  ; under yasm's short-jump optimizer for
-                                  ; this exact tiny adjacent-fallthrough
-                                  ; distance -- it encoded EB 00 (target =
-                                  ; next byte = DO_COS_FUNC's "mov ch,1"),
-                                  ; not the intended target, silently
-                                  ; turning every SIN(x) into COS(x).
-                                  ; Forcing 'near' costs 1 byte but is
-                                  ; unambiguous.
+        push si
+        call flt_sin
+        pop  si
+        ret
 
 do_cos_func:
-        mov  ch, 1                ; COS's negate rule (see TRIG_COMMON)
-        ; fall through
-
-trig_common:
-        ; GOTCHA: reached via a tail-call chain (expr2's e2_func_call is
-        ; "jmp [bx+2]", not "call"), so SI holds the caller's real parse
-        ; position on entry and must still hold it on return -- but
-        ; CORDIC_PICK and FX14_TO_FLT both use SI internally. Save/
-        ; restore it here, and call FX14_TO_FLT (not tail-call into it,
-        ; which would clobber SI again after the restore). See change
-        ; history.
         push si
-        call cordic_reduce        ; FLT_A = r [0,PI/2), AL = quadrant
-        mov  [FLT_DE], al        ; stash quadrant -- CORDIC_T can't be
-                                  ; used for this: cordic_rotate_fx
-                                  ; overwrites the whole word every
-                                  ; iteration of its own loop. FLT_DE is
-                                  ; untouched by every flt_* call used
-                                  ; between here and reading it back.
-        call flt_to_fx14          ; AX = Q14(r)
-        mov  [CORDIC_Z], ax
-        mov  word [CORDIC_X], CORDIC_INVK
-        mov  word [CORDIC_Y], 0
-        call cordic_rotate_fx
-        mov  al, [FLT_DE]        ; recover stashed quadrant
-        mov  si, CORDIC_X
-        mov  bx, CORDIC_Y
-        or   ch, ch               ; CH=0 (SIN) -> swap: SI=Y (primary), BX=X
-        jnz  .primary_is_x
-        xchg si, bx
-.primary_is_x:                    ; CH=1 (COS) -> SI=X (primary), BX=Y already
-        call cordic_pick
-        call fx14_to_flt         ; FLT_A = float(AX)  (real call, not
-                                  ; tail-call: SI must be restored AFTER
-                                  ; this returns, since it clobbers SI too)
-        pop  si                  ; restore the real parse position
+        call flt_cos
+        pop  si
+        ret
+
+; =============================================================================
+; DO_ATN_FUNC  ATN(x) -> arctangent in radians, range (-PI/2, PI/2).
+; v2.8: now a thin wrapper around FLT_ATAN's rational approximation
+; (see its own header) -- was CORDIC vectoring-mode before. SI handling
+; kept identical to the CORDIC version even though FLT_ATAN's own
+; internal push/pop si already protects it, to stay consistent with
+; DO_SIN_FUNC/DO_COS_FUNC's pattern and because this is the E2_FUNC_CALL
+; tail-jump entry point, not just an internal helper.
+; Inputs  : FLT_A = x (from eat_paren_expr)
+; Outputs : FLT_A = atan(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS
+; =============================================================================
+do_atn_func:
+        push si
+        call flt_atan
+        pop  si
+        ret
+
+; =============================================================================
+; DO_ASIN_FUNC  ASIN(x) -> arcsine in radians, range (-PI/2, PI/2).
+; Thin wrapper around FLT_ASIN, same pattern as DO_ATN_FUNC.
+; Inputs  : FLT_A = x (from eat_paren_expr)
+; Outputs : FLT_A = asin(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
+;           SQRT_X
+; =============================================================================
+do_asin_func:
+        push si
+        call flt_asin
+        pop  si
+        ret
+
+; =============================================================================
+; DO_ACOS_FUNC  ACOS(x) -> arccosine in radians, range (0, PI).
+; Thin wrapper around FLT_ACOS, same pattern as DO_ATN_FUNC.
+; Inputs  : FLT_A = x (from eat_paren_expr)
+; Outputs : FLT_A = acos(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
+;           SQRT_X
+; =============================================================================
+do_acos_func:
+        push si
+        call flt_acos
+        pop  si
+        ret
+
+; =============================================================================
+; DO_SQRT_FUNC  SQRT(x) -> square root.
+; v3.1: FLT_SQRT existed since v2.6 as ASIN's internal dependency but was
+; never exposed as its own BASIC keyword until now. Thin wrapper, same
+; pattern as DO_ATN_FUNC.
+; Inputs  : FLT_A = x (from eat_paren_expr)
+; Outputs : FLT_A = sqrt(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, SQRT_S, SQRT_X
+; =============================================================================
+do_sqrt_func:
+        push si
+        call flt_sqrt
+        pop  si
+        ret
+
+; =============================================================================
+; DO_TAN_FUNC  TAN(x) -> tangent.
+; Thin wrapper around FLT_TAN, same pattern as DO_ATN_FUNC.
+; Inputs  : FLT_A = x (from eat_paren_expr)
+; Outputs : FLT_A = tan(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, TAN_C
+; =============================================================================
+do_tan_func:
+        push si
+        call flt_tan
+        pop  si
         ret
 
 ROM_END:
