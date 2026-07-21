@@ -17,14 +17,27 @@
   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
+/*
+  LOCAL BUGFIX (this bundle):
+    flag_sbb8()/flag_sbb16() computed the borrow-extended source as
+    'v2 += v3' with v2 declared in the narrow operand type (uint8_t /
+    uint16_t). Whenever v2 was all-1s (0xFF / 0xFFFF) and the incoming
+    carry v3 was 1, that addition wrapped to 0 *inside the narrow type*
+    before ever being widened for the subtraction, silently losing the
+    borrow-out -- SBB would report CF=0 when the correct result is CF=1.
+    Fixed by widening to a separate uint16_t/uint32_t 'src' before
+    adding the carry, so the intermediate sum can't overflow before the
+    subtraction sees it. See flag_sbb8/flag_sbb16 below.
+*/
+
 #include <stdint.h>
 #include <stddef.h>
 #include "cpu.h"
 //  minor path fixes for standalone compile
 // #include "../config.h"
 // #include "../debuglog.h"
-#include "./config.h"
-#include "./debuglog.h"
+#include "config.h"
+#include "debuglog.h"
 
 const uint8_t byteregtable[8] = { regal, regcl, regdl, regbl, regah, regch, regdh, regbh };
 
@@ -213,9 +226,15 @@ FUNC_INLINE void flag_sbb8(CPU_t* cpu, uint8_t v1, uint8_t v2, uint8_t v3) {
 
 	/* v1 = destination operand, v2 = source operand, v3 = carry flag */
 	uint16_t	dst;
+	uint16_t	src;
 
-	v2 += v3;
-	dst = (uint16_t)v1 - (uint16_t)v2;
+	/* BUGFIX: previously 'v2 += v3' with v2 declared uint8_t, so the add
+	   wrapped 256->0 inside the narrow type whenever v2==0xFF and v3==1,
+	   silently losing the borrow-out (CF came back 0 instead of 1). Widen
+	   to a 16-bit 'src' before adding the carry so the intermediate sum
+	   can't overflow before the subtraction below sees it. */
+	src = (uint16_t)v2 + (uint16_t)v3;
+	dst = (uint16_t)v1 - src;
 	flag_szp8(cpu, (uint8_t)dst);
 	if (dst & 0xFF00) {
 		cpu->cf = 1;
@@ -243,9 +262,13 @@ FUNC_INLINE void flag_sbb16(CPU_t* cpu, uint16_t v1, uint16_t v2, uint16_t v3) {
 
 	/* v1 = destination operand, v2 = source operand, v3 = carry flag */
 	uint32_t	dst;
+	uint32_t	src;
 
-	v2 += v3;
-	dst = (uint32_t)v1 - (uint32_t)v2;
+	/* BUGFIX: same class of bug as flag_sbb8 -- widen to a 32-bit 'src'
+	   before adding the carry so v2==0xFFFF && v3==1 can't wrap inside
+	   the narrow type and lose the borrow-out. */
+	src = (uint32_t)v2 + (uint32_t)v3;
+	dst = (uint32_t)v1 - src;
 	flag_szp16(cpu, (uint16_t)dst);
 	if (dst & 0xFFFF0000) {
 		cpu->cf = 1;
