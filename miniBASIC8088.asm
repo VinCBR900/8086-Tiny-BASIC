@@ -1,68 +1,116 @@
 ; =============================================================================
-; miniBASIC 8088  v3.5  (was: uBASIC 8088 v1.7.5)
+; miniBASIC 8088  v3.13
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
-; floating-point support, a rational/polynomial trig library (SIN, COS,
-; TAN, ATN, ASIN, ACOS, SQRT).
+; floating-point support, a polynomial trig/log library (SIN, COS, TAN,
+; ATN, ASIN, ACOS, SQRT, LN, EXP).
+;
+; Statements accepted
+;   END  FOR..TO..STEP  FREE  GOSUB  GOTO  IF..THEN  INPUT  LET  LIST [n,m]
+;   NEW  NEXT  POKE  PRINT [TAB(n)][;][CHR$(n)]  REM  RETURN  RUN
+;
+; Expressions:
+;   + - * / % ^   = < > <= >= <>   unary -
+;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
+;   FREE  LN(flt)  PEEK(addr)  PI  RND  SIN(rad)  TAN(rad)  SQR(flt)  USR(addr)
+;   26 single letter variables, A-Z 
+;
+; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
+; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
+;
+; Trig is RADIANS-native throughout (SIN/COS/TAN/ATN/ASIN/ACOS all take/return
+; radians). Use PI (e.g. "X*180/PI") to convert to degrees for display.
+;
+; FOR/NEXT : loop variable, TO limit, and STEP are all real floats.
+;   "FOR X = 1 TO 10 STEP 0.5" and non-integer TO bounds (e.g. "TO 10.5")
+;   are both fully supported. Max nesting depth is 4.
+;
+; GOSUB/GOTO accept expressions eg GOTO 100+10*B
 ;
 ; Credit: Oscar Toledo G. for bootBASIC inspiration and TinyASM 8086 assembler.
 ;         XTulator CPU core by Mike Chambers.
 ;
 ; KNOWN LIMITATIONS
-;   - Multi-statement lines (':'-separated statements) removed in v2.7 to
-;     reclaim ROM bytes and eliminate REM/PRINT interaction bugs that
-;     arose from colon-splitting. One statement per line only.
+;   - Multi-statement lines (':'-separated statements) not supported. 
 ;
 ;   - TAB(n) prints n literal space characters relative to the current
-;     cursor position -- it does NOT move to absolute column n like
-;     classic BASIC's TAB. Code ported from a dialect with absolute TAB
-;     semantics (e.g. "PRINT TAB(C);..." inside a loop where C is the
-;     running column) will produce cumulative, ever-widening spacing
-;     instead of column alignment; use a fixed per-iteration TAB(k)
-;     (e.g. TAB(1) to advance one column per printed item) instead.
+;     cursor position, not column n.
 ;
 ;   - FLT_ADD's internal "put the larger-magnitude operand first" swap does
 ;     not restore FLT_B's original identity afterward.  If |FLT_B|>|FLT_A| on
 ;     entry, FLT_B ends up holding mangled remnants of the swap rather than
 ;     its own original value.
 ;
+;   - ASIN(x)/ACOS(x): the exact |x|==1 boundary saturates to +/-PI/2 (ASIN)
+;     or 0/PI (ACOS) rather than erroring. |x|>1 (out of domain) is NOT
+;     saturated the same way here -- it falls through to FLT_SQRT clamping
+;     1-x^2's negative value to 0.0, then FLT_DIV's own zero-divisor check
+;     raises a "?2" error. 
+;
+;   - SQRT(negative) clamps to 0.0 (no complex-number support).
+;
+;   - LN(x) for x<=0 raises a "?2" domain error.
+;
+;   - EXP(x) for |x| too large to fit the internal EXP_K scratch byte
+;     (roughly |x| > 88, i.e. beyond this float format's representable
+;     range in either direction) raises a "?2" error.
+;
+;   - ATN accurate to ~1.9e-4 rad (degree-3 odd-polynomial core, v3.11).
+;     SIN/COS accurate to ~0.0002 rad on their core polynomial domain.
+;     SIN/COS range reduction (mod 2*PI) itself breaks down for |x| roughly
+;     >= 205,887 (32767 * 2*PI) -- FLT_TO_INT's int16 saturation there
+;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
 ;
+; v3.13 (2026-07-26) - ROM_END: NASM/ROM  -> 256 bytes, YASM 65 -> 303
+;   - Refactored DISPATCH2's no-match to have not match vector to enable
+;     both function and statement matching.
+;   - DO_PRINT's CHR$/TAB matching migrated from KW_MATCH to MATCH2, with a
+;     new CHK3RD helper 
+;   - Removed now-dead KW_MATCH, CHRS_TAB/TAB_TAB, KW_CHRS/KW_TAB, and constants
+;
+; v3.12 (2026-07-26)
+;   - Updated KNOWN LIMITATIONS to document mathematical function domain boundaries and accuracy.
+;   - Factored out FLT_A_TO_HORNER_T and LDCONST_B_MUL helpers via instruction-level duplicate analysis.
+;   - Added EXP/LN showcase stress test - the hypnotic Eye
+;
+; v3.11 (2026-07-26)
+;   - Added FLT_LN and FLT_EXP keywords, updated FLT_SQRT to use exp(0.5*ln(x)), and upgraded FLT_ATAN to a degree-3 odd polynomial.
+;   - Implemented HORNER_ODD evaluator for shared odd-polynomial calculations.
+;
+; v3.10 (2026-07)
+;   - Completed Stage F of dispatch refactor: migrated THEN/TO/STEP matching in DO_IF/DO_FOR directly to MATCH2.
+;   - Removed EXPECT_TOKEN_OR_KW, unused token tables, and dead token byte constants.
+;
+; v3.9 (2026-07-25)
+;   - Completed Stage E of dispatch refactor: simplified DO_LIST to verbatim text printing.
+;
+; v3.8 (2026-07-25)
+;   - Completed Stage D of dispatch refactor: migrated function dispatch (EXPR2) to MATCH2 and FUNC_TAB2.
+;   - Maintained caller-level SI register protection across function evaluation steps.
+;
+; v3.7 (2026-07-25)
+;   - Completed Stage C of dispatch refactor: migrated statement dispatch (STMT) to MATCH2 and STMT_TAB2.
+;   - Resolved 2-character keyword prefix collisions (GOTO/GOSUB, NEW/NEXT, REM/RETURN) via disambiguation stubs.
+;   - Converted embedded showcase program data to plain text format and removed TOKENIZE routine.
+;
+; v3.6 (2026-07-25)
+;   - Completed Stage B of dispatch refactor: validated MATCH2 and DISPATCH2 routines.
+;   - Fixed stack corruption bug in MATCH2 where register BX was overwritten during table iteration.
+;
 ; v3.5 (2026-07-19)
-;   - BUGFIX: EDITLN corrupted the stored line number when replacing an
-;     existing line (DELINE clobbers DX internally; EDITLN read it again
-;     afterward without saving/restoring it). Caused permanently orphaned,
-;     unreachable duplicate lines on re-edit. Fixed with a push/pop.
-;   - BUGFIX: FLT_PI_B/FLT_2PI_B's byte-overlap self-modifying-code trick
-;     (DB 0x3B) crashed/reset the interpreter for SIN/COS near PI and 2*PI.
-;     Replaced with an equally compact, verified shared-tail merge.
-;   - BUGFIX: showcase VORTEX demo used PRINT TAB(C) assuming classic
-;     absolute-column TAB semantics; this interpreter's TAB(n) prints n
-;     literal spaces relative to the current cursor (see KNOWN LIMITATIONS
-;     history), so C growing 0..60 every row produced cumulative,
-;     ever-widening space runs instead of column alignment. Changed to
-;     TAB(1) for correct single-space-per-column advancement.
-;   - FEATURE: INPUT_LINE now sounds BELL (0x07) on each keystroke once the
-;     62-char line limit is hit, instead of silently dropping the input.
-;   - Code golf: FLT_MUL, FLT_DIV, FLT_ADD, FOR_PTR_HLP, EXPECT_TOKEN_OR_KW,
-;     DO_NEXT, FLT_PRINT micro-optimized (word-load+xchg tricks, 3-op
-;     two's-complement negate, disp8-vs-disp16 pointer reuse, dead-code
-;     removal, 8-bit IMUL, inc/dec+jz/jnz idioms -- see individual routine
-;     headers for details). New shared ONE_MINUS_MUL helper deduped an
-;     identical 5-instruction sequence in FLT_ASIN/FLT_SIN.
-;   - Net effect: ~104 bytes free (ROM variant), up from ~25, despite
-;     adding the BELL feature. All changes verified via assemble + trace +
-;     full regression pass (showcase, arithmetic, trig incl. domain edges,
-;     FOR/NEXT, line insert/replace/delete/out-of-order, 60+ line program).
+;   - Fixed DX register corruption bug in EDITLN during line replacements.
+;   - Replaced overlapping byte trick in FLT_PI_B/FLT_2PI_B with a shared-tail merge.
+;   - Fixed TAB spacing behavior in showcase demo and added visual overflow bell feedback to INPUT_LINE.
+;   - Applied size-optimization passes to math, loop, and dispatch helper routines.
 ;
 ; v3.4 (2026-07-16)
 ;   - Added TAN() and its underlying floating-point implementation.
 ;   - Replaced the showcase program with a "vortex" demo exercising all trig functions.
 ;   - Cleaned up residual CORDIC RAM definitions and documentation.
-;   - Verified trigonometric functions consistently use radians.
 ;
 ; v3.3 (2026-07-15)
 ;   - Fixed an infinite recursion bug when parsing bare parenthesized expressions.
@@ -91,7 +139,7 @@
 ;
 ; v2.7 (2026-07-14)
 ;   - Removed partial multi-statement line support (colon separator) to reclaim ROM space.
-;   - Updated the showcase program to use single-statement lines.
+;   - Updated the showcase program for single-statement lines.
 ;
 ; v2.6 (2026-07-14)
 ;   - Added a floating-point square root routine using Newton-Raphson approximation.
@@ -124,20 +172,18 @@
 ;   - Fixed FOR/NEXT stack corruption.
 ;   - Fixed nested function-call parsing.
 ;   - Fixed TAB(0) and negative TAB() behaviour.
-;   - Replaced the showcase program with floating-point demonstrations.
-;   - Miscellaneous size optimisations.
+;   - Replaced  showcase program with floating-point demonstrations.
 ;
 ; v2.0 (2026-06-23)
-;   - Integrated the MBF4 floating-point library.
 ;   - Expanded ROM and RAM from 2 KB to 4 KB.
+;   - Integrated the MBF4 floating-point library.
 ;   - Converted variables, arithmetic and FOR/NEXT to floating point.
 ;   - Updated BASIC functions and I/O to use MBF4 where appropriate.
 ;   - Unified floating-point error handling with BASIC runtime errors.
 ;   - Fixed merge-related parser and expression-evaluation issues.
 ;
-; v1.7.5 (2026-05-12) 2kByte Tiny BasicSigned 16bit
+; v1.7.5 (2026-05-12) 2kByte Tiny BasicSigned 16bit Origin
 ; =============================================================================
-
 
         cpu 8086
 
@@ -180,29 +226,34 @@ FLT_A:          equ RAM_BASE + 0x101    ; 4 bytes : primary float operand/result
 FLT_B:          equ RAM_BASE + 0x105    ; 4 bytes : secondary float operand
 FLT_C:          equ RAM_BASE + 0x109    ; 4 bytes : LHS park for
                                          ;   prec_engine_f's float dispatch.
-                                         ;   GOTCHA: reserved exclusively for
-                                         ;   that use -- was also once
-                                         ;   accidentally shared with a
-                                         ;   CORDIC scratch of the same
-                                         ;   role, which was a bug (see the
-                                         ;   v2.1 change history); that
-                                         ;   scratch (and the rest of
-                                         ;   CORDIC's RAM workspace) is gone
-                                         ;   now anyway -- CORDIC removed
-                                         ;   entirely in v3.0.
 ATN_FLAGS:      equ RAM_BASE + 0x10D    ; byte    : FLT_ATAN scratch
-                                         ;   (was DO_ATN_FUNC's before
-                                         ;   v2.8); 0x80=original sign,
-                                         ;   0x01=was range-reduced via 1/x
-SQRT_S:         equ RAM_BASE + 0x10E    ; 4 bytes : FLT_SQRT scratch: original S
-SQRT_X:         equ RAM_BASE + 0x112    ; 4 bytes : FLT_SQRT scratch: current x_n
+HORNER_T:       equ RAM_BASE + 0x10E    ; 4 bytes : HORNER_EVAL scratch: the
+                                         ; evaluation point t, held stable
+                                         ; across the whole call
+                                         ; Deliberately NOT
+                                         ; FLT_C (DO_FOR stashes the FOR
+                                         ; loop limit there across STEP-
+                                         ; expression evaluation, which can
+                                         ; contain a nested function call)
+                                         ; or TAN_C (FLT_TAN stashes cos(x)
+                                         ; there across a nested FLT_SIN
+                                         ; call) -- same collision class,
+                                         ; both ruled out for this reason.
+LN_M:           equ RAM_BASE + 0x112    ; 4 bytes : FLT_LN mantissa stash
 TAN_C:          equ RAM_BASE + 0x116    ; 4 bytes : FLT_TAN scratch: cos(x), parked
                                          ;   across the FLT_SIN call (which clobbers
                                          ;   FLT_B, so cos(x) can't be parked there)
+EXP_K:          equ RAM_BASE + 0x11A    ; byte    : FLT_EXP's integer k (assumes
+                                         ;   |k| fits a signed byte -- true for any
+                                         ;   BASIC-reachable float; checked before
+                                         ;   use, ?2 error otherwise). Dedicated
+                                         ;   scratch rather than the real stack --
+                                         ;   simpler/safer than nesting it inside
+                                         ;   FLT_EXP's x park/restore pair.
 
-RUNNING:        equ RAM_BASE + 0x11A    ; byte    : 0=immediate mode, 1=running
-PROG_END:       equ RAM_BASE + 0x11B    ; word    : one past last program byte
-PROGRAM:        equ RAM_BASE + 0x11D    ; program store start
+RUNNING:        equ RAM_BASE + 0x11B    ; byte    : 0=immediate mode, 1=running
+PROG_END:       equ RAM_BASE + 0x11C    ; word    : one past last program byte
+PROGRAM:        equ RAM_BASE + 0x11E    ; program store start
 STACK_TOP:      equ RAM_BASE + RAM_SIZE ; initial SP (grows downward)
 PROGRAM_TOP:    equ STACK_TOP - 0x100   ; 256-byte stack reserve
 
@@ -218,55 +269,6 @@ ERR_UK:         equ 0x34        ; ?4 Bad variable
 ERR_RT:         equ 0x35        ; ?5 RETURN without GOSUB
 ERR_NF:         equ 0x36        ; ?6 NEXT without FOR
 ERR_BRK:        equ 0x42        ; ?B NMI break (ROM version, no room)
-
-; =============================================================================
-; KEYWORD TERMINATOR CONSTANTS  (last byte of keyword string = ASCII | 0x80)
-; =============================================================================
-
-T_B:            equ 0xC2        ; 'B'+0x80  used by: GOSUB, TAB
-T_D:            equ 0xC4        ; 'D'+0x80  used by: END
-T_E:            equ 0xC5        ; 'E'+0x80  used by: POKE, FREE
-T_F:            equ 0xC6        ; 'F'+0x80  used by: IF
-T_K:            equ 0xCB        ; 'K'+0x80  used by: PEEK
-T_M:            equ 0xCD        ; 'M'+0x80  used by: REM
-T_N:            equ 0xCE        ; 'N'+0x80  used by: RUN, THEN
-T_O:            equ 0xCF        ; 'O'+0x80  used by: GOTO
-T_P:            equ 0xD0        ; 'P'+0x80  used by: HELP
-T_R:            equ 0xD2        ; 'R'+0x80  used by: USR
-T_S:            equ 0xD3        ; 'S'+0x80  used by: ABS
-T_T:            equ 0xD4        ; 'T'+0x80  used by: PRINT, LIST, INPUT, LET, NEXT, NOT
-T_W:            equ 0xD7        ; 'W'+0x80  used by: NEW
-T_Y:            equ 0xD9        ; 'Y'+0x80  used by: DELAY
-T_DS:           equ 0xA4        ; '$'+0x80  used by: CHR$
-
-; =============================================================================
-; TOKEN BYTES  (0x80+ stored in program lines; order matches st_tab)
-; =============================================================================
-
-TK_PRINT:       equ 0x80        ; --- statement tokens (dispatched by stmt) ---
-TK_IF:          equ 0x81
-TK_GOTO:        equ 0x82
-TK_LIST:        equ 0x83
-TK_RUN:         equ 0x84
-TK_NEW:         equ 0x85
-TK_INPUT:       equ 0x86
-TK_REM:         equ 0x87
-TK_END:         equ 0x88
-TK_LET:         equ 0x89
-TK_POKE:        equ 0x8A
-TK_FREE:        equ 0x8B
-TK_HELP:        equ 0x8C
-TK_GOSUB:       equ 0x8D
-TK_RETURN:      equ 0x8E
-TK_FOR:         equ 0x8F
-TK_NEXT:        equ 0x90
-TK_OUT:         equ 0x91
-TK_DELAY:       equ 0x92
-NUM_TOKENS:     equ 19          ; count: TK_PRINT (0x80) .. TK_DELAY (0x92)
-
-TK_THEN:        equ 0x93        ; --- sub-keywords (not in st_tab, not dispatched) ---
-TK_TO:          equ 0x94
-TK_STEP:        equ 0x95
 
 ; =============================================================================
 ; ROM BITBANG SERIAL  (Intel 8755 Port A, 4800 baud @ 5 MHz)
@@ -286,11 +288,9 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 ;   Lines 500-540 : subroutine: sum 1..10
 ;   Lines 550-590 : subroutine: factorial 5
 ;   Lines 600-610 : subroutine: Mandelbrot escape recorder
+;   Lines 700-717 : Damped Wave -- EXP/SIN stress test w/ text axis
+;   Lines 730-758 : Hypnotic Eye -- LN/EXP/SQRT/SIN logarithmic ripple
 ;
-; Token map (v1.7.5):
-;   PRINT=0x80  IF=0x81  GOSUB=0x8D  RETURN=0x8E  END=0x88
-;   FOR=0x8F    NEXT=0x90  OUT=0x91  DELAY=0x92
-;   THEN=0x93   TO=0x94    STEP=0x95  REM=0x87
 ; =============================================================================
 
 %ifdef __YASM_MAJOR__
@@ -301,103 +301,244 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 
 SHOWCASE_DATA:
         ; ── Feature demos: arithmetic, comparisons, FOR/NEXT, GOSUB ───────────────
-        db 0x0A,0x00, 0x87, "miniBASIC 8088 v3.5 showcase", 0x0D ; 10  REM
-        db 0x14,0x00, 0x80, 0x22, "--- ARITHMETIC ---", 0x22, 0x0D ; 20  PRINT
-        db 0x1E,0x00, 0x80, 0x22, "2+3=", 0x22, ";2+3;", 0x22, "  6*7=", 0x22, ";6*7", 0x0D ; 30  PRINT
-        db 0x28,0x00, 0x80, 0x22, "20/4=", 0x22, ";20/4;", 0x22, "  17%5=", 0x22, ";17%5", 0x0D ; 40  PRINT
-        db 0x32,0x00, 0x80, 0x22, "1.5+2.25=", 0x22, ";1.5+2.25", 0x0D ; 50  PRINT
-        db 0x3C,0x00, 0x80, 0x22, "--- COMPARISONS ---", 0x22, 0x0D ; 60  PRINT
-        db 0x46,0x00, 0x81, "5>3", 0x93, 0x80, 0x22, "5>3 ok", 0x22, 0x0D ; 70  IF THEN(0x93) PRINT
-        db 0x50,0x00, 0x81, "3<5", 0x93, 0x80, 0x22, "3<5 ok", 0x22, 0x0D ; 80  IF THEN(0x93) PRINT
-        db 0x5A,0x00, 0x81, "3>=3", 0x93, 0x80, 0x22, "3>=3 ok", 0x22, 0x0D ; 90  IF THEN(0x93) PRINT
-        db 0x64,0x00, 0x81, "4<>3", 0x93, 0x80, 0x22, "4<>3 ok", 0x22, 0x0D ; 100 IF THEN(0x93) PRINT
-        db 0x6E,0x00, 0x80, 0x22, "--- FOR/NEXT ---", 0x22, 0x0D ; 110 PRINT
-        db 0x78,0x00, 0x8F, "I=1", 0x94, "5", 0x0D ; 120 FOR I=1 TO(0x94) 5
-        db 0x82,0x00, 0x80, "I;", 0x0D             ; 130 PRINT I;
-        db 0x8C,0x00, 0x90, "I", 0x0D              ; 140 NEXT I
-        db 0x96,0x00, 0x80, 0x22, 0x22, 0x0D       ; 150 PRINT ""
-        db 0xA0,0x00, 0x80, 0x22, "--- GOSUB ---", 0x22, 0x0D ; 160 PRINT
-        db 0xAA,0x00, 0x8D, "500", 0x0D            ; 170 GOSUB 500
-        db 0xB4,0x00, 0x80, 0x22, "sum 1..10=", 0x22, ";S", 0x0D ; 180 PRINT
-        db 0xBE,0x00, 0x8D, "550", 0x0D            ; 190 GOSUB 550
-        db 0xC8,0x00, 0x80, 0x22, "5!=", 0x22, ";F", 0x0D ; 200 PRINT
-        db 0xD2,0x00, 0x80, 0x22, 0x22, 0x0D       ; 210 PRINT ""
+        dw 10
+        db "REM miniBASIC 8088 v3.5 showcase", 0x0D
+        dw 20
+        db "PRINT ", 0x22, "--- ARITHMETIC ---", 0x22, 0x0D
+        dw 30
+        db "PRINT ", 0x22, "2+3=", 0x22, ";2+3;", 0x22, " 6*7=", 0x22, ";6*7", 0x0D
+        dw 40
+        db "PRINT ", 0x22, "20/4=", 0x22, ";20/4;", 0x22, " 17%5=", 0x22, ";17%5", 0x0D
+        dw 50
+        db "PRINT ", 0x22, "1.5+2.25=", 0x22, ";1.5+2.25", 0x0D
+        dw 60
+        db "PRINT ", 0x22, "--- COMPARISONS ---", 0x22, 0x0D
+        dw 70
+        db "IF 5>3 THEN PRINT ", 0x22, "5>3 ok", 0x22, 0x0D
+        dw 80
+        db "IF 3<5 THEN PRINT ", 0x22, "3<5 ok", 0x22, 0x0D
+        dw 90
+        db "IF 3>=3 THEN PRINT ", 0x22, "3>=3 ok", 0x22, 0x0D
+        dw 100
+        db "IF 4<>3 THEN PRINT ", 0x22, "4<>3 ok", 0x22, 0x0D
+        dw 110
+        db "PRINT ", 0x22, "--- FOR/NEXT ---", 0x22, 0x0D
+        dw 120
+        db "FOR I=1 TO 5", 0x0D
+        dw 130
+        db "PRINT I;", 0x0D
+        dw 140
+        db "NEXT I", 0x0D
+        dw 150
+        db "PRINT ", 0x22, 0x22, 0x0D
+        dw 160
+        db "PRINT ", 0x22, "--- GOSUB ---", 0x22, 0x0D
+        dw 170
+        db "GOSUB 500", 0x0D
+        dw 180
+        db "PRINT ", 0x22, "sum 1..10=", 0x22, ";S", 0x0D
+        dw 190
+        db "GOSUB 550", 0x0D
+        dw 200
+        db "PRINT ", 0x22, "5!=", 0x22, ";F", 0x0D
+        dw 210
+        db "PRINT ", 0x22, 0x22, 0x0D
         ; ── Vortex: trig-library stress test (SIN, COS, TAN, ASIN, ACOS, ATN, ─
         ; SQRT), replaced the old CORDIC sine-wave demo in v3.4.
-        db 0xDC,0x00, 0x87, "============================================", 0x0D ; 220  REM
-        db 0xDD,0x00, 0x87, "VORTEX.BAS V1.0 - TRIG LIBRARY STRESS TEST", 0x0D ; 221  REM
-        db 0xDE,0x00, 0x87, "RENDERS A WARPED 3D SPIRAL VORTEX TO TEST:", 0x0D ; 222  REM
-        db 0xDF,0x00, 0x87, "SIN, COS, TAN, ASIN, ACOS, ATN, SQRT", 0x0D ; 223  REM
-        db 0xE0,0x00, 0x87, "============================================", 0x0D ; 224  REM
-        db 0xE1,0x00, "H=27", 0x0D ; 225
-        db 0xE2,0x00, "V=13", 0x0D ; 226
-        db 0xE3,0x00, 0x8F, "R=0", 0x94, "26", 0x0D ; 227 FOR R=0 TO(0x94) 26
-        db 0xE4,0x00, 0x8F, "C=0", 0x94, "60", 0x0D ; 228 FOR C=0 TO(0x94) 60
-        db 0xE5,0x00, "X=(C-30)/H", 0x0D ; 229
-        db 0xE6,0x00, "Y=(R-13)/V", 0x0D ; 230
-        db 0xE7,0x00, "D=SQRT(X*X+Y*Y)", 0x0D ; 231
-        db 0xE8,0x00, 0x81, "D>1.2", 0x93, 0x82, "255", 0x0D ; 232 IF THEN(0x93) GOTO(0x82) 255
-        db 0xE9,0x00, 0x81, "X=0", 0x93, 0x82, "236", 0x0D ; 233 IF THEN(0x93) GOTO(0x82) 236
-        db 0xEA,0x00, "T=ATN(Y/X)", 0x0D ; 234
-        db 0xEB,0x00, 0x82, "237", 0x0D ; 235 GOTO 237
-        db 0xEC,0x00, "T=1.5708", 0x0D ; 236
-        db 0xED,0x00, 0x87, "--- TEST SIN/COS ---", 0x0D ; 237  REM
-        db 0xEE,0x00, "W=SIN(6*D-3*T)", 0x0D ; 238
-        db 0xEF,0x00, 0x87, "--- TEST TAN ---", 0x0D ; 239  REM
-        db 0xF0,0x00, "U=TAN(W*0.5)", 0x0D ; 240
-        db 0xF1,0x00, 0x87, "--- BOUND VALUE TO [-0.99, 0.99] ---", 0x0D ; 241  REM
-        db 0xF2,0x00, "P=COS(U)*0.99", 0x0D ; 242
-        db 0xF3,0x00, 0x87, "--- TEST ASIN/ACOS ---", 0x0D ; 243  REM
-        db 0xF4,0x00, "A=ACOS(P)", 0x0D ; 244
-        db 0xF5,0x00, "B=ASIN(P)", 0x0D ; 245
-        db 0xF6,0x00, 0x87, "--- MATH SHADE VALUE ---", 0x0D ; 246  REM
-        db 0xF7,0x00, "Z=(A-B)/3.1416", 0x0D ; 247
-        db 0xF8,0x00, 0x87, "--- MAP TO ASCII CHARS (recalibrated -- see change history) ---", 0x0D ; 248  REM
-        db 0xF9,0x00, "S=32", 0x0D ; 249
-        db 0xFA,0x00, 0x81, "Z>-0.36", 0x93, "S=46", 0x0D ; 250 IF THEN(0x93) S=46
-        db 0xFB,0x00, 0x81, "Z>-0.3", 0x93, "S=43", 0x0D ; 251 IF THEN(0x93) S=43
-        db 0xFC,0x00, 0x81, "Z>-0.24", 0x93, "S=79", 0x0D ; 252 IF THEN(0x93) S=79
-        db 0xFD,0x00, 0x81, "Z>-0.18", 0x93, "S=64", 0x0D ; 253 IF THEN(0x93) S=64
-        db 0xFE,0x00, 0x80, "CHR$(S);", 0x0D ; 254 PRINT
-        db 0xFF,0x00, 0x90, "C", 0x0D ; 255 NEXT C
-        db 0x00,0x01, 0x80, 0x0D ; 256 PRINT
-        db 0x01,0x01, 0x90, "R", 0x0D ; 257 NEXT R
-        db 0x02,0x01, 0x88, 0x0D ; 258 END
+        dw 220
+        db "REM ============================================", 0x0D
+        dw 222
+        db "PRINT ", 0x22, "--- Render a Warped Spiral to test TRIG ---", 0x22, 0x0D
+        dw 223
+        db "REM SIN, COS, TAN, ASIN, ACOS, ATN, SQRT", 0x0D
+        dw 224
+        db "REM ============================================", 0x0D
+        dw 225
+        db "H=27", 0x0D
+        dw 226
+        db "V=13", 0x0D
+        dw 227
+        db "FOR R=0 TO 26", 0x0D
+        dw 228
+        db "FOR C=0 TO 60", 0x0D
+        dw 229
+        db "X=(C-30)/H", 0x0D
+        dw 230
+        db "Y=(R-13)/V", 0x0D
+        dw 231
+        db "D=SQRT(X*X+Y*Y)", 0x0D
+        dw 232
+        db "IF D>1.2 THEN GOTO 255", 0x0D
+        dw 233
+        db "IF X=0 THEN GOTO 236", 0x0D
+        dw 234
+        db "T=ATN(Y/X)", 0x0D
+        dw 235
+        db "GOTO 237", 0x0D
+        dw 236
+        db "T=1.5708", 0x0D
+        dw 237
+        db "REM --- TEST SIN/COS ---", 0x0D
+        dw 238
+        db "W=SIN(6*D-3*T)", 0x0D
+        dw 239
+        db "REM --- TEST TAN ---", 0x0D
+        dw 240
+        db "U=TAN(W*0.5)", 0x0D
+        dw 241
+        db "REM --- BOUND VALUE TO [-0.99, 0.99] ---", 0x0D
+        dw 242
+        db "P=COS(U)*0.99", 0x0D
+        dw 243
+        db "REM --- TEST ASIN/ACOS ---", 0x0D
+        dw 244
+        db "A=ACOS(P)", 0x0D
+        dw 245
+        db "B=ASIN(P)", 0x0D
+        dw 246
+        db "REM --- MATH SHADE VALUE ---", 0x0D
+        dw 247
+        db "Z=(A-B)/3.1416", 0x0D
+        dw 248
+        db "REM --- MAP TO ASCII CHARS (recalibrated -- see change history) ---", 0x0D
+        dw 249
+        db "S=32", 0x0D
+        dw 250
+        db "IF Z>-0.36 THEN S=46", 0x0D
+        dw 251
+        db "IF Z>-0.3 THEN S=43", 0x0D
+        dw 252
+        db "IF Z>-0.24 THEN S=79", 0x0D
+        dw 253
+        db "IF Z>-0.18 THEN S=64", 0x0D
+        dw 254
+        db "PRINT CHR$(S);", 0x0D
+        dw 255
+        db "NEXT C", 0x0D
+        dw 256
+        db "PRINT ", 0x0D
+        dw 257
+        db "NEXT R", 0x0D
         ; ── Mandelbrot: native MBF4 float, no fixed-point scaling needed ─────
-        db 0x18,0x01, 0x80, 0x22, "--- MANDELBROT (FLOAT) ---", 0x22, 0x0D ; 280 PRINT
-        db 0x22,0x01, 0x8F, "I=-1", 0x94, "1 ", 0x95, "0.18", 0x0D ; 290 FOR I=-1 TO(0x94) 1 STEP(0x95) 0.18
-        db 0x2C,0x01, 0x8F, "C=-2", 0x94, "0.5 ", 0x95, "0.045", 0x0D ; 300 FOR C=-2 TO(0x94) 0.5 STEP(0x95) 0.045
-        db 0x36,0x01, "A=C", 0x0D                  ; 310
-        db 0x37,0x01, "B=I", 0x0D                  ; 311
-        db 0x38,0x01, "E=0", 0x0D                  ; 312
-        db 0x40,0x01, 0x8F, "N=1", 0x94, "16", 0x0D ; 320 FOR N=1 TO(0x94) 16
-        db 0x4A,0x01, "T=A*A-B*B+C", 0x0D          ; 330
-        db 0x54,0x01, "B=2*A*B+I", 0x0D            ; 340
-        db 0x5E,0x01, "A=T", 0x0D                  ; 350
-        db 0x68,0x01, 0x81, "A*A+B*B>4", 0x93, 0x8D, "600", 0x0D ; 360 IF THEN(0x93) GOSUB 600
-        db 0x72,0x01, 0x90, "N", 0x0D              ; 370 NEXT N
-        db 0x7C,0x01, 0x81, "E>0", 0x93, 0x80, "CHR$(E+32);", 0x0D ; 380 IF THEN(0x93) PRINT
-        db 0x86,0x01, 0x81, "E=0", 0x93, 0x80, "CHR$(32);", 0x0D ; 390 IF THEN(0x93) PRINT
-        db 0x90,0x01, 0x90, "C", 0x0D              ; 400 NEXT C
-        db 0x9A,0x01, 0x80, 0x22, 0x22, 0x0D       ; 410 PRINT ""
-        db 0xA4,0x01, 0x90, "I", 0x0D              ; 420 NEXT I
-        db 0xAE,0x01, 0x88, 0x0D                   ; 430 END
+        dw 280
+        db "PRINT ", 0x22, "--- MANDELBROT (FLOAT) ---", 0x22, 0x0D
+        dw 290
+        db "FOR I=-1 TO 1 STEP 0.18", 0x0D
+        dw 300
+        db "FOR C=-2 TO 0.5 STEP 0.045", 0x0D
+        dw 310
+        db "A=C", 0x0D
+        dw 311
+        db "B=I", 0x0D
+        dw 312
+        db "E=0", 0x0D
+        dw 320
+        db "FOR N=1 TO 16", 0x0D
+        dw 330
+        db "T=A*A-B*B+C", 0x0D
+        dw 340
+        db "B=2*A*B+I", 0x0D
+        dw 350
+        db "A=T", 0x0D
+        dw 360
+        db "IF A*A+B*B>4 THEN GOSUB 600", 0x0D
+        dw 370
+        db "NEXT N", 0x0D
+        dw 380
+        db "IF E>0 THEN PRINT CHR$(E+32);", 0x0D
+        dw 390
+        db "IF E=0 THEN PRINT CHR$(32);", 0x0D
+        dw 400
+        db "NEXT C", 0x0D
+        dw 410
+        db "PRINT ", 0x22, 0x22, 0x0D
+        dw 420
+        db "NEXT I", 0x0D
+        dw 430
+        db "GOTO 730", 0x0D
         ; ── Subroutine 500: sum 1..10 ──────────────────────────────────────
-        db 0xF4,0x01, "S=0", 0x0D                  ; 500
-        db 0xFE,0x01, 0x8F, "J=1", 0x94, "10", 0x0D ; 510 FOR J=1 TO(0x94) 10
-        db 0x08,0x02, "S=S+J", 0x0D                ; 520
-        db 0x12,0x02, 0x90, "J", 0x0D              ; 530 NEXT J
-        db 0x1C,0x02, 0x8E, 0x0D                   ; 540 RETURN
+        dw 500
+        db "S=0", 0x0D
+        dw 510
+        db "FOR J=1 TO 10", 0x0D
+        dw 520
+        db "S=S+J", 0x0D
+        dw 530
+        db "NEXT J", 0x0D
+        dw 540
+        db "RETURN", 0x0D
         ; ── Subroutine 550: factorial 5 ───────────────────────────────────
-        db 0x26,0x02, "F=1", 0x0D                  ; 550
-        db 0x30,0x02, 0x8F, "K=1", 0x94, "5", 0x0D ; 560 FOR K=1 TO(0x94) 5
-        db 0x3A,0x02, "F=F*K", 0x0D                ; 570
-        db 0x44,0x02, 0x90, "K", 0x0D              ; 580 NEXT K
-        db 0x4E,0x02, 0x8E, 0x0D                   ; 590 RETURN
+        dw 550
+        db "F=1", 0x0D
+        dw 560
+        db "FOR K=1 TO 5", 0x0D
+        dw 570
+        db "F=F*K", 0x0D
+        dw 580
+        db "NEXT K", 0x0D
+        dw 590
+        db "RETURN", 0x0D
         ; ── Subroutine 600: record Mandelbrot escape iteration ───────────
-        db 0x58,0x02, 0x81, "E=0 ", 0x93, "E=N", 0x0D ; 600 IF THEN(0x93)
-        db 0x62,0x02, 0x8E, 0x0D                   ; 610 RETURN
-        dw 0                                                                ; end sentinel
+        dw 600
+        db "IF E=0 THEN E=N", 0x0D
+        dw 610
+        db "RETURN", 0x0D
+        ; ── Hypnotic Eye: LN/EXP/SQRT/SIN stress test, logarithmic ripple ───
+        dw 730
+        db "REM ==========================================", 0x0D
+        dw 733
+        db "PRINT ", 0x22, "=== HYPNOTIC EYE - LN/EXP/TRIG STRESS TEST ===", 0x22, 0x0D
+        dw 734
+        db "FOR R=0 TO 26", 0x0D
+        dw 735
+        db "LET Y=(R-13)/10", 0x0D
+        dw 736
+        db "LET L=0", 0x0D
+        dw 737
+        db "FOR C=0 TO 60", 0x0D
+        dw 738
+        db "LET X=(C-30)/20", 0x0D
+        dw 739
+        db "LET D=SQRT(X*X+Y*Y)", 0x0D
+        dw 740
+        db "REM -- Catch center to avoid LN(0) crash --", 0x0D
+        dw 741
+        db "IF D<0.05 THEN GOTO 752", 0x0D
+        dw 742
+        db "REM -- The Math: Sine wave dampened by EXP and LN --", 0x0D
+        dw 743
+        db "LET W=SIN(10*D) * EXP(-0.5 * (LN(D)*LN(D)))", 0x0D
+        dw 744
+        db "REM -- Map to positive space --", 0x0D
+        dw 745
+        db "LET Z=(W+1)/2", 0x0D
+        dw 746
+        db "LET S=32", 0x0D
+        dw 747
+        db "IF Z>0.30 THEN LET S=46", 0x0D
+        dw 748
+        db "IF Z>0.45 THEN LET S=45", 0x0D
+        dw 749
+        db "IF Z>0.60 THEN LET S=43", 0x0D
+        dw 750
+        db "IF Z>0.75 THEN LET S=42", 0x0D
+        dw 751
+        db "IF Z>0.90 THEN LET S=64", 0x0D
+        dw 752
+        db "IF D<0.05 THEN LET S=32", 0x0D
+        dw 753
+        db "PRINT TAB(C-L);CHR$(S);", 0x0D
+        dw 754
+        db "LET L=C+1", 0x0D
+        dw 755
+        db "NEXT C", 0x0D
+        dw 756
+        db "PRINT ", 0x0D
+        dw 757
+        db "NEXT R", 0x0D
+        dw 758
+        db "END", 0x0D
+        dw 0      ; end sentinel
 SHOWCASE_END:
         times ORIGIN-($-$$) db 0
 %else
@@ -448,7 +589,6 @@ start:
         ; Signon banner; fall through to main_loop
         mov  si, str_banner
         call dp_str
-        call do_free
 
 ; =============================================================================
 ; MAIN_LOOP  prompt / read / dispatch
@@ -470,8 +610,6 @@ main_loop:
         or   ax, ax
         jne  ml_numbered
         call stmt                ; no line number: execute immediately
-                                  ; (was stmt_line -- multi-statement colon
-                                  ; support removed v2.7, see change history)
         jmp  short main_loop
 ml_numbered:
         call editln             ; numbered line: store/edit in program
@@ -513,10 +651,6 @@ do_if_false:
 
 ; =============================================================================
 ; PEEK_LINE  test whether SI is at end-of-line (CR)
-; v2.7: was "end-of-statement (CR or ':')" -- ':' dropped along with
-; multi-statement colon support, see change history. Label kept as
-; 'sl_ret' for its single RET (was also STMT_LINE's return point before
-; that routine was removed in the same change; name is now just legacy).
 ; Inputs  : SI -> current position
 ; Outputs : ZF=1 at CR, ZF=0 otherwise
 ; Clobbers: (none)
@@ -529,7 +663,12 @@ sl_ret:
 
 ; =============================================================================
 ; DO_IF  IF <expr> [THEN] <stmt>
-; Handles tokenised THEN (TK_THEN = 0x93) and plain-text THEN.
+; Stage F (v3.10): THEN matched directly via MATCH2 ("TH" prefix, same
+; mechanism as every statement/function keyword now) instead of the old
+; token-byte-or-kw_match duality. THEN is optional -- CF is intentionally
+; not checked: if MATCH2 doesn't find "TH" at all, SI is left unchanged
+; (per MATCH2's own contract) and STMT dispatches whatever's actually
+; there directly, exactly as before.
 ; v2.0: expr returns float in FLT_A; truncated to int16 here for the
 ; branch test (the only place in this file that needs expr's result as a
 ; plain boolean rather than a value to store/print/use further).
@@ -542,71 +681,91 @@ do_if:
         or   ax, ax
         je   do_if_false
         call spaces
-        cmp  byte [si], TK_THEN
-        jne  di_kw_then
-        inc  si                 ; consume token
-        jmp  stmt
-
-di_kw_then:
-        mov  bx, then_tab       ; THEN is optional in direct mode
-        call kw_match
-        ; fall through to stmt
+        mov  ax, 0x4854          ; "TH" (low='T', high='H') -- THEN
+        call match2
+        ; fall through to stmt (CF ignored -- THEN is optional)
 
 ; =============================================================================
-; STMT  execute one statement from SI
-; Token fast-path: stored programs use keyword tokens (0x80+).
-; Direct-mode input falls through to the kw_match loop.
-; Inputs  : SI -> statement (token byte or raw text)
+; STMT  execute one statement from SI  (Stage C: dispatch2/match2 based)
+; v3.13: now genuinely tail-jumps into the shared DISPATCH2 (see its own
+; header) instead of inlining a duplicate copy of its table-walk loop --
+; safe specifically because STMT enters it via JMP, not CALL, and
+; STMT_TAB2's sentinel now carries its own no-match vector (DO_LET)
+; instead of STMT checking CF itself. No behavior change from the
+; caller's side: still "call stmt", matched statement's own RET still
+; lands in STMT's caller, no match still falls through to DO_LET.
+; Inputs  : SI -> statement text
 ; Outputs : (none)
-; Clobbers: AX, BX, CX, DX, SI, DI
+; Clobbers: AX, BX, CX, DX, SI, DI (per whichever handler is entered)
 ; =============================================================================
 stmt:
         call peek_line
         je   sl_ret
-        mov  al, [si]
-        cmp  al, TK_PRINT               ; below token range?
-        jb   stmt_text
-        cmp  al, TK_PRINT + NUM_TOKENS  ; above dispatchable range?
-        jnb  stmt_text
-
-        ; Token fast-path (stored programs)
-        inc  si                         ; consume token byte
-        mov  bx, st_tab
-        call get_token_ptr              ; BX -> st_tab entry
-        jmp  word [bx]
-
-        ; Text fall-through (direct mode)
-stmt_text:
-        mov  bx, tk_kw_tab
-        mov  cx, NUM_TOKENS
-stmt_lp:
-        call kw_match
-        jnc  stmt_call
-        add  bx, 2
-        loop stmt_lp
-        jmp  do_let                     ; no keyword -> implicit LET
-stmt_call:
-        sub  bx, tk_kw_tab              ; BX = index * 2
-        jmp  word [bx + st_tab]
-
+        mov  bx, stmt_tab2
+        ;jmp  dispatch2
+        ; drop through
 ; =============================================================================
-; GET_TOKEN_PTR  map token byte to table-entry address
-; Inputs  : AL = token byte (>= TK_PRINT),  BX = table base
-; Outputs : BX = &table[token - TK_PRINT]
-; Clobbers: AX
+; DISPATCH2  walk a combined keyword+handler table, find a 2-char match
+; (via MATCH2), and dispatch. Table format: pairs of words -- packed
+; 2-char value (bit15 set = "this entry takes 1 argument"), handler
+; address -- terminated by a 0xFFFF sentinel whose OWN second word is the
+; table's no-match vector (not a handler address): e.g.
+;
+; MUST be entered via JMP, never CALL (see STMT/EXPR2, its only two
+; callers) -- every exit here is a pure tail dispatch (no return address
+; is ever left pushed by DISPATCH2 itself), so whichever of the two
+; called *it* via JMP gets its own original caller reached correctly on
+; every path: match, 1-arg match, or miss.
+;
+; Bit15 clear entries (statements, and niladic functions like PI/RND/
+; FREE) are tail-jumped to directly -- the handler is responsible for
+; protecting SI itself if it clobbers it. Bit15 set entries (1-arg
+; functions) call EAT_PAREN_EXPR first (FLT_A = argument, SI past ')'),
+; then CALL the handler with SI pushed/popped centrally here (real 8088
+; constraint 65C02 doesn't share: SI is both parse position and the
+; float library's scratch register there, unlike 6502's dedicated
+; zero-page IP -- so this one path can't be a pure tail-jump the way
+; 65C02's equivalent is). Its own RET still reaches the right place: SI
+; save/restore nets to zero extra stack depth, so the RET pops exactly
+; the return address DISPATCH2's own caller's caller left behind.
+; Inputs  : SI -> input text, BX -> table
+; Outputs : does not return here on any path -- see above.
+; Clobbers: AX, BX, CX, DX, SI (advanced on match)
 ; =============================================================================
-get_token_ptr:
-        sub  al, TK_PRINT       ; 0-based index
-        cbw
-        add  ax, ax             ; * 2 (word table)
-        add  bx, ax
-        ret
+dispatch2:
+        mov  ax, [bx]
+        cmp  ax, 0xFFFF
+        je   d2_nomatch
+        mov  dx, ax
+        and  dx, 0x7FFF          ; strip the 1-arg flag for the compare
+        mov  ax, dx
+        call match2
+        jnc  d2_found
+        add  bx, 4               ; next entry: packed_word(2) + handler(2)
+        jmp  short dispatch2
+d2_found:
+        mov  ax, [bx]            ; reload entry word (MATCH2 clobbered AX)
+        mov  bx, [bx+2]          ; BX = handler address
+        test ax, 0x8000
+        jz   d2_jmp
+        push bx
+        call eat_paren_expr      ; FLT_A = argument value, SI past ')'
+        pop  bx
+        push si                  ; 1-arg function: protect SI centrally
+        call bx
+        pop  si
+        ret                      ; reaches DISPATCH2's caller's caller --
+                                  ; see header (jmp-entry means no extra
+                                  ; frame was ever pushed here)
+d2_jmp:
+        jmp  bx                  ; statement/niladic: tail-call
+d2_nomatch:
+        jmp  word [bx+2]         ; table-driven no-match vector: tail-call
 
 ; =============================================================================
 ; DO_LET  [LET] <var> = <expr>
 ; v2.0: expr now always returns float in FLT_A directly (see expr's own
 ; header for the precision-loss bug this fixes) -- no promotion needed
-; here.
 ; Inputs  : SI -> variable name
 ; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, FLT_C
 ; =============================================================================
@@ -673,53 +832,90 @@ get_var_addr:
         ret
 
 ; =============================================================================
-; KW_MATCH  case-insensitive keyword match at [SI]
-; Inputs  : BX -> table entry (word = pointer to bit-7-terminated keyword string)
+; MATCH2  case-insensitive match of AX (a packed 2-char value) against the
+; next 2 input characters at SI, then skip any further trailing A-Z/$
+; characters so SI lands past the whole word, not just its first 2 chars
+; (e.g. matching "TO" against "PRINT" -- wait, that never matches; but
+; matching "PR" against "PRINT" must still skip "INT" afterward for SI to
+; land correctly). Standalone reusable primitive -- also the core DISPATCH2
+; below is built on, and what Stage F's THEN/TO/STEP checks will call
+; directly (no table walk needed there, just one known expected value).
+; Inputs  : AX = expected value, LOW byte = 1st char, HIGH byte = 2nd
+;           char, BOTH UPPERCASE (caller's responsibility -- table
+;           entries are authored uppercase already)
 ;           SI -> input text
-; Outputs : CF=0 matched (SI advanced past keyword)
-;           CF=1 no match (SI unchanged)
-; Clobbers: AX, DI, DL
+; Outputs : CF=0 match, SI advanced past the whole matched word
+;           CF=1 no match, SI unchanged
+; Clobbers: AX, CX (CL only), DX
 ; =============================================================================
-kw_match:
+match2:
         push si
-        call spaces
-        mov  di, [bx]           ; DI -> keyword string
-.match_lp:
-        mov  al, [di]
-        inc  di
-        mov  dl, al             ; DL: char + bit-7 end-of-word flag
-        and  al, 0x7F
-        call uc_al
-        mov  ah, al             ; AH = uppercased keyword char
-        lodsb                   ; AL = input char, SI++
-        call uc_al
-        cmp  al, ah
-        jne  .fail
-        test dl, 0x80           ; last keyword char?
-        jz   .match_lp
-
-        ; Boundary check: reject prefix match (e.g. "IF" vs "IFFY")
-        ; '_' check removed — not a valid BASIC identifier char (saves 3 bytes)
+        mov  dx, ax              ; DX = expected packed value
+        lodsb                    ; AL = char1 (raw)
+        call uc_al                ; AL = uc(char1)
+        mov  cl, al                ; stash uc(char1) -- CL, not BX, since
+                                    ; DISPATCH2 (below) uses BX to walk its
+                                    ; table across this call
+        lodsb                       ; AL = char2 (raw)
+        call uc_al                   ; AL = uc(char2)
+        mov  ah, al                   ; AH = uc(char2)
+        mov  al, cl                    ; AL = uc(char1) -> AX = composed word
+        cmp  ax, dx
+        jne  m2_fail
+m2_skip:
         mov  al, [si]
         call uc_al
         cmp  al, 'A'
-        jb   .check_num
+        jb   m2_check_dollar
         cmp  al, 'Z'
-        jbe  .fail              ; A-Z: still a word
-.check_num:
-        cmp  al, '0'
-        jb   .ok
-        cmp  al, '9'
-        jbe  .fail              ; 0-9: still a word
-.ok:
-        pop  ax                 ; discard saved SI
+        ja   m2_check_dollar
+        inc  si
+        jmp  short m2_skip
+m2_check_dollar:
+        cmp  al, '$'                ; CHR$ is the one keyword with a
+        jne  m2_done                 ; trailing non-letter character
+        inc  si
+m2_done:
+        add  sp, 2                    ; discard saved si (already advanced
+                                        ; correctly) WITHOUT touching BX.
+                                        ; BUG FIX (validated this session):
+                                        ; the previous "pop bx" here
+                                        ; clobbered BX on the match path,
+                                        ; but DISPATCH2 depends on BX (its
+                                        ; live table-walk pointer) surviving
+                                        ; unclobbered across CALL MATCH2 --
+                                        ; confirmed via standalone harness
+                                        ; (test_match2.asm) before this fix
+                                        ; was ported in: DISPATCH2's JMP-path
+                                        ; test failed with BX corrupted to a
+                                        ; leftover SI value, sending D2_JMP's
+                                        ; "jmp bx" to garbage and eventually
+                                        ; unwinding the stack back to a
+                                        ; bogus return address.
         clc
         ret
-.fail:
-        pop  si
+m2_fail:
+        pop  si                       ; restore si
         stc
         ret
 
+; =============================================================================
+; CHK3RD  peek the 3rd character of the (not-yet-matched) word at SI,
+; without consuming anything. Ported from the 65C02 uBASIC6502 source's
+; CHK3RD -- needed where a 2-char MATCH2 prefix would ambiguously match
+; two different keywords and one of the two must produce a clean
+; non-match (unlike GOTO_GOSUB_DISP/NEW_NEXT_DISP/REM_RETURN_DISP's own
+; post-match last-letter check, which works fine for them because every
+; outcome there is a legitimate match -- see DO_PRINT's TAB vs TAN for
+; why that case needs this pre-match peek instead).
+; Inputs  : SI -> start of the candidate word (unconsumed)
+; Outputs : AL = uppercased 3rd character. SI unchanged.
+; Clobbers: AX
+; =============================================================================
+chk3rd:
+        mov  al, [si+2]
+        ; jmp  uc_al
+        ; drop through    
 ; =============================================================================
 ; UC_AL  convert AL to uppercase if it is a lowercase letter
 ; Inputs  : AL = character
@@ -739,6 +935,7 @@ dl_done:
 ; =============================================================================
 ; DO_LIST  LIST [<start>,<end>]
 ; Both arguments must be supplied together if used.
+; Stage E (v3.9): verbatim-text printing.
 ; Inputs  : SI -> optional range arguments
 ; Clobbers: AX, BX, CX, DX, SI, DI, BP
 ; =============================================================================
@@ -759,53 +956,11 @@ dl_lp:
         jl   dl_done
         call num_space
         lea  si, [di+2]
-        xor  dx, dx             ; DL = 0: nothing printed yet for this line
 dl_body:
         lodsb
         cmp  al, 0x0D
         je   dl_eol
-        cmp  al, TK_PRINT       ; Is it a token?
-        jb   dl_raw
-        ; Determine keyword table base: sub-keywords (TK_THEN/TO/STEP)
-        ; use then_tab as base; statement tokens use tk_kw_tab.
-        mov  bx, tk_kw_tab
-        cmp  al, TK_THEN
-        jb   .dl_have_base      ; below TK_THEN: statement token, tk_kw_tab ok
-        cmp  al, TK_STEP
-        ja   dl_raw             ; above TK_STEP: unknown, print raw
-        ; It is TK_THEN/TK_TO/TK_STEP: rebase to then_tab and re-bias AL
-        mov  bx, then_tab
-        sub  al, TK_THEN        ; 0-based index within sub-keyword block
-        add  al, TK_PRINT       ; get_token_ptr will subtract TK_PRINT back
-
-.dl_have_base:
-        ; --- TOKEN HANDLING ---
-        push si
-        push ax                 ; Save (possibly adjusted) token index
-
-        ; Check for leading space - Don't print if:
-        test dl, dl             ; 1. Start of line (DL=0)
-        jz   .skip_leading
-        cmp  dl, ' '            ; 2. Prev was space (DL=' ')
-        je   .skip_leading
-        cmp  dl, 1              ; 3. Prev was a token (DL=1)
-        je   .skip_leading
-        call output_space
-
-.skip_leading:
-        pop  ax                 ; Restore token index
-        call get_token_ptr      ; BX -> table entry (BX was set above)
-        mov  si, [bx]
-        call dp_str             ; Print the keyword
-        call output_space
-
-        pop  si
-        mov  dl, 1              ; Set state: "Last thing was a token"
-        jmp  dl_body
-
-dl_raw:
         call output
-        mov  dl, al             ; Store the actual char printed (e.g., ' ', '=', etc.)
         jmp  dl_body
 dl_eol:
         call new_line
@@ -816,9 +971,13 @@ dl_eol:
 ; DO_PRINT  PRINT [item [; item] ...]
 ; Items: "string literal", CHR$(n), TAB(n), expression.
 ; Trailing ';' suppresses CR+LF.
+; v3.13: CHR$/TAB matching migrated from KW_MATCH to MATCH2 (TAB gets a
+; CHK3RD pre-check against TAN -- see DP_TAB below); KW_MATCH itself, and
+; the CHRS_TAB/TAB_TAB/KW_CHRS/KW_TAB data it used, are now unreferenced
+; anywhere in the file and have been removed.
 ; Inputs  : SI -> print list
 ; Outputs : (none)
-; Clobbers: AX, BX, CX, SI
+; Clobbers: AX, CX, DX, SI
 ; =============================================================================
 do_print:
 dp_top:
@@ -846,17 +1005,32 @@ loop_print:
         jmp  short dp_str
 
 dp_chrs:
-        mov  bx, chrs_tab
-        call kw_match
+        call spaces
+        mov  ax, 0x4843          ; "CH" packed (CHR$ -- MATCH2's own
+                                  ; trailing-'$' handling covers the rest)
+        call match2
         jc   dp_tab
         call eat_paren_expr      ; FLT_A = arg
         call flt_to_int          ; AX = int16(FLT_A) = char code
         call output
         jmp  short dp_after
 dp_tab:
-        mov  bx, tab_tab
-        call kw_match
-        jc   dp_num
+        ; TAB vs TAN: unlike GOTO/GOSUB etc. (see GOTO_GOSUB_DISP), a
+        ; plain post-match MATCH2("TA") would wrongly consume "TAN(...)"
+        ; too (both start "TA"), with no way to un-consume it afterward
+        ; -- TAN must produce a clean non-match here so it falls through
+        ; to DP_NUM/EXPR's own function dispatch. So the 3rd char has to
+        ; be checked *before* attempting the match.  FUNC_TAB2 relies on
+        ; this: it has no TAB/TAN disambiguation since DO_PRINT is
+        ; assumed to have already filtered TAB out by the time EXPR2
+        ; ever sees "TA...".
+        call spaces
+        call chk3rd
+        cmp  al, 'B'
+        jne  dp_num              ; not TAB -- leave SI untouched for EXPR
+        mov  ax, 0x4154          ; "TA" packed
+        call match2
+        jc   dp_num              ; defensive; CHK3RD already confirmed this
         call eat_paren_expr      ; FLT_A = arg
         call flt_to_int          ; AX = int16(FLT_A) = column count
         or   ax, ax              ; GOTCHA: LOOP decrements before testing
@@ -889,37 +1063,19 @@ dp_after:
         call peek_line
         je   dp_ret
         jmp  short dp_top
-
-; =============================================================================
-; DO_FREE  print free program-store bytes (also provides dp_nl / newline)
-; Inputs  : (none)
-; Outputs : (none)
-; Clobbers: AX, SI
-; =============================================================================
-do_free:
-        mov  ax, PROGRAM_TOP
-        sub  ax, [PROG_END]
-        call num_space
-        mov  si, kw_free
-        call dp_str
 dp_nl:
         jmp  new_line           ; tail-call
-dp_ret:
-        ret
 
 ; =============================================================================
-; DO_HELP  print all keywords
-; Inputs  : (none)
-; Clobbers: AX, SI
+; DO_POKE  POKE <addr>, <val>
+; Inputs  : SI -> argument text
+; Clobbers: AX, BX, CX, DX, SI, DI
 ; =============================================================================
-do_help:
-        mov  si, kw_tab_start
-dh_lp:
-        call dp_str
-        call output_space
-        cmp  byte [si], 0       ; sentinel?
-        jne  dh_lp
-        jmp  new_line           ; tail-call
+do_poke:
+        call poke_out_hlpr
+        stosb
+dp_ret:
+        ret
 
 ; =============================================================================
 ; POKE_OUT_HLPR  parse "<addr>, <val>" pair shared by DO_POKE, DO_OUT,
@@ -939,16 +1095,6 @@ poke_out_hlpr:
         call expr               ; FLT_A = value
         call flt_to_int          ; AX = int16(FLT_A)
         pop  di                 ; DI = address
-        ret
-
-; =============================================================================
-; DO_POKE  POKE <addr>, <val>
-; Inputs  : SI -> argument text
-; Clobbers: AX, BX, CX, DX, SI, DI
-; =============================================================================
-do_poke:
-        call poke_out_hlpr
-        stosb
         ret
 
 ; =============================================================================
@@ -1235,18 +1381,7 @@ expr2:
         mov  al, [si]
         cmp  al, '('
         jne  .not_paren
-        ; v3.3 BUG FIX: this used to be a plain 'je e2_par', jumping
-        ; straight into E2_PAR without ever consuming the '(' -- E2_PAR
-        ; is also reached from EAT_PAREN_EXPR, which DOES consume it
-        ; first via its own 'mov al,"(" / call expect' (that's why
-        ; function calls like SIN(x) always worked: they go through
-        ; EAT_PAREN_EXPR, not this path). A bare '(expr)' used outside
-        ; a function call landed here instead, called EXPR with SI still
-        ; pointing at the same unconsumed '(', which recursed straight
-        ; back into this same branch -- genuine infinite recursion,
-        ; confirmed via a live trace (SI stuck, SP decreasing ~16
-        ; bytes/level) rather than a deliberate "not supported" syntax
-        ; error. Fixed by consuming '(' here too before jumping in.
+
         inc  si
         jmp  e2_par
 .not_paren:
@@ -1257,25 +1392,8 @@ expr2:
         cmp  al, '+'
         je   e2_pos
 
-        ; Scan function dispatch table
-        mov  bx, func_tab
-e2_func_lp:
-        cmp  word [bx], 0       ; sentinel?
-        jne  .have_entry
-        jmp  e2_nusr             ; out of short-jump range
-.have_entry:
-        push bx
-        call kw_match
-        pop  bx
-        jnc  e2_func_call
-        add  bx, 4              ; next entry: kw_ptr(2) + handler_ptr(2)
-        jmp  e2_func_lp
-
-e2_func_call:
-        push bx
-        call eat_paren_expr     ; FLT_A = argument value
-        pop  bx
-        jmp  [bx+2]             ; indirect jump to handler
+        mov  bx, func_tab2
+        jmp  dispatch2
 
 ; =============================================================================
 ; EAT_PAREN_EXPR  parse '(' <expr> ')' -> FLT_A
@@ -1323,7 +1441,23 @@ do_in_func:
         xor  ah, ah             ; zero-extend to 16-bit
         jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
 
-; do_usr_func is placed near the reset vector (acts as space filler); see below.
+; =============================================================================
+; DO_USR_FUNC  USR(addr) — call arbitrary machine-code address
+; v2.0: argument truncated to int16 (call address); the called routine's
+; own contract is unchanged (still receives nothing in particular, still
+; returns its result in AX as plain int16 machine-code convention) -- only
+; the BASIC-side argument and return value are now float at the boundary.
+; (Relocated here from its old spot as a filler between the reset vector
+; and the final ROM pad -- this routine grew from 2 to 11 bytes for the
+; float conversion and no longer fits in that 2-byte gap.)
+; Inputs  : FLT_A = call address (from eat_paren_expr)
+; Outputs : FLT_A = float(AX), where AX = return value from called routine
+; Clobbers: AX, whatever the called routine clobbers
+; =============================================================================
+do_usr_func:
+        call flt_to_int         ; AX = int16(FLT_A) = call address
+        call ax                 ; CALL (not JMP) so we return here after
+        jmp  flt_from_int       ; tail-call: FLT_A = float(AX)
 
 ; =============================================================================
 ; RND_SHUFFLE  advance 16-bit Galois LFSR and return new seed value
@@ -1340,19 +1474,7 @@ rnd_shuffle:
         mov  [RND_SEED], ax
         ret
 
-; =============================================================================
-; E2_VAR  load variable value at factor level
-; v2.0: 4-byte float load (was 2-byte int).
-; Inputs  : SI -> variable letter
-; Outputs : FLT_A = variable value
-; Clobbers: AX, SI, DI
-; =============================================================================
-e2_var:
-        call get_var_addr        ; DI = &VARS[var]
-        push si
-        mov  si, di
-        mov  di, FLT_A
-        jmp  cp4
+
 
 ; =============================================================================
 ; E2_NEG  unary negation factor.  v2.0: float-native (was int16 neg ax).
@@ -1364,19 +1486,6 @@ e2_neg:
         inc  si
         call expr2
         jmp  flt_negate          ; tail-call: FLT_A = -FLT_A
-
-; =============================================================================
-; E2_NUSR  number-or-variable dispatch (after function table miss)
-; Routes to flt_parse (decimal literal, v2.0: was input_number) or e2_var
-; (letter).
-; =============================================================================
-e2_nusr:
-        mov  al, [si]           ; reload: kw_match may have clobbered AL
-        cmp  al, '0'
-        jb   e2_var
-        cmp  al, '9'
-        ja   e2_var
-        jmp  flt_parse           ; tail-call: FLT_A = parsed literal
 
 ; =============================================================================
 ; INPUT_NUMBER  parse unsigned decimal integer from [SI]
@@ -1550,7 +1659,7 @@ question:
 ; Clobbers: AX
 backsp:
         mov  al, 0x08
-        db   0x3D
+        db   0x3D ; consume next2 bytes
 ; OUTPUT_SPACE
 ; Inputs  : (none)
 ; Outputs : ' '
@@ -1578,6 +1687,8 @@ input_key:
         mov  ah, 0x00           ; read and remove key
         int  0x16
         ret
+
+
 %else
         in   al, PORT_A
         test al, RX             ; wait for start bit (RX goes low)
@@ -1593,7 +1704,6 @@ input_key:
         jnc  .ik_bit
         mov  al, ah
         ret
-%endif
 
 ; =============================================================================
 ; BDLY  bit-period delay (~1 bit-time at 4800 baud / 5 MHz)
@@ -1605,7 +1715,20 @@ bdly:
         mov  cx, BAUD
         loop $                  ; 17 cy/iter on 8088
         ret
+%endif
 
+; =============================================================================
+; PARSE_LINE_TARGET  shared "parse a line-number expression, look it up"
+; tail for DO_GOTO and DO_GOSUB, which otherwise both inlined an identical
+; "call expr / call flt_to_int / call find_line" sequence.
+; Outputs : AX = target line# (int16), DI -> line >= AX (via FIND_LINE)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A
+; =============================================================================
+parse_line_target:
+        call expr                ; FLT_A = target line#
+        call flt_to_int          ; AX = int16(FLT_A)
+;        jmp  find_line           ; DI -> line >= AX; tail-call, ret goes to caller
+        ; drop through
 ; =============================================================================
 ; FIND_LINE / WALK_LINES  scan program for first line >= AX
 ; Inputs  : AX = target line number
@@ -1643,7 +1766,7 @@ wl_done:
         ret
 
 ; =============================================================================
-; EDITLN  tokenise body then store, replace, or delete a numbered line
+; EDITLN  store, replace, or delete a numbered line (plain text)
 ; Inputs  : AX = line number, SI -> raw body text in IBUF (spaces already skipped)
 ; Outputs : (none)
 ; Clobbers: AX, BX, CX, DX, SI, DI
@@ -1651,9 +1774,8 @@ wl_done:
 editln:
         push ax
         call spaces
-        call tokenize           ; tokenise in-place; SI preserved
         pop  dx                 ; DX = line number
-        ; measure tokenised body + CR
+        ; measure body + CR (plain text now)
         mov  bx, si
         mov  cx, 0
 el_len:
@@ -1690,8 +1812,8 @@ el_noex:
         ; fall through to insline
 
 ; =============================================================================
-; INSLINE  insert a tokenised line into program store
-; Inputs  : AX = line number, SI -> tokenised body + CR, CX = body+CR length
+; INSLINE  insert a line into program store (plain text)
+; Inputs  : AX = line number, SI -> body + CR, CX = body+CR length
 ; Outputs : (none)
 ; Clobbers: AX, BX, CX, DX, SI, DI
 ; =============================================================================
@@ -1796,333 +1918,23 @@ do_end:
         mov  ax, [PROG_END]
         mov  [RUN_NEXT], ax     ; RUN_NEXT -> sentinel -> run_loop will exit
         xor  al, al
-run_end:
-        mov  byte [RUNNING], al
-dg_ret:
-        ret
+        jmp  run_end
 
 ; =============================================================================
-; DO_GOTO  GOTO <linenum>
-; DO_RUN   RUN
-; v2.0: expr returns float; truncated to int16 here (line numbers are
-; always integer).
-; Inputs  : SI -> line number expression (GOTO) or program start (RUN)
-; Clobbers: AX, BX, CX, DX, DI, FLT_A
+; NEW_NEXT_DISP  disambiguate "NE" match: NEW vs NEXT (last letter: 'W'
+; vs 'T'). Same technique as GOTO_GOSUB_DISP -- see its header.
+; Inputs  : SI -> just past the fully-matched keyword ("NEW"/"NEXT")
+; Outputs : tail-jumps into DO_NEW or DO_NEXT
+; Clobbers: AX (per whichever handler is entered)
 ; =============================================================================
-; =============================================================================
-; PARSE_LINE_TARGET  shared "parse a line-number expression, look it up"
-; tail for DO_GOTO and DO_GOSUB, which otherwise both inlined an identical
-; "call expr / call flt_to_int / call find_line" sequence.
-; Outputs : AX = target line# (int16), DI -> line >= AX (via FIND_LINE)
-; Clobbers: AX, BX, CX, DX, DI, FLT_A
-; =============================================================================
-parse_line_target:
-        call expr                ; FLT_A = target line#
-        call flt_to_int          ; AX = int16(FLT_A)
-        jmp  find_line           ; DI -> line >= AX; tail-call, ret goes to caller
-
-do_goto:
-        call parse_line_target
-        cmp  [di], ax
-        je   dg_common
-JERRUL:
-        mov  al, ERR_UL
-        jmp  do_error
-
-do_run:
-        mov  di, PROGRAM
-dg_common:
-        mov  [RUN_NEXT], di
-        cmp  byte [RUNNING], 0
-        jne  dg_ret             ; already running (e.g. mid-GOTO): just return
-        inc  byte [RUNNING]
-        ; fall through to run_loop
-
-; =============================================================================
-; RUN_LOOP  fetch and execute lines until sentinel or DO_END
-; Inputs  : (none; reads RUN_NEXT)
-; Clobbers: everything (one statement per iteration)
-; =============================================================================
-run_loop:
-        mov  di, [RUN_NEXT]
-        mov  si, di
-        lodsw                   ; AX = line#; SI -> body
-        test ax, ax
-        jz   run_end
-        mov  [CURLN], ax
-        call next_line_ptr      ; DI -> start of next line
-        mov  [RUN_NEXT], di
-        call stmt                ; (was stmt_line -- multi-statement colon
-                                  ; support removed v2.7)
-        jmp  short run_loop
-
-; =============================================================================
-; DO_GOSUB  GOSUB <linenum>
-; Saves RUN_NEXT on dedicated GOSUB stack then jumps to target.
-; v2.0: expr returns float; truncated to int16 here (line numbers are
-; always integer).
-; Inputs  : SI -> line number expression
-; Clobbers: AX, BX, CX, DX, DI, FLT_A
-; =============================================================================
-do_gosub:
-        call parse_line_target
-        cmp  [di], ax
-        jne  JERRUL
-        mov  bx, [GOSUB_SP]
-        cmp  bx, 8
-        jb   gs_push
-        jmp  ins_oom            ; overflow -> out of memory (?3)
-
-gs_push:
-        inc  word [GOSUB_SP]
-        add  bx, bx              ; BX is already loaded, use it
-; tinyasm has no LEA; encode "lea si,[GOSUB_STK+bx]" by hand (opcode
-; 0x8D /r with mod=01 reg=SI(110) rm=BX(111), disp8=0x50=GOSUB_STK lo byte)
-%ifdef __YASM_MAJOR__
-        lea  si, [GOSUB_STK + bx]
-%else
-        db   0x8D, 0x77, 0x50
-%endif
-        mov  ax, [RUN_NEXT]
-        mov  [si], ax
-        mov  [RUN_NEXT], di      ; DI is target from find_line
-        ret
-
-gs_underflow:
-        mov  al, ERR_RT
-        jmp  do_error
-
-; =============================================================================
-; DO_RETURN  RETURN
-; Pops return address from GOSUB stack and resumes execution.
-; Inputs  : (none)
-; Outputs : (none)
-; Clobbers: AX, BX, SI
-; =============================================================================
-do_return:
-        mov  si, GOSUB_SP
-        mov  ax, [si]
-        or   ax, ax
-        jz   gs_underflow
-        dec  ax
-        mov  [si], ax
-        add  ax, ax              ; byte offset = depth * 2
-        xchg ax, bx
-; tinyasm has no LEA; encode "lea si,[GOSUB_STK+bx]" by hand (see gs_push)
-%ifdef __YASM_MAJOR__
-        lea  si, [GOSUB_STK + bx]
-%else
-        db   0x8D, 0x77, 0x50
-%endif
-        lodsw
-        mov  [RUN_NEXT], ax
-        ret
-
-; =============================================================================
-; DO_REM  REM — skip remainder of line during program execution
-; Inputs  : SI -> REM body
-; Clobbers: AH, SI, DI
-; =============================================================================
-do_rem:
-        mov  di, si             ; DI = SI: copy_si_di becomes a pure skip
-        mov  ah, 0x0D
-        ; fall through to copy_si_di
-
-; =============================================================================
-; COPY_SI_DI  copy (or skip) bytes from SI to DI until AH or CR
-; If DI = SI on entry the copy is a no-op (used by DO_REM at runtime).
-; Used by TOKENIZE to pass string literals and REM bodies verbatim.
-; Inputs  : SI = read ptr, DI = write ptr, AH = secondary terminator
-; Outputs : SI and DI advanced to char after terminator
-; Clobbers: AX, SI, DI
-; =============================================================================
-copy_si_di:
-        lodsb
-        stosb
-        cmp  al, 0x0D
-        je   .done
-        cmp  al, ah
-        jne  copy_si_di
-.done:
-        ret
-
-; =============================================================================
-; TOKENIZE  convert keyword text to single-byte tokens in-place in IBUF
-; String literals and REM bodies are preserved verbatim.
-; Tokenised form <= original length, so in-place rewrite is safe.
-; Inputs  : SI -> start of body text in IBUF
-; Outputs : IBUF rewritten with token bytes; SI unchanged (restored)
-; Clobbers: AX, BX, CX, DX, DI
-; =============================================================================
-tokenize:
-        push si
-        mov  di, si             ; write pointer starts at read pointer
-
-tk_lp:
-        lodsb
-        cmp  al, 0x0D
-        je   tk_done
-
-        ; String literal: pass verbatim
-        cmp  al, '"'
-        jne  tk_not_str
-        stosb                   ; write opening quote
-        mov  ah, '"'
-        call copy_si_di
-        jmp  tk_lp
-
-tk_not_str:
-        dec  si                 ; back up to re-include current char
-        mov  bx, tk_kw_tab
-tk_try:
-        cmp  word [bx], 0
-        je   tk_char
-        push di
-        push bx
-        call kw_match
-        pop  bx
-        pop  di
-        jc   tk_next_kw
-
-        ; Keyword matched: emit token byte
-        mov  ax, bx
-        sub  ax, tk_kw_tab      ; byte offset into table
-        shr  ax, 1              ; -> 0-based index
-        add  al, TK_PRINT       ; + base
-        stosb
-        call spaces             ; consume trailing spaces
-        cmp  al, TK_REM
-        jne  tk_lp
-        mov  ah, 0x0D           ; REM: copy rest verbatim
-        call copy_si_di
-        jmp  tk_finish
-
-tk_next_kw:
-        add  bx, 2
-        jmp  tk_try
-
-tk_char:
-        lodsb                   ; no match: emit literal char
-        stosb
-        jmp  tk_lp
-
-tk_done:
-        stosb                   ; write final CR
-tk_finish:
-        pop  si                 ; restore body start pointer
-        ret
-
-; =============================================================================
-; DO_FOR  FOR <var> = <start> TO <end> [STEP <step>]
-; v2.0: start/limit/step are now float (4 bytes each); frame widened from
-; 8 to 12 bytes/slot.
-; Frame layout (12 bytes per slot in FOR_STK):
-;   [bx+0] var_ptr(2)  [bx+2] limit(4)  [bx+6] step(4)  [bx+10] loop_ptr(2)
-; Inputs  : SI -> line body after FOR token
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_C
-; =============================================================================
-df_syn:
-        mov  al, ERR_OM
-        jmp  do_error
-do_for:
-        call spaces
-        call get_var_addr
-        mov  [INS_TMP], di      ; save &var
-        call expect_equals
-        call expr               ; FLT_A = start value
-        push si
-        mov  si, FLT_A
-        mov  di, [INS_TMP]
-        movsw
-        movsw                    ; initialise loop variable (4 bytes)
-        pop  si
-        ; TO is mandatory
-        mov  al, TK_TO
-        mov  bx, to_tab
-        call expect_token_or_kw
-        jc   df_syn
-
-        call expr               ; FLT_A = limit
-        ; Stash the limit in FLT_C across the STEP expression below
-        ; (which will itself overwrite FLT_A while being parsed). This
-        ; is a single, non-nested use of FLT_C -- unlike prec_engine_f's
-        ; old design (see its own header), nothing here recurses, so
-        ; sharing FLT_C for this one stash is fine.
-        push si
-        mov  si, FLT_A
-        mov  di, FLT_C
-        movsw
-        movsw
-        pop  si
-
-        ; STEP is optional (default = 1.0)
-        mov  al, TK_STEP
-        mov  bx, step_tab
-        call expect_token_or_kw
-        jc   df_one_step
-        call expr               ; FLT_A = explicit step value
-        jmp  short df_have_step
-df_one_step:
-        mov  ax, 1
-        call flt_from_int        ; FLT_A = 1.0 (default step)
-df_have_step:
-        ; Push frame.  FLT_A = step, FLT_C = limit at this point.
-        mov  cx, [FOR_SP]
-        cmp  cl, 4
-        jnb  df_syn             ; FOR stack full
-        inc  word [FOR_SP]
-        call for_ptr_hlp        ; BX -> frame slot
-        mov  di, bx             ; DI = base address of frame
-        mov  ax, [INS_TMP]      ; var_ptr
-        stosw                   ; [di+0] = var_ptr, di += 2
-        push si
-        mov  si, FLT_C          ; limit
-        movsw
-        movsw                   ; [di+2..5] = limit, di += 4
-        mov  si, FLT_A          ; step
-        movsw
-        movsw                   ; [di+6..9] = step, di += 4
-        pop  si
-        mov  ax, [RUN_NEXT]     ; loop_ptr
-        stosw                   ; [di+10] = loop_ptr, di += 2
-        ret
-
-; =============================================================================
-; FOR_PTR_HLP  convert FOR stack depth to frame pointer
-; Inputs  : CX = depth index (0-based)
-; Outputs : BX -> FOR_STK[CX]  (12 bytes per frame, v2.0: was 8)
-; Clobbers: AX, BX
-; =============================================================================
-for_ptr_hlp:
-        ; depth is always <= 3 (FOR stack capped at 4 slots, checked in
-        ; DO_FOR), so AL*12 never exceeds AH=0 -- 8-bit MUL replaces the
-        ; old shift-add sequence.
-        mov  al, 12
-        mul  cl                 ; AX = CL * 12 (AH stays 0, CL<=3)
-        xchg ax, bx
-        add  bx, FOR_STK
-        ret
-
-; =============================================================================
-; EXPECT_TOKEN_OR_KW  match a sub-keyword by token byte or plain text
-; Inputs  : AL = token value (e.g. TK_TO), BX -> keyword table entry (text match)
-; Outputs : CF=0 matched (SI advanced), CF=1 no match
-; Clobbers: AX, DI, DL
-; =============================================================================
-expect_token_or_kw:
-        ; CMP with equal operands guarantees CF=0, and INC never touches
-        ; CF (8086 quirk, so multi-word increment loops don't disturb an
-        ; in-flight carry chain) -- so the explicit CLC on the match path
-        ; is redundant and dropped.
-        call spaces
-        cmp  byte [si], al
-        je   etk_match
-        call kw_match
-        ret
-etk_match:
-        inc  si                 ; CF still 0 from the CMP above
-        ret
-
+new_next_disp:
+        dec  si
+        mov  al, [si]
+        inc  si
+        call uc_al
+        cmp  al, 'W'
+        je   do_new
+        ; drop through
 ; =============================================================================
 ; DO_NEXT  NEXT <var>
 ; v2.0: limit/step/var are float; var += step via flt_add, exit test via
@@ -2131,9 +1943,6 @@ etk_match:
 ; Inputs  : SI -> line body after NEXT token
 ; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_C
 ; =============================================================================
-dn_no_for:
-        mov  al, ERR_NF
-        jmp  do_error
 do_next:
         call spaces
         call get_var_addr       ; DI = &var
@@ -2200,112 +2009,295 @@ dn_loop:
         mov  ax, [bx+10]
         mov  [RUN_NEXT], ax     ; jump back to top of loop
         ret
+dn_no_for:
+        mov  al, ERR_NF
+        jmp  do_error
+
 dn_pos_step:
         dec  ax
         jnz  dn_loop
 dn_done:
         mov  [FOR_SP], cx       ; pop frame (CX = correct new depth)
+dg_ret:
         ret
 
-
 ; =============================================================================
-; DO_DELAY  DELAY <count>  (ROM / real-hardware build only)
-; One unit ≈ 0.1 seconds at 5 MHz.  No effect in YASM/8bitworkshop build.
-; v2.0: expr returns float; truncated to int16 here (loop counter is
+; DO_GOTO  GOTO <linenum>
+; DO_RUN   RUN
+; v2.0: expr returns float; truncated to int16 here (line numbers are
 ; always integer).
-; Inputs  : SI -> count expression
-; Clobbers: AX, BX, CX, DX, FLT_A
+; Inputs  : SI -> line number expression (GOTO) or program start (RUN)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A
 ; =============================================================================
-do_delay:
-        call expr
-        call flt_to_int          ; AX = int16(FLT_A) = count
-.outer_loop:
-        mov  cx, 29412          ; ~0.1 s at 5 MHz (17 cy/iter)
-.inner_loop:
-        loop .inner_loop
-        dec  ax
-        jnz  .outer_loop
+do_goto:
+        call parse_line_target
+        cmp  [di], ax
+        je   dg_common
+JERRUL:
+        mov  al, ERR_UL
+        jmp  do_error
+
+do_run:
+        mov  di, PROGRAM
+dg_common:
+        mov  [RUN_NEXT], di
+        cmp  byte [RUNNING], 0
+        jne  dg_ret             ; already running (e.g. mid-GOTO): just return
+        inc  byte [RUNNING]
+        ; fall through to run_loop
+; =============================================================================
+; RUN_LOOP  fetch and execute lines until sentinel or DO_END
+; Inputs  : (none; reads RUN_NEXT)
+; Clobbers: everything (one statement per iteration)
+; =============================================================================
+run_loop:
+        mov  di, [RUN_NEXT]
+        mov  si, di
+        lodsw                   ; AX = line#; SI -> body
+        test ax, ax
+        jz   run_end
+        mov  [CURLN], ax
+        call next_line_ptr      ; DI -> start of next line
+        mov  [RUN_NEXT], di
+        call stmt                
+        jmp  short run_loop
+run_end:
+        mov  byte [RUNNING], al
         ret
 
 ; =============================================================================
-; KEYWORD STRINGS  (bit-7 terminated; table ends with 0x00 sentinel)
+; GOTO_GOSUB_DISP  disambiguate "GO" match: GOTO vs GOSUB (3rd char).
+; Inputs  : SI -> just past the fully-matched keyword ("GOTO"/"GOSUB")
+; Outputs : tail-jumps into DO_GOTO or DO_GOSUB
+; Clobbers: AX (per whichever handler is entered)
 ; =============================================================================
-kw_tab_start:
-kw_print:   db 0x50,0x52,0x49,0x4E,T_T         ; PRINT
-kw_if:      db 0x49,T_F                         ; IF
-kw_goto:    db 0x47,0x4F,0x54,T_O              ; GOTO
-kw_list:    db 0x4C,0x49,0x53,T_T              ; LIST
-kw_run:     db 0x52,0x55,T_N                   ; RUN
-kw_new:     db 0x4E,0x45,T_W                   ; NEW
-kw_input:   db 0x49,0x4E,0x50,0x55,T_T         ; INPUT
-kw_rem:     db 0x52,0x45,T_M                   ; REM
-kw_end:     db 0x45,0x4E,T_D                   ; END
-kw_let:     db 0x4C,0x45,T_T                   ; LET
-kw_poke:    db 0x50,0x4F,0x4B,T_E             ; POKE
-kw_free:    db 0x46,0x52,0x45,T_E             ; FREE
-kw_help:    db 0x48,0x45,0x4C,T_P             ; HELP
-kw_gosub:   db 0x47,0x4F,0x53,0x55,T_B        ; GOSUB
-kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N   ; RETURN
-kw_for:     db 0x46,0x4F,T_R                  ; FOR
-kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT
-kw_out:     db 0x4F,0x55,T_T                  ; OUT
-kw_delay:   db 0x44,0x45,0x4C,0x41,T_Y        ; DELAY
-kw_to:      db 0x54,T_O                        ; TO
-kw_step:    db 0x53,0x54,0x45,T_P             ; STEP
-; --- not statements; included for HELP output ---
-kw_then:    db 0x54,0x48,0x45,T_N             ; THEN
-kw_chrs:    db 0x43,0x48,0x52,T_DS            ; CHR$
-kw_peek:    db 0x50,0x45,0x45,T_K             ; PEEK
-kw_usr:     db 0x55,0x53,T_R                  ; USR
-kw_in:      db 0x49,T_N                        ; IN
-kw_tab:     db 0x54,0x41,T_B                  ; TAB
-kw_abs:     db 0x41,0x42,T_S                  ; ABS
-kw_rnd:     db 0x52,0x4E,T_D                  ; RND
-kw_not:     db 0x4E,0x4F,T_T                  ; NOT
-kw_sin:     db 0x53,0x49,T_N                  ; SIN
-kw_cos:     db 0x43,0x4F,T_S                  ; COS
-kw_tan:     db 0x54,0x41,T_N                  ; TAN
-kw_atn:     db 0x41,0x54,T_N                  ; ATN
-kw_asin:    db 0x41,0x53,0x49,T_N             ; ASIN
-kw_acos:    db 0x41,0x43,0x4F,T_S             ; ACOS
-kw_sqrt:    db 0x53,0x51,0x52,T_T             ; SQRT
-        db 0                                    ; sentinel
+goto_gosub_disp:
+        dec  si
+        mov  al, [si]
+        inc  si
+        call uc_al
+        cmp  al, 'B'
+        je   do_gosub
+        jmp  do_goto
+        ; drop through
+; =============================================================================
+; DO_GOSUB  GOSUB <linenum>
+; Saves RUN_NEXT on dedicated GOSUB stack then jumps to target.
+; v2.0: expr returns float; truncated to int16 here (line numbers are
+; always integer).
+; Inputs  : SI -> line number expression
+; Clobbers: AX, BX, CX, DX, DI, FLT_A
+; =============================================================================
+do_gosub:
+        call parse_line_target
+        cmp  [di], ax
+        jne  JERRUL
+        mov  bx, [GOSUB_SP]
+        cmp  bx, 8
+        jb   gs_push
+        jmp  ins_oom            ; overflow -> out of memory (?3)
+
+gs_push:
+        inc  word [GOSUB_SP]
+        add  bx, bx              ; BX is already loaded, use it
+; tinyasm has no LEA; encode "lea si,[GOSUB_STK+bx]" by hand (opcode
+; 0x8D /r with mod=01 reg=SI(110) rm=BX(111), disp8=0x50=GOSUB_STK lo byte)
+;        lea  si, [GOSUB_STK + bx]
+        db   0x8D, 0x77, 0x50
+        mov  ax, [RUN_NEXT]
+        mov  [si], ax
+        mov  [RUN_NEXT], di      ; DI is target from find_line
+        ret
+
+gs_underflow:
+        mov  al, ERR_RT
+        jmp  do_error
 
 ; =============================================================================
-; TOKEN -> KEYWORD STRING POINTER TABLE  (same order as st_tab / TK_xx)
+; REM_RETURN_DISP  disambiguate "RE" match: REM vs RETURN (last letter:
+; Inputs  : SI -> just past the fully-matched keyword ("REM"/"RETURN")
+; Outputs : tail-jumps into DO_REM or DO_RETURN
+; Clobbers: AX (per whichever handler is entered)
 ; =============================================================================
-tk_kw_tab:
-        dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
-        dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
-        dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next, kw_out, kw_delay
-        dw kw_then, kw_to, kw_step     ; v2.2: sub-keywords now tokenized
-        dw 0    ; GOTCHA: required sentinel 
-        
-; Sub-keyword pointer entries.
-; then_tab/to_tab/step_tab double as a detokenizer table for do_list:
-;   [then_tab + (token - TK_THEN) * 2]  -> correct kw_* pointer.
-; Entries are contiguous so get_token_ptr arithmetic (BX=then_tab) works.
-then_tab:   dw kw_then          ; TK_THEN = 0x93, index 0
-to_tab:     dw kw_to            ; TK_TO   = 0x94, index 1
-step_tab:   dw kw_step          ; TK_STEP = 0x95, index 2
-; PRINT-only functions (single entry each; matched individually, not iterated)
-chrs_tab:   dw kw_chrs
-tab_tab:    dw kw_tab
+rem_return_disp:
+        dec  si
+        mov  al, [si]
+        inc  si
+        call uc_al
+        cmp  al, 'N'
+        je   do_return
+        jmp  do_rem
+        ; drop through
+; =============================================================================
+; DO_RETURN  RETURN
+; Pops return address from GOSUB stack and resumes execution.
+; Inputs  : (none)
+; Outputs : (none)
+; Clobbers: AX, BX, SI
+; =============================================================================
+do_return:
+        mov  si, GOSUB_SP
+        mov  ax, [si]
+        or   ax, ax
+        jz   gs_underflow
+        dec  ax
+        mov  [si], ax
+        add  ax, ax              ; byte offset = depth * 2
+        xchg ax, bx
+; tinyasm has no LEA; encode "lea si,[GOSUB_STK+bx]" by hand (see gs_push)
+;        lea  si, [GOSUB_STK + bx]
+        db   0x8D, 0x77, 0x50
+        lodsw
+        mov  [RUN_NEXT], ax
+        ret
+
+; =============================================================================
+; DO_REM  REM — skip remainder of line during program execution
+; Inputs  : SI -> REM body
+; Clobbers: AH, SI, DI
+; =============================================================================
+do_rem:
+        mov  di, si             ; DI = SI: copy_si_di becomes a pure skip
+        mov  ah, 0x0D
+        ; fall through to copy_si_di
+
+; =============================================================================
+; COPY_SI_DI  copy (or skip) bytes from SI to DI until AH or CR
+; If DI = SI on entry the copy is a no-op (used by DO_REM at runtime).
+; Inputs  : SI = read ptr, DI = write ptr, AH = secondary terminator
+; Outputs : SI and DI advanced to char after terminator
+; Clobbers: AX, SI, DI
+; =============================================================================
+copy_si_di:
+        lodsb
+        stosb
+        cmp  al, 0x0D
+        je   .done
+        cmp  al, ah
+        jne  copy_si_di
+.done:
+        ret
+
+; =============================================================================
+; DO_FOR  FOR <var> = <start> TO <end> [STEP <step>]
+; v2.0: start/limit/step are now float (4 bytes each); frame widened from
+; 8 to 12 bytes/slot.
+; Frame layout (12 bytes per slot in FOR_STK):
+;   [bx+0] var_ptr(2)  [bx+2] limit(4)  [bx+6] step(4)  [bx+10] loop_ptr(2)
+; Inputs  : SI -> line body after FOR token
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_C
+; =============================================================================
+df_syn:
+        mov  al, ERR_OM
+        jmp  do_error
+do_for:
+        call spaces
+        call get_var_addr
+        mov  [INS_TMP], di      ; save &var
+        call expect_equals
+        call expr               ; FLT_A = start value
+        push si
+        mov  si, FLT_A
+        mov  di, [INS_TMP]
+        movsw
+        movsw                    ; initialise loop variable (4 bytes)
+        pop  si
+        ; TO is mandatory
+        call spaces
+        mov  ax, 0x4F54          ; "TO" (low='T', high='O')
+        call match2
+        jc   df_syn
+
+        call expr               ; FLT_A = limit
+        ; Stash the limit in FLT_C across the STEP expression below
+        ; (which will itself overwrite FLT_A while being parsed). This
+        ; is a single, non-nested use of FLT_C -- unlike prec_engine_f's
+        ; old design (see its own header), nothing here recurses, so
+        ; sharing FLT_C for this one stash is fine.
+        push si
+        mov  si, FLT_A
+        mov  di, FLT_C
+        movsw
+        movsw
+        pop  si
+
+        ; STEP is optional (default = 1.0)
+        call spaces
+        mov  ax, 0x5453          ; "ST" (low='S', high='T')
+        call match2
+        jc   df_one_step
+        call expr               ; FLT_A = explicit step value
+        jmp  short df_have_step
+df_one_step:
+        mov  ax, 1
+        call flt_from_int        ; FLT_A = 1.0 (default step)
+df_have_step:
+        ; Push frame.  FLT_A = step, FLT_C = limit at this point.
+        mov  cx, [FOR_SP]
+        cmp  cl, 4
+        jnb  df_syn             ; FOR stack full
+        inc  word [FOR_SP]
+        call for_ptr_hlp        ; BX -> frame slot
+        mov  di, bx             ; DI = base address of frame
+        mov  ax, [INS_TMP]      ; var_ptr
+        stosw                   ; [di+0] = var_ptr, di += 2
+        push si
+        mov  si, FLT_C          ; limit
+        movsw
+        movsw                   ; [di+2..5] = limit, di += 4
+        mov  si, FLT_A          ; step
+        movsw
+        movsw                   ; [di+6..9] = step, di += 4
+        pop  si
+        mov  ax, [RUN_NEXT]     ; loop_ptr
+        stosw                   ; [di+10] = loop_ptr, di += 2
+        ret
+
+; =============================================================================
+; FOR_PTR_HLP  convert FOR stack depth to frame pointer
+; Inputs  : CX = depth index (0-based)
+; Outputs : BX -> FOR_STK[CX]  (12 bytes per frame, v2.0: was 8)
+; Clobbers: AX, BX
+; =============================================================================
+for_ptr_hlp:
+        ; depth is always <= 3 (FOR stack capped at 4 slots, checked in
+        ; DO_FOR), so AL*12 never exceeds AH=0 -- 8-bit MUL replaces the
+        ; old shift-add sequence.
+        mov  al, 12
+        mul  cl                 ; AX = CL * 12 (AH stays 0, CL<=3)
+        xchg ax, bx
+        add  bx, FOR_STK
+        ret
+
+; =============================================================================
+; STMT_TAB2  Stage C statement dispatch table (dispatch2/match2 format).
+; {dw packed_2char, dw handler_addr} pairs, dw 0xFFFF sentinel. All entries
+; are bit15=0 (statements are always tail-JMP'd, never CALL'd -- there is
+; no 1-arg "protect SI" case here, unlike the future function table).
+; Replaces st_tab/tk_kw_tab/get_token_ptr/kw_match for STATEMENT dispatch
+; only. 
+; =============================================================================
+stmt_tab2:
+        dw 0x5250, do_print             ; PR -> PRINT
+        dw 0x4649, do_if                ; IF
+        dw 0x4F47, goto_gosub_disp      ; GO -> GOTO/GOSUB (collision)
+        dw 0x494C, do_list              ; LI -> LIST
+        dw 0x5552, do_run               ; RU -> RUN
+        dw 0x454E, new_next_disp        ; NE -> NEW/NEXT (collision)
+        dw 0x4E49, do_input             ; IN -> INPUT
+        dw 0x4552, rem_return_disp      ; RE -> REM/RETURN (collision)
+        dw 0x4E45, do_end               ; EN -> END
+        dw 0x454C, do_let               ; LE -> LET
+        dw 0x4F50, do_poke              ; PO -> POKE
+        dw 0x4F46, do_for               ; FO -> FOR
+        dw 0x554F, do_out               ; OU -> OUT
+        dw 0xFFFF, do_let                ; sentinel: no-match -> implicit LET
 
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "miniBASIC 8088 v3.5"
+str_banner: db "miniBASIC 8088 v3.13"
 CRLF:       db 0x0D, 0x0A + 0x80
-
-; =============================================================================
-; STATEMENT HANDLER TABLE  (indexed by token - TK_PRINT, one word per entry)
-; =============================================================================
-st_tab:
-        dw do_print,  do_if,     do_goto,   do_list,  do_run,   do_new
-        dw do_input,  do_rem,    do_end,    do_let,   do_poke,  do_free
-        dw do_help,   do_gosub,  do_return, do_for,   do_next,  do_out, do_delay
 
 ; =============================================================================
 ; OPERATOR TABLES  {char(1), handler_ptr(2), ...}, 0x00 sentinel
@@ -2328,24 +2320,38 @@ tab_mul:                        ; multiplicative level (v2.0: float, except %)
         db 0
 
 ; =============================================================================
-; FUNCTION DISPATCH TABLE  {kw_ptr(2), handler_ptr(2), ...}, dw 0 sentinel
+; FUNC_TAB2  Stage D function dispatch table (match2 2-char-prefix format,
+; same packing as STMT_TAB2 -- see its header). bit15 of the packed word
+; selects niladic (0, tail-jmp, no argument) vs 1-arg (1, EAT_PAREN_EXPR
+; parses "(expr)" first, then the handler runs with FLT_A = argument).
+; Replaces FUNC_TAB/KW_MATCH for function dispatch. No collision stubs
+; needed here: TAB/TAN's shared "TA" prefix was already resolved (DO_PRINT
+; checks for TAB via its own dedicated MATCH2+CHK3RD lookup *before* ever
+; falling through to EXPR2, so "TA" here unambiguously means TAN -- see
+; DO_PRINT's header). IN/INPUT's shared "IN" prefix never collides
+; either: INPUT lives in STMT_TAB2 (checked only at statement-start) and
+; IN lives here (checked only during expression/factor parsing) --
+; different parse states, same as every other statement/function overlap.
 ; =============================================================================
-func_tab:
-        dw kw_rnd,  do_rnd_func
-        dw kw_peek, do_peek_func
-        dw kw_in,   do_in_func
-        dw kw_usr,  do_usr_func
-        dw kw_abs,  flt_abs
-        dw kw_sin,  do_sin_func
-        dw kw_cos,  do_cos_func
-        dw kw_tan,  do_tan_func
-        dw kw_atn,  do_atn_func
-        dw kw_asin, do_asin_func
-        dw kw_acos, do_acos_func
-        dw kw_sqrt, do_sqrt_func
-        dw 0
-
-; (ROM_END moved below, after the MBF4 float library -- see merge note)
+func_tab2:
+        dw 0x4950, do_pi_func            ; PI (niladic)
+        dw 0x4E52, do_rnd_func           ; RN -> RND (niladic)
+        dw 0x5246, do_free_func          ; FR -> FREE (niladic)
+        dw 0xC550, do_peek_func          ; PE -> PEEK (1-arg)
+        dw 0xCE49, do_in_func            ; IN (1-arg)
+        dw 0xD355, do_usr_func           ; US -> USR (1-arg)
+        dw 0xC241, flt_abs               ; AB -> ABS (1-arg)
+        dw 0xC953, flt_sin               ; SI -> SIN (1-arg)
+        dw 0xCF43, flt_cos               ; CO -> COS (1-arg)
+        dw 0xC154, flt_tan               ; TA -> TAN (1-arg)
+        dw 0xD441, flt_atan              ; AT -> ATN (1-arg)
+        dw 0xD341, flt_asin              ; AS -> ASIN (1-arg)
+        dw 0xC341, flt_acos              ; AC -> ACOS (1-arg)
+        dw 0xD153, flt_sqrt              ; SQ -> SQRT (1-arg)
+        dw 0xCE4C, flt_ln                ; LN (1-arg)
+        dw 0xD845, flt_exp               ; EX -> EXP (1-arg)
+        dw 0xCC46, flt_floor             ; FL -> FLOOR (1-arg)
+        dw 0xFFFF, e2_nusr               ; sentinel: no-match -> number/var
 
 ; =============================================================================
 ; MBF4 32-BIT FLOAT LIBRARY  (merged from mbfloat_v14.asm; see file header
@@ -2375,101 +2381,7 @@ func_tab:
 ;   AX = integer in/out.  SI preserved by all routines that clobber it.
 ;   IBUF is reused as flt_print's 7-digit extraction scratch; safe because
 ;   flt_print is never reached while a line is being edited or run mid-token.
-;
-; v2.0 MERGE-TIME CHANGES TO THIS LIBRARY (everything else below this
-; header is byte-for-byte mbfloat_v14.asm's library body):
-;
-; NOTE ON LAYOUT (unchanged from mbfloat_v14.asm): small helpers
-; (flt_zero, norm_pack, flt_negate, flt_b_to_a, flt_abs, copy helpers)
-; are placed FIRST so that all JMPs from the arithmetic routines are
-; backward jumps to lower addresses. With org 0xF000 a forward JMP of
-; >0x1000 bytes would wrap around into RAM; backward JMPs to addresses
-; above 0xF000 are always safe. This ordering is preserved exactly as
-; in the original file -- do not reshuffle without re-checking every
-; jmp/jcc target stays backward.
 ; =============================================================================
-
-; =============================================================================
-; FLT_ZERO  FLT_A = 0.0
-; Inputs  : (none)
-; Outputs : FLT_A = 0.0
-; Clobbers: AX
-; =============================================================================
-flt_zero:
-        xor  ax, ax
-        mov  [FLT_A+0], ax
-        mov  [FLT_A+2], ax
-        ret
-
-; =============================================================================
-; NORM_PACK  normalise CH:DX, round, pack into FLT_A
-;
-; Placed early so all callers (flt_add, flt_mul, flt_div) jump backward.
-;
-; Register convention on entry:
-;   BH = biased exponent
-;   CH = mant[23:16]  (bit7 = implied-1 when normalised)
-;   DH = mant[15:8]
-;   DL = mant[7:0]
-;   AL = sub-guard byte (round-half-up; not stored)
-;   [FLT_SA] = result sign (0x00 or 0x80)
-;
-; Inputs  : BH, CH, DH, DL, AL, [FLT_SA]
-; Outputs : FLT_A packed
-; Clobbers: AX, BX, CX, DX
-; =============================================================================
-norm_pack:
-np_lp:
-        or   ch, ch
-        js   np_round
-        jnz  np_bit
-        ; CH=0: byte-shift optimisation
-        sub  bh, 8
-        jbe  np_zero
-        mov  ch, dh
-        mov  dh, dl
-        mov  dl, al
-        xor  al, al
-        jmp  np_lp
-np_bit:
-        ; 1-bit left-shift AL:DL:DH:CH. CF already 0 here (set by the
-        ; 'or ch,ch' above, which is the only path into np_bit) so the
-        ; explicit clc is dead weight -- dropped.
-        rcl  al, 1
-        rcl  dx, 1
-        rcl  ch, 1
-        dec  bh
-        jnz  np_lp
-np_zero:
-        jmp  flt_zero
-
-np_round:
-        ; Round-half-up via sub-guard AL
-        add  al, 0x80
-        jnc  np_pack
-        inc  dx                 ; ripples DL->DH carry as one 16-bit op;
-                                 ; ZF set iff DX wrapped 0xFFFF->0x0000
-                                 ; (both bytes maxed), same condition the
-                                 ; old separate inc dl/inc dh pair checked
-        jnz  np_pack
-        inc  ch
-        jnz  np_pack
-        ; Mantissa overflow on round: all three incs above fell through,
-        ; so dl=dh=ch=0 here exactly -- set ch=0x80 directly (cheaper than
-        ; stc/rcr ch,1, which would compute the same result via rotation).
-        mov  ch, 0x80
-        inc  bh
-        jz   np_zero
-
-np_pack:
-        mov  [FLT_A+0], bh
-        mov  al, [FLT_SA]
-        and  ch, 0x7F
-        or   ch, al
-        mov  [FLT_A+1], ch
-        mov  [FLT_A+2], dh
-        mov  [FLT_A+3], dl
-        ret
 
 ; =============================================================================
 ; DO_ABS_FUNC  ABS(n) -> absolute value.  v2.0: float-native (was int16).
@@ -2496,6 +2408,16 @@ sign_xor:
         ret
 
 ; =============================================================================
+; DO_PI_FUNC  PI -> 3.14159265, niladic.
+; Inputs  : (none)
+; Outputs : FLT_A = PI
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B
+; =============================================================================
+do_pi_func:
+        call flt_pi_b
+        ;jmp  flt_b_to_a
+        ; drop through
+; =============================================================================
 ; Copy helpers
 ; v0.10: bodies merged into a shared 'cp4' tail (each entry point just
 ; loads SI/DI for its own direction, then falls/jumps into one copy).
@@ -2505,11 +2427,17 @@ flt_b_to_a:
         push si
         mov  si, FLT_B
         mov  di, FLT_A
-        jmp  cp4
+        jmp  short cp4
 flt_a_to_b:
         push si
         mov  si, FLT_A
         mov  di, FLT_B
+        jmp  short cp4
+
+flt_a_to_horner_t:
+        push si
+        mov  si, FLT_A
+        mov  di, HORNER_T
 cp4:
         movsw
         movsw
@@ -2518,8 +2446,6 @@ cp4:
 
 ; =============================================================================
 ; FLT_A_PUSH / FLT_A_POP  shared "park all of FLT_A on the real stack"
-; tail, used everywhere a routine needs to protect FLT_A across a sub-call
-; that clobbers it. v2.3: factored out of 6 duplicated inline copies.
 ; GOTCHA: a plain CALL/RET wrapper doesn't work here -- CALL pushes the
 ; return address UNDER (push side) or ABOVE (pop side) the very words
 ; we're parking, so a bare 'ret' would either return into parked data or
@@ -2551,19 +2477,6 @@ flt_b_pop:
         jmp  bx
 
 ; =============================================================================
-; LOAD_HALF_PI_A  FLT_A = PI/2 (as MBF4)
-; v2.9: factored out of 2 duplicated inline copies (FLT_ATAN's reciprocal
-; branch, FLT_ACOS) -- found by asmdup.py after the ASIN/ACOS port.
-; Inputs  : (none)
-; Outputs : FLT_A = PI/2
-; Clobbers: DI, SI
-; =============================================================================
-load_half_pi_a:
-        mov  di, FLT_A
-        mov  si, half_pi_const
-        jmp cp5
-
-; =============================================================================
 ; FLT_PI_2_B / FLT_PI_B / FLT_2PI_B  load PI/2, PI, or 2*PI into FLT_B
 ; v3.0, added for FLT_SIN's range reduction. PI and 2*PI are derived from
 ; PI/2 via the exponent-byte INC trick (same idea FLT_SQRT already uses
@@ -2574,40 +2487,86 @@ load_half_pi_a:
 ; Outputs : FLT_B = PI/2, PI, or 2*PI respectively
 ; Clobbers: DI, SI
 ; =============================================================================
+load_half_pi_a:
+        mov  di, FLT_A
+        DB 0x3B ; consume next 3 bytes
 flt_pi_2_b:
         mov  di, FLT_B
         mov  si, half_pi_const
-cp5:        
         movsw
         movsw
-        ret
-
-; Do not Split flt_2pi_b from flt_pi_b
-flt_pi_b:
-        call flt_pi_2_b
-        jmp  short pi_inc          ; PI/2 -> PI (shared with flt_2pi_b below)
-
-flt_2pi_b:
-        call flt_pi_b              ; FLT_B = PI, falls through for the
-                                    ; 2nd increment
-pi_inc:
-        inc  byte [FLT_B+0]        ; exponent+1 -> value*2
         ret
 
 ; =============================================================================
-; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
-; v2.0: limit n truncated to int16, result promoted back to float.
-; Inputs  : FLT_A = limit n (from eat_paren_expr)
-; Outputs : FLT_A = value in range [0, n), as a float
-; Clobbers: AX, BX, CX, DX, FLT_A
+; FLT_PI_B / FLT_2PI_B 
+; =============================================================================
+flt_2pi_b:
+        stc                         ; CF=1 for 2*PI (we want to add 2)
+        db   0xB1                   ; 'mov cl, imm8' swallows the 'clc' (0xF8)
+flt_pi_b:
+        clc                         ; CF=0 for PI (we want to add 1)
+        call flt_pi_2_b             ; DI advances to FLT_B + 4 
+        adc  byte [di-4], 1         ; PI: 1+0=1. 2PI: 1+1=2.
+        ret
+
+; =============================================================================
+; LDCONST_B_MUL  FLT_B = [SI] (4-byte MBF4 constant), then FLT_A *= FLT_B
+; Inputs  : SI -> 4-byte MBF4 constant, FLT_A = multiplicand
+; Outputs : FLT_A = FLT_A * [SI]
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B (FLT_MUL's own clobbers)
+; =============================================================================
+ldconst_b_mul:
+        mov  di, FLT_B  ; 3
+        movsw ; 1
+        movsw ; 1
+        jmp flt_mul             ; tail-call: FLT_A = FLT_A * FLT_B
+
+; =============================================================================
+; DO_RND_FUNC  RND -> pseudo-random value in [0, 1], niladic
+; Inputs  : (none)
+; Outputs : FLT_A = value in [0, 1] as a float (random_int / 32767)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B, FLT_SA, FLT_ER, FLT_DB
 ; =============================================================================
 do_rnd_func:
-        call flt_to_int         ; AX = int16(FLT_A) = limit
-        push ax                 ; save limit
-        call rnd_shuffle        ; advance LFSR -> AX
-        pop  cx                 ; CX = limit
-        call math_mod           ; AX = AX % CX
-        ;jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
+        mov  ax, 32767
+        call flt_from_int        ; FLT_A = 32767.0
+        call flt_a_to_b          ; FLT_B = 32767.0
+        call rnd_shuffle         ; advance LFSR -> AX
+        and  ax, 0x7FFF          ; keep positive (16-bit signed range)
+        call flt_from_int        ; FLT_A = float(random)
+        jmp  flt_div             ; FLT_A = FLT_A / FLT_B  (tail-call)
+
+; =============================================================================
+; DO_FREE_FUNC  FREE -> free program-store bytes, as a float, niladic.
+; Usable in expressions (e.g. IF FREE<100 THEN...) 
+; Inputs  : (none)
+; Outputs : FLT_A = PROGRAM_TOP - PROG_END, as a float
+; Clobbers: AX, BX, CX, DI, FLT_A
+; =============================================================================
+do_free_func:
+        mov  ax, PROGRAM_TOP
+        sub  ax, [PROG_END]
+        jmp  flt_from_int         ; tail-call: FLT_A = float(AX)
+
+; =============================================================================
+; flt_floor  FLT_A = truncate(FLT_A) toward zero, staying a float.
+; v3.0, added for FLT_SIN's range reduction (needs floor(x/2*PI) as a
+; float again, to multiply back by 2*PI and subtract). 
+; GOTCHA: FLT_TO_INT saturates at +/-32767 rather than erroring, so
+; |FLT_A| > 32767 silently truncates to a saturated value here too --
+; same int16 ceiling this codebase's PEEK/POKE/TAB/etc. args already
+; live with (see the file header), not a new limitation. FLT_SIN only
+; ever calls this on x/2*PI after taking |x|, so this caps the usable
+; input angle magnitude at a bit over 32767*2*PI (~205887) before SIN's
+; range reduction itself goes wrong -- more than enough for realistic
+; BASIC programs, but worth knowing.
+; Inputs  : FLT_A
+; Outputs : FLT_A = truncate(FLT_A)
+; Clobbers: AX, BX, CX, DX, DI
+; =============================================================================
+flt_floor:
+        call flt_to_int          ; AX = int16(FLT_A), truncated
+;        jmp  flt_from_int         ; tail-call: FLT_A = float(AX)
         ; drop through
 ; =============================================================================
 ; FLT_FROM_INT  AX (signed int16) -> FLT_A
@@ -2687,27 +2646,7 @@ mul_by_ten:
         jmp  flt_mul            ; tail-call (forward - safe, within range)
 
 ; =============================================================================
-; DIV_BY_TEN  FLT_A = FLT_A / 10
-; Inputs  : FLT_A
-; Outputs : FLT_A
-; Clobbers: AX, BX, CX, DX, DI, FLT_SA, FLT_ER, FLT_DB
-;           (union of flt_ten_b's and flt_div's own clobbers)
-; =============================================================================
-div_by_ten:
-        call flt_ten_b
-        jmp  flt_div            ; tail-call (forward - safe, within range)
-
-; =============================================================================
 ; FLT_TO_INT  FLT_A -> AX (signed int16, truncate toward zero)
-;
-; S8 (orig): sign saved to DL (free during shift of BX); FLT_TS slot
-;   eliminated.
-; v0.10: the byte at FLT_A+1 is read once into BH and copied to DL (was
-;   two separate memory reads); the dead 'and bh,0x7F' before 'or bh,0x80'
-;   is dropped (OR forces bit7=1 regardless of the AND); and the sign
-;   test is deferred to a post-loop 'shl dl,1' (bit7 -> CF) instead of
-;   'and dl,0x80' + 'or dl,dl' -- no masking needed since only the
-;   carry-out is used.
 ;
 ; True exponent e = exp-0x80. Extract top 16 bits of 24-bit mantissa into BX,
 ; right-shift by (16-e), apply sign.
@@ -2721,22 +2660,6 @@ flt_to_int:
         or   al, al
         jz   fti_zero
         sub  al, 0x80           ; true exponent
-        ; v3.0 BUG FIX: was a single 'jle fti_zero' here. For AL<0x80
-        ; (any fractional magnitude, true_exp<0), SUB AL,0x80 sets OF=1
-        ; *and* SF=1 together (0x80 read as -128 for signed-overflow
-        ; purposes conflicts with its intended use as a +128 bias), so
-        ; JLE's SF!=OF test never fires and this fast path was silently
-        ; skipped for every |value|<1 input -- unreachable until FLT_SIN
-        ; (v3.0) became the first caller to ever pass flt_to_int a
-        ; sub-1-magnitude value; every prior caller (PEEK/POKE/TAB/RND
-        ; args) always passed magnitude >=1. Confirmed via a live
-        ; single-step trace (SIN(0.00001) computing x/2*PI, which should
-        ; truncate to 0, instead fell through into the shift-based path
-        ; with a negative true_exp and came out with a large nonzero
-        ; garbage AX). Root cause verified by hand from the standard
-        ; x86 subtraction-overflow flag formula, not guessed. Splitting
-        ; into ZF/SF-only checks (no OF) sidesteps the conflict; costs
-        ; 2 bytes over the single JLE.
         jz   fti_zero           ; true_exp == 0 -> |value| < 1 (boundary)
         js   fti_zero           ; true_exp < 0  -> |value| < 1
         cmp  al, 16
@@ -2779,29 +2702,7 @@ fti_sat_pos:
         mov  ax, 32767
         ret
 
-; =============================================================================
-; FLT_INT  FLT_A = truncate(FLT_A) toward zero, staying a float.
-; v3.0, added for FLT_SIN's range reduction (needs floor(x/2*PI) as a
-; float again, to multiply back by 2*PI and subtract). Trivial
-; composition of two routines that already existed (this codebase had
-; no float->float truncation before -- no BASIC INT() keyword either,
-; unlike the codebase the ported FLT_SIN's "Reuses your BASIC's INT"
-; comment assumed).
-; GOTCHA: FLT_TO_INT saturates at +/-32767 rather than erroring, so
-; |FLT_A| > 32767 silently truncates to a saturated value here too --
-; same int16 ceiling this codebase's PEEK/POKE/TAB/etc. args already
-; live with (see the file header), not a new limitation. FLT_SIN only
-; ever calls this on x/2*PI after taking |x|, so this caps the usable
-; input angle magnitude at a bit over 32767*2*PI (~205887) before SIN's
-; range reduction itself goes wrong -- more than enough for realistic
-; BASIC programs, but worth knowing.
-; Inputs  : FLT_A
-; Outputs : FLT_A = truncate(FLT_A)
-; Clobbers: AX, BX, CX, DX, DI
-; =============================================================================
-flt_int:
-        call flt_to_int          ; AX = int16(FLT_A), truncated
-        jmp  flt_from_int         ; tail-call: FLT_A = float(AX)
+
 
 ; =============================================================================
 ; FLT_CMP  compare FLT_A with FLT_B (signed)
@@ -2839,6 +2740,24 @@ fcmp_zero:
         xor  ax, ax
         ret
 
+; =============================================================================
+; FLT_ACOS  FLT_A = acos(FLT_A), radians, range (0, PI)
+;
+; logic -- acos(x) = PI/2 - asin(x). Same domain caveat as FLT_ASIN.
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = acos(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, HORNER_T,
+;           LN_M, EXP_K (via FLT_ASIN)
+; NOTE: does NOT self-preserve SI, same reasoning as FLT_ASIN -- its
+; only caller (DO_ACOS_FUNC) already wraps the call.
+; =============================================================================
+flt_acos:
+        call flt_asin              ; FLT_A = asin(x)
+        call flt_a_to_b            ; FLT_B = asin(x)
+        call load_half_pi_a        ; FLT_A = PI/2
+        ;jmp  flt_sub                ; tail-call: FLT_A = PI/2 - asin(x)
+        ; drop through
 ; =============================================================================
 ; FLT_SUB  FLT_A = FLT_A - FLT_B
 ; Inputs  : FLT_A, FLT_B
@@ -2879,6 +2798,69 @@ fneg_tail:
 flt_neg_r:
         ret
 
+; =============================================================================
+; FLT_LN  FLT_A = ln(FLT_A), x > 0 required (?2 domain error otherwise)
+;
+; FLT_LN: splits x = m * 2^E with m in [0.5,1.0), then ln(x) = E*ln(2) + ln(m),
+; with ln(m) evaluated via z=(m-1)/(m+1), ln(m)=z*Q(z^2) 
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = ln(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, LN_M, HORNER_T
+; =============================================================================
+flt_ln:
+        cmp  byte [FLT_A+0], 0
+        je   ln_err
+        test byte [FLT_A+1], 0x80
+        jnz  ln_err
+        jmp  short ln_cont
+ln_err:
+        jmp  div_err                ; ?2, shared with FLT_DIV (domain error)
+
+ln_cont:
+        mov  al, [FLT_A+0]
+        sub  al, 0x80
+        cbw                         ; AX = signed exponent E
+        push ax                     ; stash E across the FLT_A-clobbering
+                                     ; work below
+
+        mov  byte [FLT_A+0], 0x80   ; FLT_A = m, mantissa in [0.5,1.0)
+        mov  si, FLT_A
+        mov  di, LN_M
+        movsw
+        movsw                       ; LN_M = m (stashed whole -- exponent
+                                     ; byte included, same as the source)
+
+        mov  ax, 1
+        call flt_from_int_b         ; FLT_B = 1.0
+        call flt_sub                ; FLT_A = m - 1
+        call flt_a_push             ; park (m-1)
+
+        mov  si, LN_M
+        mov  di, FLT_A
+        movsw
+        movsw                       ; FLT_A = m (restored)
+        mov  ax, 1
+        call flt_from_int_b         ; FLT_B = 1.0
+        call flt_add                ; FLT_A = m + 1
+        call flt_a_to_b             ; FLT_B = m + 1
+        call flt_a_pop              ; FLT_A = (m-1)  (unpark)
+        call flt_div                ; FLT_A = z = (m-1)/(m+1)
+
+        mov  si, ln_poly_tbl
+        mov  cx, 4
+        call horner_odd             ; FLT_A = z*Q(z^2) = ln(m)
+
+        pop  ax                     ; retrieve E
+        call flt_a_push             ; NOW park ln(m) (must happen after E
+                                     ; is off the stack, before FLT_A gets
+                                     ; overwritten by FLT_FROM_INT below)
+        call flt_from_int           ; FLT_A = float(E)
+        mov  si, ln2_const
+        call ldconst_b_mul          ; FLT_A = E*ln(2)
+        call flt_b_pop              ; FLT_B = ln(m)  (unpark into B)
+        ; jmp  flt_add                ; FLT_A = E*ln2 + ln(m); tail-call
+        ; drop through
 ; =============================================================================
 ; FLT_ADD  FLT_A = FLT_A + FLT_B
 ;
@@ -3062,6 +3044,39 @@ fa_np:
 fa_zero:
         jmp  flt_zero           ; backward jump - safe
 
+
+; =============================================================================
+; HORNER_ODD  FLT_A = z * P(z^2), for an odd polynomial evaluated through
+; the existing HORNER_EVAL (which itself just evaluates a plain P(t), t
+; supplied by the caller).
+;
+; Squares z once, evaluates P(z^2) via HORNER_EVAL (same SI/CX contract as calling
+; it directly), then multiplies the result back by the original z. Shared
+; by the new FLT_ATAN core (atan(x) = x*P(x^2)) and FLT_LN (ln(m) =
+; z*Q(z^2)) below -- one routine serving both, same economy of scale the
+; 6502 source got from it.
+;
+; Inputs  : FLT_A = z, SI -> coefficient table (HORNER_EVAL's own
+;           format/order), CX = number of coefficients (degree+1)
+; Outputs : FLT_A = z * P(z^2)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, HORNER_T (own work,
+;           plus HORNER_EVAL's/FLT_MUL's own clobbers)
+; =============================================================================
+horner_odd:
+        call flt_a_push          ; park z (FLT_A itself is left unchanged --
+                                  ; see flt_a_push's own header)
+        push si                  ; save table ptr -- flt_mul clobbers it
+        push cx                  ; save coefficient count likewise
+        call flt_a_to_b          ; FLT_B = z
+        call flt_mul             ; FLT_A = z^2
+        call flt_a_to_horner_t   ; HORNER_T = z^2 (HORNER_EVAL's eval point)
+        pop  cx                  ; restore count
+        pop  si                  ; restore table ptr
+        call horner_eval         ; FLT_A = P(z^2)
+        call flt_a_to_b          ; FLT_B = P(z^2)
+        call flt_a_pop           ; FLT_A = z (restore the parked copy)
+        ;jmp  flt_mul             ; FLT_A = z * P(z^2); tail-call
+        ; drop through
 ; =============================================================================
 ; FLT_MUL  FLT_A = FLT_A * FLT_B
 ;
@@ -3184,6 +3199,34 @@ fms_norm_ok:
         pop  si
         jmp  norm_pack          ; backward jump - safe
 
+; =============================================================================
+; FLT_TAN  FLT_A = tan(FLT_A) = sin(x) / cos(x)
+;
+; Domain: not checked. tan(x) is undefined at x=+-PI/2, +-3PI/2, etc.,
+; where cos(x)=0 -- FLT_DIV's own divide-by-zero check (?2) will catch
+; the exact-zero case; near-zero cos(x) 
+;
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = tan(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, TAN_C (and everything
+;           FLT_SIN/FLT_COS/FLT_DIV clobber)
+; =============================================================================
+flt_tan:
+        call flt_a_push            ; park x
+        call flt_cos                 ; FLT_A = cos(x)
+        mov  si, FLT_A
+        mov  di, TAN_C
+        movsw
+        movsw                        ; TAN_C = cos(x) (safe: FLT_SIN never
+                                      ; touches this scratch)
+        call flt_a_pop               ; FLT_A = x
+        call flt_sin                   ; FLT_A = sin(x)
+        mov  si, TAN_C
+        mov  di, FLT_B
+        movsw
+        movsw                        ; FLT_B = cos(x)
+       ; jmp  flt_div                   ; tail-call: FLT_A = sin(x) / cos(x)
+        ; drop through
 ; =============================================================================
 ; FLT_DIV  FLT_A = FLT_A / FLT_B
 ;
@@ -3336,175 +3379,206 @@ fdiv_next:
         ; AL already holds the guard byte (old AL) - leave unchanged
         mov  bh, [FLT_ER]
         pop  di
-        jmp  norm_pack          ; backward jump - safe
+       ; jmp  norm_pack          ; backward jump - safe
+        ; drop through
+; =============================================================================
+; NORM_PACK  normalise CH:DX, round, pack into FLT_A
+;
+; Placed early so all callers (flt_add, flt_mul, flt_div) jump backward.
+;
+; Register convention on entry:
+;   BH = biased exponent
+;   CH = mant[23:16]  (bit7 = implied-1 when normalised)
+;   DH = mant[15:8]
+;   DL = mant[7:0]
+;   AL = sub-guard byte (round-half-up; not stored)
+;   [FLT_SA] = result sign (0x00 or 0x80)
+;
+; Inputs  : BH, CH, DH, DL, AL, [FLT_SA]
+; Outputs : FLT_A packed
+; Clobbers: AX, BX, CX, DX
+; =============================================================================
+norm_pack:
+np_lp:
+        or   ch, ch
+        js   np_round
+        jnz  np_bit
+        ; CH=0: byte-shift optimisation
+        sub  bh, 8
+        jbe  flt_zero
+        mov  ch, dh
+        mov  dh, dl
+        mov  dl, al
+        xor  al, al
+        jmp  np_lp
+np_bit:
+        ; 1-bit left-shift AL:DL:DH:CH. CF already 0 here (set by the
+        ; 'or ch,ch' above, which is the only path into np_bit) so the
+        ; explicit clc is dead weight -- dropped.
+        rcl  al, 1
+        rcl  dx, 1
+        rcl  ch, 1
+        dec  bh
+        jnz  np_lp
+        ; drop through
+; =============================================================================
+; FLT_ZERO  FLT_A = 0.0
+; Inputs  : (none)
+; Outputs : FLT_A = 0.0
+; Clobbers: AX
+; =============================================================================
+flt_zero:
+        xor  ax, ax
+        mov  [FLT_A+0], ax
+        mov  [FLT_A+2], ax
+        ret
+
+np_round:
+        ; Round-half-up via sub-guard AL
+        add  al, 0x80
+        jnc  np_pack
+        inc  dx                 ; ripples DL->DH carry as one 16-bit op;
+                                 ; ZF set iff DX wrapped 0xFFFF->0x0000
+                                 ; (both bytes maxed), same condition the
+                                 ; old separate inc dl/inc dh pair checked
+        jnz  np_pack
+        inc  ch
+        jnz  np_pack
+        ; Mantissa overflow on round: all three incs above fell through,
+        ; so dl=dh=ch=0 here exactly -- set ch=0x80 directly (cheaper than
+        ; stc/rcr ch,1, which would compute the same result via rotation).
+        mov  ch, 0x80
+        inc  bh
+        jz   np_zero
+
+np_pack:
+        mov  [FLT_A+0], bh
+        mov  al, [FLT_SA]
+        and  ch, 0x7F
+        or   ch, al
+        mov  [FLT_A+1], ch
+        mov  [FLT_A+2], dh
+        mov  [FLT_A+3], dl
+        ret
+np_zero:
+        jmp  flt_zero
 
 ; =============================================================================
-; FLT_SQRT  FLT_A = sqrt(FLT_A), Newton-Raphson, 5 iterations
+; FLT_SQRT  FLT_A = sqrt(FLT_A) via the exp(0.5*ln(x)) identity, with zero
+; and negative guards.
 ;
-; Ported from the 65C02 uBASIC6502 float library's FLT_SQRT. Initial guess:
-; halve the biased exponent byte and re-bias by +64. Valid here because
-; this codebase's MBF4 format is excess-128 biased with mantissa in
-; [0.5,1) -- cross-checked against DO_ATN_FUNC's own exponent-byte
-; threshold (biased exponent 0x82 <=> value 2.0, which only holds under
-; that convention), not just assumed from the source this was ported from.
-; Iterates x_(n+1) = (S/x_n + x_n) / 2, halving via exponent decrement
-; rather than a real divide-by-2 (same trick as the source).
+; Negative input clamped to 0.0 -- this library has no complex-number
+; support, matching every other trig/log function's level of domain rigor
+; here (none of them raise an error for an out-of-domain input either,
+; except LN's exact x<=0 case, which FLT_SQRT never reaches: it clamps
+; before calling FLT_LN).
 ;
-; BUG FIXED from the ported source: the original 6502 draft's comment said
-; "JSR COPY_A_TO_B ; Move x_n from T_X into FLT_B", but COPY_A_TO_B copies
-; FLT_A (not T_X) into FLT_B -- and FLT_A had just been reloaded with S at
-; that point, so as literally written it would have computed S/S=1 every
-; iteration instead of S/x_n. A second comment further down ("Restore x_n
-; into FLT_B from T_X") had no code under it at all -- never implemented in
-; the source. Fixed here by copying x_n from T_X into FLT_B directly. Only
-; one such copy is needed (not one per FLT_DIV/FLT_ADD call) because neither
-; FLT_DIV nor FLT_ADD documents FLT_B as clobbered -- both leave it
-; unchanged in memory, confirmed against their own header comments.
-;
-; BUG FIXED (v3.1, found v2.9): FLT_SQRT(0) -- reached whenever ASIN/ACOS
-; hit exactly |x|=1, where 1-x^2 is exact zero -- produced garbage
-; instead of 0. The exponent-halving seed step below doesn't understand
-; MBF4's exact-zero sentinel (exponent byte 0x00 means "this is zero",
-; not "a tiny normalized value"); blindly halving-and-rebiasing 0x00
-; produced a nonzero "quasi-zero" seed (0x40), and 5 Newton-Raphson
-; iterations on that converge to a large garbage value, not 0. FLT_ASIN
-; then divided x by that quasi-zero -- small enough to blow up the
-; result, but not exactly zero, so FLT_DIV's real divide-by-zero check
-; never caught it. Confirmed via ASIN(0.99)/ASIN(0.999)/ASIN(0.9999),
-; which all correctly trended toward PI/2 -- this was specifically the
-; exact-zero case, not general imprecision near the boundary. Fixed
-; with an explicit zero check before the seed step; FLT_A is already
-; all-zero bytes in that case, so returning immediately is exact, not
-; approximate.
-;
-; Domain: FLT_A assumed non-negative otherwise; no further error check
-; (caller's responsibility, same as the ported source).
-;
-; Inputs  : FLT_A = S (value to take the square root of)
-; Outputs : FLT_A = sqrt(S)
-; Clobbers: AX, BX, CX, DX, DI, SQRT_S, SQRT_X
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = sqrt(x). x<0 clamps to 0.0.
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, LN_M, HORNER_T, EXP_K
 ; =============================================================================
 flt_sqrt:
         cmp  byte [FLT_A+0], 0
-        je   fsqrt_zero          ; exact zero: sqrt(0)=0, FLT_A is
-                                  ; already correct as-is
-        push si
-        mov  si, FLT_A
-        mov  di, SQRT_S
-        movsw
-        movsw                     ; T_S = S (original input, preserved
-                                   ; across all 5 iterations)
-
-        shr  byte [FLT_A+0], 1    ; halve the biased exponent
-        add  byte [FLT_A+0], 64   ; re-bias -> fast initial guess x_0
-
-        mov  cx, 5                ; 5 iterations: plenty for a 24-bit mantissa
-fsqrt_nr:
-        mov  si, FLT_A
-        mov  di, SQRT_X
-        movsw
-        movsw                     ; T_X = x_n (current guess, backed up)
-        mov  si, SQRT_S
-        mov  di, FLT_A
-        movsw
-        movsw                     ; FLT_A = S
-        mov  si, SQRT_X
-        mov  di, FLT_B
-        movsw
-        movsw                     ; FLT_B = x_n
-
-        push cx
-        call flt_div               ; FLT_A = S / x_n (FLT_B still x_n --
-                                    ; neither FLT_DIV nor FLT_ADD clobbers it)
-        call flt_add               ; FLT_A = (S / x_n) + x_n
-        dec  byte [FLT_A+0]        ; /2 via exponent decrement
-        pop  cx
-        loop fsqrt_nr
-
-        pop  si
+        je   fsqrt_zero              ; x==0 -> sqrt(0)=0 (skip undefined ln(0))
+        test byte [FLT_A+1], 0x80
+        jz   fsqrt_pos                ; x>0 -> normal path
+        mov  byte [FLT_A+0], 0        ; x<0 -> clamp to 0.0
 fsqrt_zero:
         ret
-
+fsqrt_pos:
+        call flt_ln
+        cmp  byte [FLT_A+0], 0
+        je   fsqrt_half               ; ln(x)==0 (x==1) -> exp(0)=1, skip halving
+        dec  byte [FLT_A+0]           ; *0.5 (halve the exponent)
+fsqrt_half:
+        ;jmp  flt_exp                  ; tail-call: exp(0.5*ln x)
+        ; drop through
 ; =============================================================================
-; FLT_ATAN  FLT_A = atan(FLT_A), full domain, rational approximation
+; FLT_EXP  FLT_A = e^FLT_A
 ;
-; Ported from the 65C02 uBASIC6502 float library's FLT_ATAN:
-; atan(x) = x / (1 + 0.28086*x^2), a minimax rational approximation
-; valid for |x|<=1 (max error ~0.005 rad in that range). This is a
-; straight port with no bug to fix (unlike FLT_SQRT) -- the 6502
-; source's FLT_ATAN was correct as written.
+; k=trunc(x*log2(e)), r=x-k*ln(2) (so r is small), evaluate exp(r) via degree-5
+; EXP_POLY_TBL through the existing HORNER_EVAL (a plain, not odd,
+; polynomial -- no HORNER_ODD needed here), then rebuild e^x = exp(r)*2^k
+; by adding k directly onto the result's biased exponent byte.
 ;
-; Extended here to the full domain via the same reciprocal identity the
-; CORDIC-based DO_ATN_FUNC this replaces already used: for |x|>=1.0,
-; atan(x) = sign(x) * (PI/2 - atan(1/|x|)). This extension isn't just
-; nice-to-have: FLT_ASIN (added alongside this, see change history)
-; evaluates atan(x/sqrt(1-x^2)), whose argument grows without bound as
-; |x| -> 1, so ATAN needs to stay accurate well past |x|=1 for ASIN/
-; ACOS's accuracy near the domain edges.
-;
-; GOTCHA: the |x|>=1.0 test is a raw exponent-byte compare, not a call
-; to FLT_CMP, for the same reason DO_ATN_FUNC's own |x|>=2.0 test was --
-; FLT_ADD's larger-operand swap doesn't restore FLT_B's identity (see
-; the RESIDUAL QUIRK note at the top of the file). Biased exponent 0x81
-; <=> value 1.0 under this codebase's excess-128/[0.5,1)-mantissa MBF4
-; convention (same convention DO_ATN_FUNC's own 0x82<=>2.0 test relies
-; on).
+; Domain: raises the shared ?2 (overflow) error if k doesn't fit a signed
+; byte (i.e. |x| large enough that e^x/e^-x is unrepresentable or absurd
+; for this 4-byte-float BASIC) -- same error FLT_DIV uses for its own
+; overflow case.
 ;
 ; Inputs  : FLT_A = x
-; Outputs : FLT_A = atan(x), radians, range (-PI/2, PI/2)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS
+; Outputs : FLT_A = e^x
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, EXP_K, HORNER_T
 ; =============================================================================
-flt_atan:
-        push si
-        mov  al, [FLT_A+1]
-        and  al, 0x80              ; AL = original sign bit
-        mov  [ATN_FLAGS], al
-        call flt_abs                ; FLT_A = |x|
-        cmp  byte [FLT_A+0], 0x81   ; exponent >= 0x81 <=> |x| >= 1.0
-        jb   fatan_have_arg
-        call flt_a_to_b             ; FLT_B = |x|
-        mov  ax, 1
-        call flt_from_int           ; FLT_A = 1.0
-        call flt_div                ; FLT_A = 1.0 / |x|
-        inc  byte [ATN_FLAGS]      ; set bit0 ("was range-reduced"); safe
-                                    ; as INC (not OR 0x01) because bit0 is
-                                    ; guaranteed clear here -- ATN_FLAGS was
-                                    ; just set to the sign bit alone (0x00
-                                    ; or 0x80) a few lines up
-fatan_have_arg:
-        call flt_a_push             ; protect the argument across FLT_MUL
-        call flt_a_to_b             ; FLT_B = x
-        call flt_mul                ; FLT_A = x^2
-        mov  di, FLT_B
-        mov  si, const_0_28086
-        movsw
-        movsw                      ; FLT_B = 0.28086
-        call flt_mul                ; FLT_A = 0.28086 * x^2
-        mov  ax, 1
-        call flt_from_int_b         ; FLT_B = 1.0
-        call flt_add                ; FLT_A = 1.0 + 0.28086*x^2  [denom]
-        call flt_a_to_b             ; FLT_B = denom
-        call flt_a_pop              ; FLT_A = x (or 1/|x|)
-        call flt_div                ; FLT_A = x / denom  (rational approx)
+flt_exp:
+        call flt_a_push             ; park x
+        mov  si, log2e_const
+        call ldconst_b_mul          ; FLT_A = y = x*log2(e)
+        call flt_to_int             ; AX = trunc(y) = k (16-bit, saturated)
+        cmp  ax, 127
+        jg   exp_range_err
+        cmp  ax, -128
+        jl   exp_range_err
+        mov  [EXP_K], al            ; stash k's low byte (dedicated
+                                     ; scratch -- simpler/safer than
+                                     ; nesting this inside the x park/
+                                     ; restore pair below)
+        call flt_from_int           ; FLT_A = float(k)
+        mov  si, ln2_const
+        call ldconst_b_mul          ; FLT_A = k*ln(2)
+        call flt_a_to_b             ; FLT_B = k*ln(2)
+        call flt_a_pop              ; FLT_A = x (unpark; balances entry)
+        call flt_sub                ; FLT_A = r = x - k*ln(2)
+        call flt_a_to_horner_t      ; HORNER_T = r (HORNER_EVAL's eval point)
+        mov  si, exp_poly_tbl
+        mov  cx, 6
+        call horner_eval            ; FLT_A = P(r) ~= exp(r)
+        mov  al, [EXP_K]
+        add  [FLT_A+0], al          ; FLT_A's exponent += k
+        ret
+exp_range_err:
+        call flt_a_pop              ; balance the entry park
+        jmp  div_err                ; ?2, |x| out of EXP's range
 
-        test byte [ATN_FLAGS], 0x01
-        jz   fatan_sign
-        call flt_a_to_b             ; FLT_B = atan(1/|x|)
-        call load_half_pi_a         ; FLT_A = PI/2
-        call flt_sub                ; FLT_A = PI/2 - atan(1/|x|)
-fatan_sign:
-        test byte [ATN_FLAGS], 0x80
-        jz   fatan_done
-        call flt_negate
-fatan_done:
+; =============================================================================
+; HORNER_EVAL  evaluate c[0] + c[1]*t + c[2]*t^2 + ... + c[n]*t^n via
+; Horner's method: ((c[n]*t + c[n-1])*t + ...)*t + c[0]
+; Inputs  : SI -> coefficient table in ROM, HIGHEST-degree term (c[n])
+;           FIRST, 4 bytes/entry (MBF4); CX = number of coefficients
+;           (degree+1); HORNER_T = t, the evaluation point (caller
+;           pre-loads this -- e.g. FLT_SIN evaluates a polynomial in x'^2
+;           and does its own final *x' afterward, so it stores x'^2 here,
+;           not x' itself)
+; Outputs : FLT_A = polynomial value
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, FLT_SA, FLT_SB (own work
+;           plus FLT_MUL's and FLT_ADD's own clobbers)
+; =============================================================================
+horner_eval:
+        mov  di, FLT_A
+        movsw
+        movsw                   ; FLT_A = c[n] (highest-degree term)
+        dec  cx
+        jcxz he_done            ; single-coefficient "polynomial": done
+he_lp:
+        push cx
+        push si                 ; SI (coefficient pointer) is clobbered by
+                                 ; FLT_MUL/FLT_ADD -- save/restore around
+                                 ; both calls below
+        mov  si, HORNER_T
+        call ldconst_b_mul
         pop  si
+        mov  di, FLT_B
+        movsw
+        movsw                    ; FLT_B = next coefficient; SI += 4
+        call flt_add               ; FLT_A = FLT_A + coefficient
+        pop  cx
+        loop he_lp
+he_done:
         ret
 
 ; =============================================================================
 ; FLT_ASIN  FLT_A = asin(FLT_A), radians, range (-PI/2, PI/2)
 ;
-; Ported from the 65C02 uBASIC6502 float library's FLT_ASIN, unchanged
-; logic -- no bug found here (unlike FLT_SQRT in v2.6):
 ; asin(x) = atan(x / sqrt(1-x^2)).
 ;
 ; Domain: |x|<=1. |x|>1 not checked -- same as FLT_SQRT and the ported
@@ -3527,30 +3601,14 @@ fatan_done:
 ;
 ; Inputs  : FLT_A = x
 ; Outputs : FLT_A = asin(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
-;           SQRT_X (via FLT_SQRT/FLT_ATAN)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, HORNER_T,
+;           LN_M, EXP_K (via FLT_SQRT/FLT_ATAN)
 ; NOTE: does NOT self-preserve SI (unlike FLT_SQRT/FLT_ATAN) -- its only
 ; callers (DO_ASIN_FUNC, FLT_ACOS) already wrap the whole call in their
 ; own push/pop si, so a second layer here is dead weight. If a future
 ; caller needs SI preserved across FLT_ASIN without wrapping it itself,
 ; add the wrap back.
 ; =============================================================================
-; =============================================================================
-; ONE_MINUS_MUL  FLT_A = 1.0 - (FLT_A * FLT_B)
-; Factored out of FLT_ASIN and FLT_SIN's polynomial phase -- both had this
-; exact 5-instruction sequence inline.
-; Inputs  : FLT_A, FLT_B
-; Outputs : FLT_A = 1.0 - (FLT_A * FLT_B)
-; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_SA, FLT_SB
-;           (union of FLT_MUL's, FLT_FROM_INT's, and FLT_SUB's own clobbers)
-; =============================================================================
-one_minus_mul:
-        call flt_mul
-        call flt_a_to_b
-        mov  ax, 1
-        call flt_from_int
-        jmp  flt_sub             ; tail-call: FLT_A = 1.0 - FLT_B
-
 flt_asin:
         call flt_a_push           ; park x on the real stack
         call flt_a_to_b           ; FLT_B = x
@@ -3573,40 +3631,100 @@ fasin_general:
         call flt_a_to_b           ; FLT_B = sqrt(1 - x^2)  [denominator]
         call flt_a_pop             ; FLT_A = x
         call flt_div                ; FLT_A = x / sqrt(1 - x^2)
-        jmp  flt_atan                ; tail-call: FLT_A = atan(result) = asin(x)
-
+        ;jmp  flt_atan                ; tail-call: FLT_A = atan(result) = asin(x)
+        ; drop through
 ; =============================================================================
-; FLT_ACOS  FLT_A = acos(FLT_A), radians, range (0, PI)
+; FLT_ATAN  FLT_A = atan(FLT_A), full domain, degree-3 odd-polynomial
+; approximation via HORNER_ODD
 ;
-; Ported from the 65C02 uBASIC6502 float library's FLT_ACOS, unchanged
-; logic -- acos(x) = PI/2 - asin(x). Same domain caveat as FLT_ASIN.
+; atan(x) = x*P(x^2), a degree-3 Remez fit
+; on [0,1] (~1.9e-4 rad max error -- ~26x tighter) evaluated through the
+; new shared HORNER_ODD.
+;
+; Range reduction for |x|>=1.0 (reciprocal + PI/2 identity) is
+; unchanged from the version this replaces -- still needed since
+; FLT_ASIN evaluates atan(x/sqrt(1-x^2)), whose argument grows without
+; bound as |x|->1.
+;
+; GOTCHA: the |x|>=1.0 test is a raw exponent-byte compare, not a call
+; to FLT_CMP, for the same reason DO_ATN_FUNC's own |x|>=2.0 test was --
+; FLT_ADD's larger-operand swap doesn't restore FLT_B's identity (see
+; the RESIDUAL QUIRK note at the top of the file). Biased exponent 0x81
+; <=> value 1.0 under this codebase's excess-128/[0.5,1)-mantissa MBF4
+; convention (same convention DO_ATN_FUNC's own 0x82<=>2.0 test relies
+; on).
 ;
 ; Inputs  : FLT_A = x
-; Outputs : FLT_A = acos(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
-;           SQRT_X (via FLT_ASIN)
-; NOTE: does NOT self-preserve SI, same reasoning as FLT_ASIN -- its
-; only caller (DO_ACOS_FUNC) already wraps the call.
+; Outputs : FLT_A = atan(x), radians, range (-PI/2, PI/2)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, HORNER_T
 ; =============================================================================
-flt_acos:
-        call flt_asin              ; FLT_A = asin(x)
-        call flt_a_to_b            ; FLT_B = asin(x)
-        call load_half_pi_a        ; FLT_A = PI/2
-        jmp  flt_sub                ; tail-call: FLT_A = PI/2 - asin(x)
+flt_atan:
+        push si
+        mov  al, [FLT_A+1]
+        and  al, 0x80              ; AL = original sign bit
+        mov  [ATN_FLAGS], al
+        call flt_abs                ; FLT_A = |x|
+        cmp  byte [FLT_A+0], 0x81   ; exponent >= 0x81 <=> |x| >= 1.0
+        jb   fatan_core
+        call flt_a_to_b             ; FLT_B = |x|
+        mov  ax, 1
+        call flt_from_int           ; FLT_A = 1.0
+        call flt_div                ; FLT_A = 1.0 / |x|  (now < 1.0)
+        inc  byte [ATN_FLAGS]      ; set bit0 ("was range-reduced"); safe
+                                    ; as INC (not OR 0x01) because bit0 is
+                                    ; guaranteed clear here -- ATN_FLAGS was
+                                    ; just set to the sign bit alone (0x00
+                                    ; or 0x80) a few lines up
+fatan_core:
+        mov  si, atn_poly_tbl
+        mov  cx, 4
+        call horner_odd             ; FLT_A = FLT_A * P(FLT_A^2) = atan_core(.)
+                                     ; (HORNER_ODD parks/restores the argument
+                                     ; itself -- no separate push needed here)
+
+        test byte [ATN_FLAGS], 0x01
+        jz   fatan_sign
+        call flt_a_to_b             ; FLT_B = atan_core(1/|x|)
+        call load_half_pi_a         ; FLT_A = PI/2
+        call flt_sub                ; FLT_A = PI/2 - atan_core(1/|x|)
+fatan_sign:
+        test byte [ATN_FLAGS], 0x80
+        jz   fatan_done
+        call flt_negate
+fatan_done:
+        pop  si
+        ret
 
 ; =============================================================================
+; ONE_MINUS_MUL  FLT_A = 1.0 - (FLT_A * FLT_B)
+; Factored out of FLT_ASIN and FLT_SIN's polynomial phase -- both had this
+; exact 5-instruction sequence inline.
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = 1.0 - (FLT_A * FLT_B)
+; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_SA, FLT_SB
+;           (union of FLT_MUL's, FLT_FROM_INT's, and FLT_SUB's own clobbers)
+; =============================================================================
+one_minus_mul:
+        call flt_mul
+        call flt_a_to_b
+        mov  ax, 1
+        call flt_from_int
+        jmp  flt_sub             ; tail-call: FLT_A = 1.0 - FLT_B
+
+; =============================================================================
+; FLT_COS  FLT_A = cos(FLT_A) = sin(PI/2 - FLT_A)
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = cos(x)
+; Clobbers: same as FLT_SIN (tail-calls it)
+; =============================================================================
+flt_cos:
+        call flt_a_to_b            ; FLT_B = x
+        call load_half_pi_a        ; FLT_A = PI/2
+        call flt_sub                ; FLT_A = PI/2 - x
+;        jmp  flt_sin                 ; tail-call: FLT_A = sin(PI/2 - x)
+        ; drop through
+; =============================================================================
 ; FLT_SIN  FLT_A = sin(FLT_A), radians, full domain
-;
-; Ported from a 65C02 trig library (2-term minimax polynomial, accurate
-; on [0,PI/2] after range reduction mod 2*PI and quadrant folding).
-; Straight port, no bug found -- traced the real-stack depth through
-; every branch (FLT_A_PUSH/FLT_A_POP/FLT_B_POP's 4-byte float parks,
-; interleaved with a 1-word sign-tracker push/pop) and it balances on
-; every path, matching the source's own PHA/PLA + PUSH_FLT_A/POP_FLT_A
-; interleaving. Replaces CORDIC (v3.0 -- see change history); the
-; polynomial is plausibly *more* precise than CORDIC's ~14-bit
-; fixed-point, not just smaller, though not independently re-derived
-; here -- accuracy is only as good as the source's own claim.
 ;
 ; GOTCHA: the sign tracker lives in AX on the real stack (AL=0x00 or
 ; 0x80, AH don't-care) rather than a byte push, since 8086 has no
@@ -3614,14 +3732,14 @@ flt_acos:
 ; once (net stack-depth-neutral) if x lands past PI during folding, and
 ; popped for good at the very end.
 ;
-; Domain: magnitude of x limited by FLT_INT's int16 saturation on
-; x/(2*PI) -- see FLT_INT's own header for the ceiling. Not checked
+; Domain: magnitude of x limited by flt_floor's int16 saturation on
+; x/(2*PI) -- see flt_floor's own header for the ceiling. Not checked
 ; beyond that, matching this codebase's existing rigor for its other
 ; trig functions.
 ;
 ; Inputs  : FLT_A = x
 ; Outputs : FLT_A = sin(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, HORNER_T
 ; =============================================================================
 flt_sin:
         mov  al, [FLT_A+1]
@@ -3632,7 +3750,7 @@ flt_sin:
         call flt_a_push             ; park |x|
         call flt_2pi_b              ; FLT_B = 2*PI
         call flt_div                 ; FLT_A = |x| / 2*PI
-        call flt_int                  ; FLT_A = INT(|x| / 2*PI)
+        call flt_floor                  ; FLT_A = INT(|x| / 2*PI)
         call flt_2pi_b                 ; FLT_B = 2*PI
         call flt_mul                    ; FLT_A = INT(...) * 2*PI
         call flt_a_to_b                  ; FLT_B = INT(...) * 2*PI
@@ -3664,86 +3782,23 @@ fsin_le_pi_2:
         call load_half_pi_a                           ; restore
         call flt_sub                                   ; x' = PI/2-(PI/2-x')
 fsin_eval_poly:
-        ; sin(x') ~= x' * (1 - x'^2 * (0.16605 - 0.00761 * x'^2))
-        call flt_a_push               ; park x'
+        ; sin(x') ~= x' * (c2*x'^4 + c1*x'^2 + c0), Horner in t=x'^2,
+        ; c0=1.0, c1=-0.16605, c2=0.00761 (same coefficients as before,
+        ; just table-driven now instead of unrolled)
+        call flt_a_push               ; park x' (for the final *x')
         call flt_a_to_b
         call flt_mul                   ; FLT_A = x'^2
-        call flt_a_push                 ; park x'^2
+        call flt_a_to_horner_t          ; HORNER_T = x'^2
+        mov  si, sin_coeffs
+        mov  cx, 3
+        call horner_eval                  ; FLT_A = c2*t^2 + c1*t + c0
 
-        mov  di, FLT_B
-        mov  si, const_c2
-        movsw
-        movsw                            ; FLT_B = 0.00761
-        call flt_mul                      ; FLT_A = 0.00761 * x'^2
-        call flt_a_to_b
-        mov  di, FLT_A
-        mov  si, const_c1
-        movsw
-        movsw                              ; FLT_A = 0.16605
-        call flt_sub                        ; FLT_A = 0.16605 - 0.00761*x'^2
+        call flt_b_pop                     ; FLT_B = x' (unpark)
+        call flt_mul                        ; FLT_A = x' * (...)
 
-        call flt_b_pop                       ; FLT_B = x'^2
-        call one_minus_mul                    ; FLT_A = 1.0 - x'^2*(...)
-
-        call flt_b_pop                           ; FLT_B = x'
-        call flt_mul                              ; FLT_A = x' * (...)
-
-        pop  ax                                    ; sign tracker
+        pop  ax                              ; sign tracker
         xor  [FLT_A+1], al
         ret
-
-; =============================================================================
-; FLT_COS  FLT_A = cos(FLT_A) = sin(PI/2 - FLT_A)
-; Ported from the same 65C02 trig library. Straight port, trivial.
-; Inputs  : FLT_A = x
-; Outputs : FLT_A = cos(x)
-; Clobbers: same as FLT_SIN (tail-calls it)
-; =============================================================================
-flt_cos:
-        call flt_a_to_b            ; FLT_B = x
-        call load_half_pi_a        ; FLT_A = PI/2
-        call flt_sub                ; FLT_A = PI/2 - x
-        jmp  flt_sin                 ; tail-call: FLT_A = sin(PI/2 - x)
-
-; =============================================================================
-; FLT_TAN  FLT_A = tan(FLT_A) = sin(x) / cos(x)
-;
-; Ported from the same 65C02 trig library. The source parks cos(x) via a
-; 6-byte manual shuffle into its own T_X scratch (presumably to conserve
-; the 6502's tiny 256-byte hardware stack); on 8088 the real stack has
-; much more headroom, so this reimplements the same idea with a plain
-; scratch RAM slot (TAN_C) rather than replicating the shuffle -- cos(x)
-; can't be parked via FLT_A_PUSH/the stack the way it works elsewhere in
-; this file, because FLT_SIN (called next, to get sin(x)) clobbers FLT_B
-; internally, and the stack-park mechanism here only has one slot (FLT_A)
-; to round-trip through -- a second parked value needs real memory.
-;
-; Domain: not checked. tan(x) is undefined at x=+-PI/2, +-3PI/2, etc.,
-; where cos(x)=0 -- FLT_DIV's own divide-by-zero check (?2) will catch
-; the exact-zero case; near-zero cos(x) (x close to but not exactly the
-; singularity) will just produce a very large but finite result, same
-; level of rigor as this codebase's other trig functions.
-;
-; Inputs  : FLT_A = x
-; Outputs : FLT_A = tan(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, TAN_C (and everything
-;           FLT_SIN/FLT_COS/FLT_DIV clobber)
-; =============================================================================
-flt_tan:
-        call flt_a_push            ; park x
-        call flt_cos                 ; FLT_A = cos(x)
-        mov  si, FLT_A
-        mov  di, TAN_C
-        movsw
-        movsw                        ; TAN_C = cos(x) (safe: FLT_SIN never
-                                      ; touches this scratch)
-        call flt_a_pop               ; FLT_A = x
-        call flt_sin                   ; FLT_A = sin(x)
-        mov  si, TAN_C
-        mov  di, FLT_B
-        movsw
-        movsw                        ; FLT_B = cos(x)
-        jmp  flt_div                   ; tail-call: FLT_A = sin(x) / cos(x)
 
 ; =============================================================================
 ; FLT_PRINT  print FLT_A as decimal to terminal
@@ -3979,35 +4034,38 @@ fp_print_emit:
         jmp  fp_print_lp
 fp_print_done:
         ; S22: restore FLT_A directly from stack
-        call flt_a_pop
+        call flt_a_pop  ; must be a call not jmp
         ret
 
 ; =============================================================================
+; E2_VAR  load variable value at factor level
+; v2.0: 4-byte float load (was 2-byte int).
+; Inputs  : SI -> variable letter
+; Outputs : FLT_A = variable value
+; Clobbers: AX, SI, DI
+; =============================================================================
+e2_var:
+        call get_var_addr        ; DI = &VARS[var]
+        push si
+        mov  si, di
+        mov  di, FLT_A
+        jmp  cp4
+
+; =============================================================================
+; E2_NUSR  number-or-variable dispatch (after function table miss)
+; Routes to flt_parse (decimal literal, v2.0: was input_number) or e2_var
+; (letter).
+; =============================================================================
+e2_nusr:
+        mov  al, [si]           ; reload
+        cmp  al, '0'
+        jb   e2_var
+        cmp  al, '9'
+        ja   e2_var
+        ;jmp  flt_parse           ; tail-call: FLT_A = parsed literal
+        ; drop through
+; =============================================================================
 ; FLT_PARSE  decimal string at [SI] -> FLT_A
-;
-; Recursive rewrite: the integer part is accumulated iteratively (digit-by-
-; digit, multiply-by-10-then-add, same as before) but the FRACTIONAL part is
-; built by recursing to the end of the fractional digits first, then
-; unwinding: each frame computes (digit + result_of_rest) / 10. This gets
-; the same value as the old "count decimal places, then divide by 10^n at
-; the end" approach, but needs no place-counter and naturally stops at
-; exactly the typed digits with no separate scaling pass. Recursion depth
-; is bounded by the number of *typed* fractional-digit characters (a BASIC
-; program's source text), not by the parsed value's magnitude, so it is
-; safe in a way a similar trick for the integer part would not be.
-;
-; GOTCHA: the input sign is stashed in FLT_DE, not FLT_SA. FLT_SA is
-; flt_add's own "sign of larger operand" scratch and gets clobbered by
-; every flt_add call made while accumulating digits -- stashing the
-; sign there would lose it before it could be applied. FLT_DE is safe
-; for the whole parse (flt_print's scratch, untouched by flt_add/mul/div,
-; and flt_parse never calls flt_print).
-;
-; GOTCHA: FPAR_CHK_DOT's decimal-point path and FPAR_SIGN_APPLY's
-; plain-integer path are NOT symmetric on purpose. PARSE_FRAC's own base
-; case (PFRAC_END) already un-consumes the digit string's terminator, so
-; the decimal-point path must NOT also do FPAR_SIGN_APPLY's 'dec si' --
-; doing both double-decrements SI. See v2.1 change history.
 ;
 ; Inputs  : SI -> null/CR-terminated decimal string
 ; Outputs : FLT_A = parsed value; SI advanced past last char consumed
@@ -4079,6 +4137,9 @@ fpar_done:
 ;           applies a second dec si after calling this (see fpar_chk_dot).
 ; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B
 ; -----------------------------------------------------------------------------
+pfrac_end:
+        dec  si                 ; un-consume the non-digit terminator
+        jmp  flt_zero           ; base case: nothing left -> 0.0
 parse_frac:
         lodsb
         sub  al, '0'
@@ -4090,141 +4151,57 @@ parse_frac:
         pop  ax
         call flt_from_int_b     ; FLT_B = this digit
         call flt_add            ; FLT_A = digit + rest
-        jmp  div_by_ten         ; tail-call: FLT_A = (digit + rest) / 10
-pfrac_end:
-        dec  si                 ; un-consume the non-digit terminator
-        jmp  flt_zero           ; base case: nothing left -> 0.0
-
+;        jmp  div_by_ten         ; tail-call: FLT_A = (digit + rest) / 10
+        ; drop through
 ; =============================================================================
-; DO_USR_FUNC  USR(addr) — call arbitrary machine-code address
-; v2.0: argument truncated to int16 (call address); the called routine's
-; own contract is unchanged (still receives nothing in particular, still
-; returns its result in AX as plain int16 machine-code convention) -- only
-; the BASIC-side argument and return value are now float at the boundary.
-; Inputs  : FLT_A = call address (from eat_paren_expr)
-; Outputs : FLT_A = float(AX), where AX = return value from called routine
-; Clobbers: AX, whatever the called routine clobbers
-; =============================================================================
-do_usr_func:
-        call flt_to_int         ; AX = int16(FLT_A) = call address
-        call ax       ; CALL (not JMP) so we return here after
-        jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
+; DIV_BY_TEN  FLT_A = FLT_A / 10
+; ; =============================================================================
+div_by_ten:
+        call flt_ten_b
+        jmp  flt_div            ; tail-call (forward - safe, within range)
 
 ; =============================================================================
 ; Shared float constants (MBF4). half_pi_const used by FLT_ATAN, FLT_ASIN
 ; (via LOAD_HALF_PI_A), FLT_ACOS, FLT_SIN, FLT_COS (via FLT_PI_2_B/
-; FLT_PI_B/FLT_2PI_B). const_0_28086 is FLT_ATAN's rational-approximation
-; coefficient; const_c1/const_c2 are FLT_SIN's polynomial coefficients.
-; All three non-trivial constants were generated and verified via this
-; ROM's own flt_parse (A=<value>, then PEEK'd back out of VARS), not
-; hand-derived -- see v2.8/v3.0 change history.
-; NOTE (v3.0): this block used to sit between CORDIC_ATAN_TAB and
-; CORDIC_ROTATE_FX; relocated here, unchanged, when CORDIC was removed
-; -- these four are the only things from that stretch of the file that
-; were still needed.
+; FLT_PI_B/FLT_2PI_B). const_c1/const_c2 are FLT_SIN's polynomial
+; coefficients. 
 ; =============================================================================
+
 half_pi_const: db 0x81, 0x49, 0x0F, 0xDB  ; PI/2 as MBF4
-const_0_28086: db 0x7F, 0x0F, 0xCC, 0xE2  ; 0.28086 as MBF4
-const_c1:      db 0x7E, 0x2A, 0x09, 0x02  ; 0.16605 as MBF4
-const_c2:      db 0x79, 0x79, 0x5D, 0x4D  ; 0.00761 as MBF4
+ln2_const:     db 0x80, 0x31, 0x72, 0x18  ; ln(2)     = 0.6931472
+log2e_const:   db 0x81, 0x38, 0xAA, 0x3B  ; log2(e)   = 1.4426950
 
-; =============================================================================
-; DO_SIN_FUNC  SIN(x)          DO_COS_FUNC  COS(x)
-; v3.0: thin wrappers around FLT_SIN/FLT_COS's minimax-polynomial
-; implementation -- replaces the CORDIC engine entirely (CORDIC_ROTATE_FX,
-; CORDIC_REDUCE, CORDIC_PICK, FLT_TO_FX14, FX14_TO_FLT, and the old
-; merged TRIG_COMMON dispatch, ~360 bytes total including CORDIC_ATAN_TAB
-; and FX14_SCALE). See v3.0 change history for the full accounting.
-; Inputs  : FLT_A = x (radians, from eat_paren_expr)
-; Outputs : FLT_A = sin(x) / cos(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B
-; =============================================================================
-do_sin_func:
-        push si
-        call flt_sin
-        pop  si
-        ret
+; sin_coeffs: FLT_SIN's polynomial coefficients for HORNER_EVAL, highest
+; degree first (t=x'^2): c2=+0.00761, c1=-0.16605, c0=+1.0. 
+sin_coeffs:    db 0x79, 0x79, 0x5D, 0x4D  ; c2 = +0.00761
+               db 0x7E, 0xAA, 0x09, 0x02  ; c1 = -0.16605
+               db 0x81, 0x00, 0x00, 0x00  ; c0 = +1.0
 
-do_cos_func:
-        push si
-        call flt_cos
-        pop  si
-        ret
+; atn_poly_tbl: FLT_ATAN's degree-3 odd-poly coefficients for HORNER_ODD,
+; atan(x)=x*P(x^2), Remez fit on [0,1], highest degree first (C3..C0):
+;   atan(x) ~= x*(0.999810457 - 0.326217234*x^2 + 0.156670749*x^4
+;                 - 0.045055345*x^6)
+atn_poly_tbl:  db 0x7C, 0xB8, 0x8B, 0xF4  ; C3 = -0.045055345
+               db 0x7E, 0x20, 0x6E, 0x4C  ; C2 = +0.156670749
+               db 0x7F, 0xA7, 0x05, 0xF2  ; C1 = -0.326217234
+               db 0x80, 0x7F, 0xF3, 0x94  ; C0 = +0.999810457
 
-; =============================================================================
-; DO_ATN_FUNC  ATN(x) -> arctangent in radians, range (-PI/2, PI/2).
-; v2.8: now a thin wrapper around FLT_ATAN's rational approximation
-; (see its own header) -- was CORDIC vectoring-mode before. SI handling
-; kept identical to the CORDIC version even though FLT_ATAN's own
-; internal push/pop si already protects it, to stay consistent with
-; DO_SIN_FUNC/DO_COS_FUNC's pattern and because this is the E2_FUNC_CALL
-; tail-jump entry point, not just an internal helper.
-; Inputs  : FLT_A = x (from eat_paren_expr)
-; Outputs : FLT_A = atan(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS
-; =============================================================================
-do_atn_func:
-        push si
-        call flt_atan
-        pop  si
-        ret
+; ln_poly_tbl: FLT_LN's degree-3 odd-poly coefficients for HORNER_ODD,
+; ln(m)=z*Q(z^2) where z=(m-1)/(m+1), highest degree first (C3..C0).
+ln_poly_tbl:   db 0x7F, 0x2F, 0x29, 0x5C  ; C3 = +0.34211242
+               db 0x7F, 0x4A, 0xA5, 0xC5  ; C2 = +0.39579598
+               db 0x80, 0x2A, 0xB1, 0x9C  ; C1 = +0.66677263
+               db 0x81, 0x7F, 0xFF, 0xFB  ; C0 = +1.99999941
 
-; =============================================================================
-; DO_ASIN_FUNC  ASIN(x) -> arcsine in radians, range (-PI/2, PI/2).
-; Thin wrapper around FLT_ASIN, same pattern as DO_ATN_FUNC.
-; Inputs  : FLT_A = x (from eat_paren_expr)
-; Outputs : FLT_A = asin(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
-;           SQRT_X
-; =============================================================================
-do_asin_func:
-        push si
-        call flt_asin
-        pop  si
-        ret
-
-; =============================================================================
-; DO_ACOS_FUNC  ACOS(x) -> arccosine in radians, range (0, PI).
-; Thin wrapper around FLT_ACOS, same pattern as DO_ATN_FUNC.
-; Inputs  : FLT_A = x (from eat_paren_expr)
-; Outputs : FLT_A = acos(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, ATN_FLAGS, SQRT_S,
-;           SQRT_X
-; =============================================================================
-do_acos_func:
-        push si
-        call flt_acos
-        pop  si
-        ret
-
-; =============================================================================
-; DO_SQRT_FUNC  SQRT(x) -> square root.
-; v3.1: FLT_SQRT existed since v2.6 as ASIN's internal dependency but was
-; never exposed as its own BASIC keyword until now. Thin wrapper, same
-; pattern as DO_ATN_FUNC.
-; Inputs  : FLT_A = x (from eat_paren_expr)
-; Outputs : FLT_A = sqrt(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, SQRT_S, SQRT_X
-; =============================================================================
-do_sqrt_func:
-        push si
-        call flt_sqrt
-        pop  si
-        ret
-
-; =============================================================================
-; DO_TAN_FUNC  TAN(x) -> tangent.
-; Thin wrapper around FLT_TAN, same pattern as DO_ATN_FUNC.
-; Inputs  : FLT_A = x (from eat_paren_expr)
-; Outputs : FLT_A = tan(x)
-; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, TAN_C
-; =============================================================================
-do_tan_func:
-        push si
-        call flt_tan
-        pop  si
-        ret
-
+; exp_poly_tbl: FLT_EXP's degree-5 (plain, not odd) polynomial for
+; HORNER_EVAL directly, evaluated at r = x - k*ln(2), highest degree
+; first (C5..C0).
+exp_poly_tbl:  db 0x7A, 0x0B, 0x13, 0xF2  ; C5 = +0.00848864
+               db 0x7C, 0x2E, 0x6E, 0x2A  ; C4 = +0.04258553
+               db 0x7E, 0x2A, 0xA1, 0xBF  ; C3 = +0.16663264
+               db 0x7F, 0x7F, 0xEC, 0xA5  ; C2 = +0.49985232
+               db 0x81, 0x00, 0x00, 0x0F  ; C1 = +1.00000182
+               db 0x81, 0x00, 0x00, 0x1C  ; C0 = +1.00000339
 ROM_END:
 
 ; =============================================================================
