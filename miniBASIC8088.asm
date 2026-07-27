@@ -13,7 +13,8 @@
 ; Expressions:
 ;   + - * / % ^   = < > <= >= <>   unary -
 ;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
-;   FREE  LN(flt)  PEEK(addr)  PI  RND  SIN(rad)  TAN(rad)  SQR(flt)  USR(addr)
+;   FREE  IN(io)  LN(flt)  PEEK(addr)  PI  RND  SIN(rad)  TAN(rad)  SQRT(flt)
+;   USR(addr)
 ;   26 single letter variables, A-Z 
 ;
 ; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
@@ -33,6 +34,18 @@
 ;
 ; KNOWN LIMITATIONS
 ;   - Multi-statement lines (':'-separated statements) not supported. 
+;
+; Two Character keyword matching - To save ROM space, only 2 chars are 
+;   matched, then rest of word consumed until a space or `(`.  So spaces
+;   are needed eg `10 PRINT TAB(5);"HELLO"` works, `10 PR TA(5);"Hello"`
+;   also works, but `10 PRINTTAB(5);"Hello"` prints '5Hello'
+;
+;  Number literal Format: Require a leading digit before the decimal point -
+;   "0.5" works, ".5" does not (parses as 0).
+;   Scientific notation is NOT supported - the "E..." suffix is silently 
+;   ignored, so "1E10" parses as plain "1". Type magnitudes in full.
+;
+;  FLOOR(flt) rounds towards zero eg floor(3.5) is 3, floor (-3.5) is -3, NOT -4.
 ;
 ;   - TAB(n) prints n literal space characters relative to the current
 ;     cursor position, not column n.
@@ -56,6 +69,13 @@
 ;     (roughly |x| > 88, i.e. beyond this float format's representable
 ;     range in either direction) raises a "?2" error.
 ;
+; X^Y is computed as EXP(Y*LN(X)):
+;   - X must be positive; X<=0 raises LN's "?2" domain error, negative base 
+;     not supported e.g. (-2)^2.
+;   - Binds tighter than * / % (proper BODMAS/PEMDAS) and is right-
+;     associative, so "2*3^2"=18 and "2^3^2"=512, matching convention.
+;   - Inherits EXP's overflow/underflow "?2" error for extreme results.
+;
 ;   - ATN accurate to ~1.9e-4 rad (degree-3 odd-polynomial core, v3.11).
 ;     SIN/COS accurate to ~0.0002 rad on their core polynomial domain.
 ;     SIN/COS range reduction (mod 2*PI) itself breaks down for |x| roughly
@@ -65,12 +85,15 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;
-; v3.13 (2026-07-26) - ROM_END: NASM/ROM  -> 256 bytes, YASM 65 -> 303
+; v3.13 (2026-07-26) - ROM_END: NASM/ROM 207 bytes, YASM 254 bytes
 ;   - Refactored DISPATCH2's no-match to have not match vector to enable
 ;     both function and statement matching.
 ;   - DO_PRINT's CHR$/TAB matching migrated from KW_MATCH to MATCH2, with a
 ;     new CHK3RD helper 
 ;   - Removed now-dead KW_MATCH, CHRS_TAB/TAB_TAB, KW_CHRS/KW_TAB, and constants
+;   - Fixed the Vortex spiral's offset bug
+;   - Added the ^ (power) operator: new EXPR_POW precedence level 
+;   - Added FLT_B_PUSH (mirrors the existing FLT_B_POP) for FLT_POW
 ;
 ; v3.12 (2026-07-26)
 ;   - Updated KNOWN LIMITATIONS to document mathematical function domain boundaries and accuracy.
@@ -345,6 +368,14 @@ SHOWCASE_DATA:
         db "PRINT ", 0x22, 0x22, 0x0D
         ; ── Vortex: trig-library stress test (SIN, COS, TAN, ASIN, ACOS, ATN, ─
         ; SQRT), replaced the old CORDIC sine-wave demo in v3.4.
+        ; v3.13: FIXED -- cells outside the D>1.2 radius used to jump
+        ; straight to NEXT C without printing anything (not even a space),
+        ; so row lengths varied with how many background cells came before
+        ; the first foreground char, making the spiral appear shifted/
+        ; warped. S=32 (background/default char) now runs BEFORE the
+        ; D>1.2 check, which now jumps straight to the PRINT line (skips
+        ; the trig math AND the 4 threshold IFs, avoiding a stale-Z
+        ; re-trigger), so every cell prints exactly one character.
         dw 220
         db "REM ============================================", 0x0D
         dw 222
@@ -368,41 +399,41 @@ SHOWCASE_DATA:
         dw 231
         db "D=SQRT(X*X+Y*Y)", 0x0D
         dw 232
-        db "IF D>1.2 THEN GOTO 255", 0x0D
-        dw 233
-        db "IF X=0 THEN GOTO 236", 0x0D
-        dw 234
-        db "T=ATN(Y/X)", 0x0D
-        dw 235
-        db "GOTO 237", 0x0D
-        dw 236
-        db "T=1.5708", 0x0D
-        dw 237
-        db "REM --- TEST SIN/COS ---", 0x0D
-        dw 238
-        db "W=SIN(6*D-3*T)", 0x0D
-        dw 239
-        db "REM --- TEST TAN ---", 0x0D
-        dw 240
-        db "U=TAN(W*0.5)", 0x0D
-        dw 241
-        db "REM --- BOUND VALUE TO [-0.99, 0.99] ---", 0x0D
-        dw 242
-        db "P=COS(U)*0.99", 0x0D
-        dw 243
-        db "REM --- TEST ASIN/ACOS ---", 0x0D
-        dw 244
-        db "A=ACOS(P)", 0x0D
-        dw 245
-        db "B=ASIN(P)", 0x0D
-        dw 246
-        db "REM --- MATH SHADE VALUE ---", 0x0D
-        dw 247
-        db "Z=(A-B)/3.1416", 0x0D
-        dw 248
-        db "REM --- MAP TO ASCII CHARS (recalibrated -- see change history) ---", 0x0D
-        dw 249
         db "S=32", 0x0D
+        dw 233
+        db "IF D>1.2 THEN GOTO 254", 0x0D
+        dw 234
+        db "IF X=0 THEN GOTO 237", 0x0D
+        dw 235
+        db "T=ATN(Y/X)", 0x0D
+        dw 236
+        db "GOTO 238", 0x0D
+        dw 237
+        db "T=1.5708", 0x0D
+        dw 238
+        db "REM --- TEST SIN/COS ---", 0x0D
+        dw 239
+        db "W=SIN(6*D-3*T)", 0x0D
+        dw 240
+        db "REM --- TEST TAN ---", 0x0D
+        dw 241
+        db "U=TAN(W*0.5)", 0x0D
+        dw 242
+        db "REM --- BOUND VALUE TO [-0.99, 0.99] ---", 0x0D
+        dw 243
+        db "P=COS(U)*0.99", 0x0D
+        dw 244
+        db "REM --- TEST ASIN/ACOS ---", 0x0D
+        dw 245
+        db "A=ACOS(P)", 0x0D
+        dw 246
+        db "B=ASIN(P)", 0x0D
+        dw 247
+        db "REM --- MATH SHADE VALUE ---", 0x0D
+        dw 248
+        db "Z=(A-B)/3.1416", 0x0D
+        dw 249
+        db "REM --- MAP TO ASCII CHARS (recalibrated -- see change history) ---", 0x0D
         dw 250
         db "IF Z>-0.36 THEN S=46", 0x0D
         dw 251
@@ -1324,7 +1355,22 @@ expr_add:
 ; =============================================================================
 expr1:
         mov  bx, tab_mul
-        mov  di, expr2          ; functions are highest precedence
+        mov  di, expr_pow        ; power level binds tighter than * / %
+        jmp  short prec_engine_f
+
+; =============================================================================
+; EXPR_POW  exponentiation level (^), v3.13. Binds tighter than * / % but
+; looser than unary minus/functions/literals (EXPR2). Left-associative,
+; same as the rest of this parser's PREC_ENGINE_F-based levels (and same
+; as most contemporary microcomputer BASICs' own ^ -- 2^3^2 evaluates as
+; (2^3)^2=64 here, not the "mathematical" right-associative 2^(3^2)=512).
+; Inputs  : SI -> expression text
+; Outputs : FLT_A = result
+; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B
+; =============================================================================
+expr_pow:
+        mov  bx, tab_pow
+        mov  di, expr2           ; functions/literals/vars are highest precedence
         jmp  short prec_engine_f
 
 ; =============================================================================
@@ -2319,6 +2365,11 @@ tab_mul:                        ; multiplicative level (v2.0: float, except %)
         dw flt_mod
         db 0
 
+tab_pow:                        ; exponentiation level (v3.13)
+        db '^'
+        dw flt_pow
+        db 0
+
 ; =============================================================================
 ; FUNC_TAB2  Stage D function dispatch table (match2 2-char-prefix format,
 ; same packing as STMT_TAB2 -- see its header). bit15 of the packed word
@@ -2474,6 +2525,16 @@ flt_b_pop:
         pop  bx
         pop  word [FLT_B+0]
         pop  word [FLT_B+2]
+        jmp  bx
+
+; FLT_B_PUSH  mirror of FLT_A_PUSH, parks FLT_B instead -- without
+; touching FLT_A at all (needed by FLT_POW: FLT_A holds the base, which
+; must stay untouched while FLT_B, the exponent, gets parked ahead of
+; the FLT_LN call that's about to clobber FLT_B).
+flt_b_push:
+        pop  bx
+        push word [FLT_B+2]
+        push word [FLT_B+0]
         jmp  bx
 
 ; =============================================================================
@@ -3539,6 +3600,53 @@ flt_exp:
 exp_range_err:
         call flt_a_pop              ; balance the entry park
         jmp  div_err                ; ?2, |x| out of EXP's range
+
+; =============================================================================
+; FLT_POW  FLT_A = FLT_A ^ FLT_B (base ^ exponent), via exp(exponent*ln(base))
+;
+; Domain: base (FLT_A on entry) must be > 0 -- inherited directly from
+; FLT_LN's own domain requirement rather than special-cased. This library
+; doesn't support 0^x (undefined for x<=0, and a special case for x>0
+; not worth the ROM for) or negative bases raised to non-integer powers
+; (complex result) -- consistent with FLT_SQRT's own no-complex-number
+; stance elsewhere. Raises the shared ?2 domain error otherwise (same
+; code FLT_LN/FLT_EXP use for their own domain violations).
+;
+; Inputs  : FLT_A = base, FLT_B = exponent
+; Outputs : FLT_A = base ^ exponent
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B, LN_M, HORNER_T, EXP_K
+; =============================================================================
+flt_pow:
+        cmp  byte [FLT_A+0], 0
+        je   pow_err                ; base==0 -> domain error
+        test byte [FLT_A+1], 0x80
+        jnz  pow_err                 ; base<0  -> domain error
+        jmp  short pow_cont
+pow_err:
+        jmp  div_err                 ; ?2, shared domain-error code
+pow_cont:
+        push si                      ; protect the parser's own SI --
+                                      ; FLT_LN/FLT_EXP below both use SI
+                                      ; internally as scratch for loading
+                                      ; ROM constant tables, same reason
+                                      ; DISPATCH2 centrally protects SI
+                                      ; around 1-arg function calls. This
+                                      ; handler is called directly from
+                                      ; PREC_ENGINE_F, which doesn't
+                                      ; protect SI itself -- never needed
+                                      ; to before, since +,-,*,/,% don't
+                                      ; touch it.
+        call flt_b_push              ; park exponent (FLT_A/FLT_B both
+                                      ; untouched -- see FLT_B_PUSH header)
+        call flt_ln                  ; FLT_A = ln(base)
+        call flt_a_to_b              ; FLT_B = ln(base)
+        call flt_a_pop               ; FLT_A = exponent (restored)
+        call flt_mul                 ; FLT_A = exponent * ln(base)
+        call flt_exp                 ; FLT_A = base^exponent (a real call
+                                      ; here, not a tail-jmp, so SI can be
+                                      ; restored below afterward)
+        pop  si
+        ret
 
 ; =============================================================================
 ; HORNER_EVAL  evaluate c[0] + c[1]*t + c[2]*t^2 + ... + c[n]*t^n via
