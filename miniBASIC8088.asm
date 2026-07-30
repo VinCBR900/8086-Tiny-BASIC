@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 8088  v3.13
+; miniBASIC 8088  v3.14
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
@@ -13,8 +13,8 @@
 ; Expressions:
 ;   + - * / % ^   = < > <= >= <>   unary -
 ;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
-;   FREE  IN(io)  LN(flt)  PEEK(addr)  PI  RND  SIN(rad)  TAN(rad)  SQRT(flt)
-;   USR(addr)
+;   FREE  IN(io)  LN(flt)  LOG(flt)  PEEK(addr)  PI  RND  SGN(flt)  SIN(rad)
+;   TAN(rad)  SQRT(flt)  USR(addr)
 ;   26 single letter variables, A-Z 
 ;
 ; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
@@ -35,17 +35,10 @@
 ; KNOWN LIMITATIONS
 ;   - Multi-statement lines (':'-separated statements) not supported. 
 ;
-; Two Character keyword matching - To save ROM space, only 2 chars are 
-;   matched, then rest of word consumed until a space or `(`.  So spaces
-;   are needed eg `10 PRINT TAB(5);"HELLO"` works, `10 PR TA(5);"Hello"`
-;   also works, but `10 PRINTTAB(5);"Hello"` prints '5Hello'
-;
-;  Number literal Format: Require a leading digit before the decimal point -
-;   "0.5" works, ".5" does not (parses as 0).
-;   Scientific notation is NOT supported - the "E..." suffix is silently 
-;   ignored, so "1E10" parses as plain "1". Type magnitudes in full.
-;
-;  FLOOR(flt) rounds towards zero eg floor(3.5) is 3, floor (-3.5) is -3, NOT -4.
+;   - No INT() function, by design -- FLOOR(flt) (truncate toward zero)
+;     covers the same need without colliding with IN(io)'s "IN" prefix
+;     the way an "INT" entry would (both start "IN"; MATCH2 only checks
+;     2 characters, see FUNC_TAB2's own header for the full reasoning).
 ;
 ;   - TAB(n) prints n literal space characters relative to the current
 ;     cursor position, not column n.
@@ -69,31 +62,76 @@
 ;     (roughly |x| > 88, i.e. beyond this float format's representable
 ;     range in either direction) raises a "?2" error.
 ;
-; X^Y is computed as EXP(Y*LN(X)):
-;   - X must be positive; X<=0 raises LN's "?2" domain error, negative base 
-;     not supported e.g. (-2)^2.
-;   - Binds tighter than * / % (proper BODMAS/PEMDAS) and is right-
-;     associative, so "2*3^2"=18 and "2^3^2"=512, matching convention.
-;   - Inherits EXP's overflow/underflow "?2" error for extreme results.
+;   - base^exponent (v3.13): base must be > 0 -- computed as
+;     exp(exponent*ln(base)), so it inherits LN's domain requirement
+;     directly rather than special-casing 0^x or negative bases raised
+;     to integer powers (no complex-number support, consistent with
+;     SQRT/ASIN/ACOS above). Raises the same "?2" domain error.
 ;
 ;   - ATN accurate to ~1.9e-4 rad (degree-3 odd-polynomial core, v3.11).
 ;     SIN/COS accurate to ~0.0002 rad on their core polynomial domain.
-;     SIN/COS range reduction (mod 2*PI) itself breaks down for |x| roughly
-;     >= 205,887 (32767 * 2*PI) -- FLT_TO_INT's int16 saturation there
+;     SIN/COS/TAN now raise a "?2" domain error for |x| >= 2^17 (131072)
+;     (v3.14) -- a hard guard added deliberately more conservative than
+;     the exact range-reduction ceiling of ~205,887 (32767*2*PI), where
+;     FLT_TO_INT's int16 saturation would otherwise silently produce
+;     garbage well outside [-1,1]. See FLT_SIN's own header for why the
+;     threshold is a round, cheap, single-byte exponent check rather
+;     than the exact boundary.
+;
+;   - LOG(x) (base-10 log, v3.14): same domain requirement as LN (x>0),
+;     inherited directly since it's computed as ln(x)*log10(e).
 ;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
 ;
-; v3.13 (2026-07-26) - ROM_END: NASM/ROM 207 bytes, YASM 254 bytes
+; v3.14 (2026-07-27) - ROM_END: NASM/ROM 150 bytes, YASM 197 bytes
+;   - SIN/COS/TAN given a hard domain guard: |x| >= 2^17 (131072) now
+;     raises "?2" instead of silently producing garbage past FLT_TO_INT's
+;     int16 saturation on the range-reduction ceiling (~205,887). A single
+;     exponent-byte compare, deliberately conservative rather than exact
+;     -- see FLT_SIN's header for the reasoning. COS/TAN inherit it for
+;     free (both route through FLT_SIN).
+;   - Added LOG(x) (base-10, via ln(x)*log10(e) -- new log10e_const,
+;     4 bytes, reuses LDCONST_B_MUL) and SGN(x) (-1/0/1, no ROM constants
+;     needed). Both wired into FUNC_TAB2, no prefix collisions.
+;   - Fixed a truncated KNOWN LIMITATIONS sentence (SIN/COS entry cut off
+;     mid-thought from an earlier hand-edit pass) while updating it for
+;     the new guard.
+;
+
 ;   - Refactored DISPATCH2's no-match to have not match vector to enable
 ;     both function and statement matching.
 ;   - DO_PRINT's CHR$/TAB matching migrated from KW_MATCH to MATCH2, with a
 ;     new CHK3RD helper 
 ;   - Removed now-dead KW_MATCH, CHRS_TAB/TAB_TAB, KW_CHRS/KW_TAB, and constants
-;   - Fixed the Vortex spiral's offset bug
-;   - Added the ^ (power) operator: new EXPR_POW precedence level 
-;   - Added FLT_B_PUSH (mirrors the existing FLT_B_POP) for FLT_POW
+;   - Fixed the Vortex spiral's offset bug: cells outside the D>1.2 radius
+;     used to skip PRINT entirely instead of printing a background space,
+;     so row lengths varied and the shape appeared shifted. S=32 now runs
+;     before the D>1.2 check, which jumps straight to the PRINT line.
+;   - Added the ^ (power) operator: new EXPR_POW precedence level (binds
+;     tighter than * / %, looser than unary minus/functions), computed as
+;     exp(exponent*ln(base)) via a new FLT_POW. Guarded: base must be > 0
+;     (?2 domain error otherwise, same as LN/EXP's own domain errors).
+;   - Bug found and fixed while adding FLT_POW: it's called directly from
+;     PREC_ENGINE_F as an operator handler, which never protects SI around
+;     handler calls (never needed to -- +,-,*,/,% don't touch SI). But
+;     FLT_LN/FLT_EXP (which FLT_POW calls internally) both clobber SI as
+;     scratch for loading ROM constant tables, silently corrupting the
+;     parser's own position and dropping the rest of the expression after
+;     any "^" (e.g. "2^2*3" evaluated as if it were just "2^2"). Fixed by
+;     having FLT_POW protect/restore SI itself, the same reasoning
+;     DISPATCH2 already centralizes for 1-arg function calls.
+;   - Audited guards on all trig/EXP/LN functions (SIN, COS, TAN, ASIN,
+;     ACOS, ATN, SQRT, LN, EXP): all confirmed correctly intact after the
+;     v3.11-v3.13 refactors -- no other issues found.
+;   - Added FLT_B_PUSH (mirrors the existing FLT_B_POP) for FLT_POW's own
+;     use, and no other reason to add it stood out, so left it available
+;     for any future caller needing to park FLT_B without touching FLT_A.
+;   - Header/KNOWN LIMITATIONS corrected: function list said "SQR" (the
+;     real keyword is SQRT), didn't mention IN(io) at all; documented
+;     that INT() is intentionally absent (FLOOR covers truncation without
+;     colliding with IN's "IN" prefix) and added ^'s domain requirement.
 ;
 ; v3.12 (2026-07-26)
 ;   - Updated KNOWN LIMITATIONS to document mathematical function domain boundaries and accuracy.
@@ -2342,7 +2380,7 @@ stmt_tab2:
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "miniBASIC 8088 v3.13"
+str_banner: db "miniBASIC 8088 v3.14"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -2402,6 +2440,8 @@ func_tab2:
         dw 0xCE4C, flt_ln                ; LN (1-arg)
         dw 0xD845, flt_exp               ; EX -> EXP (1-arg)
         dw 0xCC46, flt_floor             ; FL -> FLOOR (1-arg)
+        dw 0xCF4C, flt_log10             ; LO -> LOG (1-arg)
+        dw 0xC753, flt_sgn               ; SG -> SGN (1-arg)
         dw 0xFFFF, e2_nusr               ; sentinel: no-match -> number/var
 
 ; =============================================================================
@@ -3649,6 +3689,38 @@ pow_cont:
         ret
 
 ; =============================================================================
+; FLT_LOG10  FLT_A = log10(FLT_A), via ln(x)*log10(e)
+; Same domain requirement as FLT_LN (x>0), inherited directly -- no
+; separate guard needed.
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = log10(x)
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B, LN_M, HORNER_T
+; =============================================================================
+flt_log10:
+        call flt_ln
+        mov  si, log10e_const
+        jmp  ldconst_b_mul         ; tail-call: FLT_A = ln(x)*log10(e)
+
+; =============================================================================
+; FLT_SGN  FLT_A = sign(FLT_A): -1, 0, or 1
+; Total function -- no domain restrictions, no guard needed.
+; Inputs  : FLT_A = x
+; Outputs : FLT_A = -1 (x<0), 0 (x==0), or 1 (x>0)
+; Clobbers: AX, BX, CX, DI
+; =============================================================================
+flt_sgn:
+        cmp  byte [FLT_A+0], 0
+        je   sgn_zero               ; exponent==0 -> x==0, FLT_A already 0
+        mov  ax, 1
+        test byte [FLT_A+1], 0x80
+        jz   sgn_fromint
+        neg  ax
+sgn_fromint:
+        jmp  flt_from_int           ; tail-call: FLT_A = float(AX)
+sgn_zero:
+        ret
+
+; =============================================================================
 ; HORNER_EVAL  evaluate c[0] + c[1]*t + c[2]*t^2 + ... + c[n]*t^n via
 ; Horner's method: ((c[n]*t + c[n-1])*t + ...)*t + c[0]
 ; Inputs  : SI -> coefficient table in ROM, HIGHEST-degree term (c[n])
@@ -3840,10 +3912,24 @@ flt_cos:
 ; once (net stack-depth-neutral) if x lands past PI during folding, and
 ; popped for good at the very end.
 ;
-; Domain: magnitude of x limited by flt_floor's int16 saturation on
-; x/(2*PI) -- see flt_floor's own header for the ceiling. Not checked
-; beyond that, matching this codebase's existing rigor for its other
-; trig functions.
+; Domain: hard guard added v3.14 -- rejects |x| >= 2^17 (131072) with the
+; shared ?2 domain error, checked via a single exponent-byte compare
+; (biased exponent 0x92 <=> 2^17, same MBF4 convention FLT_ATAN's own
+; |x|>=1.0 check uses). Chosen deliberately more conservative than the
+; exact ~205,887 (32767*2*PI) ceiling documented below: 131072 is a clean
+; single-byte threshold, while an exact-to-205887 check would need a
+; 4-byte MBF4 constant and a full FLT_CMP call for a few thousand extra
+; usable degrees. Some inputs between 131072 and 205887 that would have
+; still worked now error instead -- deliberate, since the point of a hard
+; guard is catching every genuinely-broken input, not preserving every
+; still-working one at the margin. COS/TAN inherit this for free (both
+; route through here) -- checked on their own shifted argument (PI/2-x
+; for COS), not the original x, but that's the same order of magnitude
+; for any x large enough to matter here.
+;
+; Previously (pre-v3.14): magnitude of x limited by flt_floor's int16
+; saturation on x/(2*PI) -- see flt_floor's own header for that exact
+; ceiling. Was undocumented-but-not-hard-checked before; now checked.
 ;
 ; Inputs  : FLT_A = x
 ; Outputs : FLT_A = sin(x)
@@ -3854,7 +3940,13 @@ flt_sin:
         and  al, 0x80              ; AL = sign tracker (0x00 or 0x80)
         push ax
         call flt_abs                ; FLT_A = |x|
-
+        cmp  byte [FLT_A+0], 0x92   ; exponent >= 0x92 <=> |x| >= 2^17
+        jnb  fsin_range_err
+        jmp  short fsin_cont
+fsin_range_err:
+        pop  ax                     ; balance the sign-tracker push
+        jmp  div_err                 ; ?2, |x| out of SIN/COS/TAN's range
+fsin_cont:
         call flt_a_push             ; park |x|
         call flt_2pi_b              ; FLT_B = 2*PI
         call flt_div                 ; FLT_A = |x| / 2*PI
@@ -4278,6 +4370,7 @@ div_by_ten:
 half_pi_const: db 0x81, 0x49, 0x0F, 0xDB  ; PI/2 as MBF4
 ln2_const:     db 0x80, 0x31, 0x72, 0x18  ; ln(2)     = 0.6931472
 log2e_const:   db 0x81, 0x38, 0xAA, 0x3B  ; log2(e)   = 1.4426950
+log10e_const:  db 0x7F, 0x5E, 0x5B, 0xD8  ; log10(e)  = 0.4342945
 
 ; sin_coeffs: FLT_SIN's polynomial coefficients for HORNER_EVAL, highest
 ; degree first (t=x'^2): c2=+0.00761, c1=-0.16605, c0=+1.0. 
