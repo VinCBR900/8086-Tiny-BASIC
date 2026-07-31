@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 8088  v3.14
+; miniBASIC 8088  v3.15
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
@@ -11,7 +11,14 @@
 ;   NEW  NEXT  POKE  PRINT [TAB(n)][;][CHR$(n)]  REM  RETURN  RUN
 ;
 ; Expressions:
-;   + - * / % ^   = < > <= >= <>   unary -
+;   + - * / % ^     add, subtract, multiply, divide, MOD, POWER
+;   & | ~ !         bitwise/logical AND, OR, XOR, NOT (~ stands in for XOR
+;                   since ^ is already POWER here -- see KNOWN LIMITATIONS)
+;   = < > <= >= <>  relational, return -1 (true) or 0 (false)
+;   unary -         negation
+;   Precedence, loosest to tightest: | , ~ , & , relational , +/- , */% ,
+;   ^ , unary -/!/functions. All but relational/unary/functions are
+;   left-associative (see KNOWN LIMITATIONS for ^ specifically).
 ;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
 ;   FREE  IN(io)  LN(flt)  LOG(flt)  PEEK(addr)  PI  RND  SGN(flt)  SIN(rad)
 ;   TAN(rad)  SQRT(flt)  USR(addr)
@@ -43,11 +50,6 @@
 ;   - TAB(n) prints n literal space characters relative to the current
 ;     cursor position, not column n.
 ;
-;   - FLT_ADD's internal "put the larger-magnitude operand first" swap does
-;     not restore FLT_B's original identity afterward.  If |FLT_B|>|FLT_A| on
-;     entry, FLT_B ends up holding mangled remnants of the swap rather than
-;     its own original value.
-;
 ;   - ASIN(x)/ACOS(x): the exact |x|==1 boundary saturates to +/-PI/2 (ASIN)
 ;     or 0/PI (ACOS) rather than erroring. |x|>1 (out of domain) is NOT
 ;     saturated the same way here -- it falls through to FLT_SQRT clamping
@@ -68,6 +70,18 @@
 ;     to integer powers (no complex-number support, consistent with
 ;     SQRT/ASIN/ACOS above). Raises the same "?2" domain error.
 ;
+;   - & | ~ ! (v3.15): bitwise/logical AND, OR, XOR, NOT. Both operands
+;     (unary for !) truncated to int16 the same way % and PEEK/POKE/IN/
+;     OUT already do -- no separate domain guard, same FLT_TO_INT
+;     saturation those already live with. '~' stands in for XOR since
+;     '^' is already the power operator here. Precedence (loosest to
+;     tightest): | , ~ , & , relational (< = > etc.), +/-, */%, ^, then
+;     unary -/!/functions -- same relative ordering as C's &/^/| family.
+;     Composes with relational operators the way classic BASIC's AND/OR
+;     do (true=-1=all bits set, false=0), e.g. "A>B & C<D", and with
+;     PEEK/POKE/IN/OUT for register-level bit manipulation, e.g.
+;     "OUT port, (PEEK(addr) & 15) | newval".
+;
 ;   - ATN accurate to ~1.9e-4 rad (degree-3 odd-polynomial core, v3.11).
 ;     SIN/COS accurate to ~0.0002 rad on their core polynomial domain.
 ;     SIN/COS/TAN now raise a "?2" domain error for |x| >= 2^17 (131072)
@@ -85,53 +99,24 @@
 ; CHANGE HISTORY
 ; =============================================================================
 ;
+; v3.15 (2026-07-27) - ROM_END: NASM/ROM 62 bytes, YASM 109 bytes
+;   - Restored bitwise/logical operators & | ~ ! (AND/OR/XOR/NOT), 
+;     '~' stands in for XOR since '^' is POW here.
+;   - Added a BITWISE demo block to showcase demo.
+;
 ; v3.14 (2026-07-27) - ROM_END: NASM/ROM 150 bytes, YASM 197 bytes
 ;   - SIN/COS/TAN given a hard domain guard: |x| >= 2^17 (131072) now
-;     raises "?2" instead of silently producing garbage past FLT_TO_INT's
-;     int16 saturation on the range-reduction ceiling (~205,887). A single
-;     exponent-byte compare, deliberately conservative rather than exact
-;     -- see FLT_SIN's header for the reasoning. COS/TAN inherit it for
-;     free (both route through FLT_SIN).
-;   - Added LOG(x) (base-10, via ln(x)*log10(e) -- new log10e_const,
-;     4 bytes, reuses LDCONST_B_MUL) and SGN(x) (-1/0/1, no ROM constants
-;     needed). Both wired into FUNC_TAB2, no prefix collisions.
-;   - Fixed a truncated KNOWN LIMITATIONS sentence (SIN/COS entry cut off
-;     mid-thought from an earlier hand-edit pass) while updating it for
-;     the new guard.
-;
-
+;     raises "?2" instead of silent garbage due to FLT_TO_INT's
+;     int16 saturation. 
+;   - Added LOG(x) (base-10, via ln(x)*log10(e)
 ;   - Refactored DISPATCH2's no-match to have not match vector to enable
 ;     both function and statement matching.
 ;   - DO_PRINT's CHR$/TAB matching migrated from KW_MATCH to MATCH2, with a
 ;     new CHK3RD helper 
 ;   - Removed now-dead KW_MATCH, CHRS_TAB/TAB_TAB, KW_CHRS/KW_TAB, and constants
-;   - Fixed the Vortex spiral's offset bug: cells outside the D>1.2 radius
-;     used to skip PRINT entirely instead of printing a background space,
-;     so row lengths varied and the shape appeared shifted. S=32 now runs
-;     before the D>1.2 check, which jumps straight to the PRINT line.
+;   - Fixed the Vortex spiral's offset bug
 ;   - Added the ^ (power) operator: new EXPR_POW precedence level (binds
-;     tighter than * / %, looser than unary minus/functions), computed as
-;     exp(exponent*ln(base)) via a new FLT_POW. Guarded: base must be > 0
-;     (?2 domain error otherwise, same as LN/EXP's own domain errors).
-;   - Bug found and fixed while adding FLT_POW: it's called directly from
-;     PREC_ENGINE_F as an operator handler, which never protects SI around
-;     handler calls (never needed to -- +,-,*,/,% don't touch SI). But
-;     FLT_LN/FLT_EXP (which FLT_POW calls internally) both clobber SI as
-;     scratch for loading ROM constant tables, silently corrupting the
-;     parser's own position and dropping the rest of the expression after
-;     any "^" (e.g. "2^2*3" evaluated as if it were just "2^2"). Fixed by
-;     having FLT_POW protect/restore SI itself, the same reasoning
-;     DISPATCH2 already centralizes for 1-arg function calls.
-;   - Audited guards on all trig/EXP/LN functions (SIN, COS, TAN, ASIN,
-;     ACOS, ATN, SQRT, LN, EXP): all confirmed correctly intact after the
-;     v3.11-v3.13 refactors -- no other issues found.
-;   - Added FLT_B_PUSH (mirrors the existing FLT_B_POP) for FLT_POW's own
-;     use, and no other reason to add it stood out, so left it available
-;     for any future caller needing to park FLT_B without touching FLT_A.
-;   - Header/KNOWN LIMITATIONS corrected: function list said "SQR" (the
-;     real keyword is SQRT), didn't mention IN(io) at all; documented
-;     that INT() is intentionally absent (FLOOR covers truncation without
-;     colliding with IN's "IN" prefix) and added ^'s domain requirement.
+;     tighter than * / %, looser than unary minus/functions), 
 ;
 ; v3.12 (2026-07-26)
 ;   - Updated KNOWN LIMITATIONS to document mathematical function domain boundaries and accuracy.
@@ -344,12 +329,15 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 ; SHOWCASE DATA  (8bitworkshop / YASM build only)
 ;
 ; Pre-loaded program.  Type RUN to execute, NEW to clear.
-;   Lines  10-190 : feature demos (arithmetic, comparisons, FOR/NEXT, GOSUB)
-;   Lines 200-330 : Mandelbrot (fixed-point 1/64, 16 iterations, ASCII density)
+;   Lines  10-190 : feature demos (arithmetic, comparisons, bitwise/logical
+;                   at 101-103, FOR/NEXT, GOSUB)
+;   Lines 220-258 : Vortex -- trig-library stress test (SIN, COS, TAN,
+;                   ASIN, ACOS, ATN, SQRT), chains into Mandelbrot below
+;   Lines 280-430 : Mandelbrot (native MBF4 float, 16 iterations, ASCII
+;                   density), chains into Hypnotic Eye below
 ;   Lines 500-540 : subroutine: sum 1..10
 ;   Lines 550-590 : subroutine: factorial 5
 ;   Lines 600-610 : subroutine: Mandelbrot escape recorder
-;   Lines 700-717 : Damped Wave -- EXP/SIN stress test w/ text axis
 ;   Lines 730-758 : Hypnotic Eye -- LN/EXP/SQRT/SIN logarithmic ripple
 ;
 ; =============================================================================
@@ -382,6 +370,12 @@ SHOWCASE_DATA:
         db "IF 3>=3 THEN PRINT ", 0x22, "3>=3 ok", 0x22, 0x0D
         dw 100
         db "IF 4<>3 THEN PRINT ", 0x22, "4<>3 ok", 0x22, 0x0D
+        dw 101
+        db "PRINT ", 0x22, "--- BITWISE ---", 0x22, 0x0D
+        dw 102
+        db "PRINT ", 0x22, "12&10=", 0x22, ";12&10;", 0x22, " 12|3=", 0x22, ";12|3;", 0x22, " 12~10=", 0x22, ";12~10", 0x0D
+        dw 103
+        db "PRINT ", 0x22, "!0=", 0x22, ";!0;", 0x22, " 5>3&2<4=", 0x22, ";5>3&2<4", 0x0D
         dw 110
         db "PRINT ", 0x22, "--- FOR/NEXT ---", 0x22, 0x0D
         dw 120
@@ -1196,7 +1190,9 @@ expect_equals:
 expect:
         call spaces
         cmp  [si], al
-        jne  JERRSN
+        je   .ok
+        jmp  JERRSN              ; out of short-jump range now
+.ok:
         inc  si
 sp_r:
         ret
@@ -1214,13 +1210,50 @@ spaces:
         jmp  short spaces
 
 ; =============================================================================
-; EXPR  evaluate expression including relational operators
-; v2.0: ALWAYS returns float in FLT_A 
+; EXPR  evaluate expression including bitwise/logical &, ~ (xor), | and
+; relational operators (v3.15: & | ~ added as new outer levels; the old
+; EXPR body, handling relational operators, is renamed EXPR_REL below and
+; wrapped rather than changed -- every existing caller of EXPR gets & | ~
+; support for free, no call sites elsewhere needed to change).
+; Precedence (loosest to tightest): | , ~ (xor) , & , relational, +/-, etc.
+; -- same relative ordering as C's &/^/| family, with ~ standing in for ^
+; since ^ is already this BASIC's power operator.
+; & | ~ operate the same way % does: both operands truncated to int16
+; (FLT_TO_INT), the native 8086 instruction applied, result converted
+; back to float (FLT_FROM_INT) -- same shape as FLT_MOD, just without a
+; divide-by-zero guard to worry about. Also the same convention already
+; used for IN/OUT/PEEK/POKE's own address/port/value arguments, so these
+; compose naturally with them for register-level bit manipulation, e.g.
+; "OUT port, (PEEK(addr) & 15) | newval".
 ; Inputs  : SI -> expression text
 ; Outputs : FLT_A = result
 ; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B
 ; =============================================================================
 expr:
+        mov  bx, tab_or
+        mov  di, expr_xor
+        jmp  prec_engine_f       ; out of short-jump range now
+
+expr_xor:
+        mov  bx, tab_xor
+        mov  di, expr_and
+        jmp  prec_engine_f       ; out of short-jump range now
+
+expr_and:
+        mov  bx, tab_and
+        mov  di, expr_rel
+        jmp  short prec_engine_f
+
+; =============================================================================
+; EXPR_REL  evaluate expression including relational operators (this was
+; EXPR itself before v3.15 -- see the new EXPR above, which now wraps
+; this with & | ~).
+; v2.0: ALWAYS returns float in FLT_A 
+; Inputs  : SI -> expression text
+; Outputs : FLT_A = result
+; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B
+; =============================================================================
+expr_rel:
         call expr_add            ; FLT_A = left operand (full float precision)
         call spaces
         mov  al, [si]
@@ -1412,23 +1445,63 @@ expr_pow:
         jmp  short prec_engine_f
 
 ; =============================================================================
+; FLT_PREP_INT16B  shared prefix for FLT_MOD/FLT_AND/FLT_XOR/FLT_OR: both
+; operands truncated to int16. Factored out via asmdup.py -- all four
+; had this identical 5-instruction sequence inline.
+; Inputs  : FLT_A, FLT_B
+; Outputs : AX = int16(FLT_B), CX = int16(FLT_A)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B
+; =============================================================================
+flt_prep_int16b:
+        call flt_to_int         ; AX = int16(FLT_A)
+        push ax
+        call flt_b_to_a
+        call flt_to_int         ; AX = int16(FLT_B)
+        pop  cx                 ; CX = int16(FLT_A)
+        ret
+
+; =============================================================================
 ; FLT_MOD  FLT_A = FLT_A modulo FLT_B (truncating, like int16 % did)
 ; Both operands truncated to int16, divided with math_mod's int semantics,
 ; result promoted back to float. (BASIC's % was always integer-only; kept
 ; that way rather than implementing a true float remainder.)
 ; Inputs  : FLT_A, FLT_B
 ; Outputs : FLT_A = int16(FLT_A) mod int16(FLT_B), as a float
-; Clobbers: AX, BX, CX, DX, FLT_A, FLT_B
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B
 ; =============================================================================
 flt_mod:
-        call flt_to_int         ; AX = int16(FLT_A)
-        push ax
-        call flt_b_to_a
-        call flt_to_int         ; AX = int16(FLT_B)
-        pop  cx                 ; CX = int16(FLT_A) (the dividend)
+        call flt_prep_int16b     ; AX = int16(FLT_B), CX = int16(FLT_A)
         xchg ax, cx              ; AX = dividend, CX = divisor
         call math_mod            ; AX = AX mod CX (int16, may raise div_err)
         jmp  flt_from_int        ; tail-call: FLT_A = float(AX)
+
+; =============================================================================
+; FLT_AND / FLT_XOR / FLT_OR  bitwise/logical &, ~, | (v3.15). Same
+; int16-truncate/native-op/convert-back shape as FLT_MOD above (now
+; sharing its FLT_PREP_INT16B prefix too), minus a divide guard (nothing
+; here can trap). True/false compose correctly with these the same way
+; classic BASIC's AND/OR do: relational operators return -1 (all bits
+; set) or 0, so bitwise ops on those values ARE logical ops -- the same
+; dual use (boolean logic AND raw register bit manipulation via
+; PEEK/POKE/IN/OUT) these operators had before floats.
+; Inputs  : FLT_A, FLT_B
+; Outputs : FLT_A = FLT_A <op> FLT_B (int16-truncated on both sides)
+; Clobbers: AX, BX, CX, DX, DI, FLT_A, FLT_B
+; =============================================================================
+flt_and:
+        call flt_prep_int16b
+        and  ax, cx
+        jmp  flt_from_int
+
+flt_xor:
+        call flt_prep_int16b
+        xor  ax, cx
+        jmp  flt_from_int
+
+flt_or:
+        call flt_prep_int16b
+        or   ax, cx
+        jmp  flt_from_int
 
 ; =============================================================================
 ; MATH_MOD / MATH_DIV  int16 primitives, used only by FLT_MOD and RND(n).
@@ -1475,6 +1548,10 @@ expr2:
 .not_neg:
         cmp  al, '+'
         je   e2_pos
+        cmp  al, '!'
+        jne  .not_not
+        jmp  e2_not              ; out of short-jump range
+.not_not:
 
         mov  bx, func_tab2
         jmp  dispatch2
@@ -1570,6 +1647,20 @@ e2_neg:
         inc  si
         call expr2
         jmp  flt_negate          ; tail-call: FLT_A = -FLT_A
+
+; =============================================================================
+; E2_NOT  unary bitwise/logical ! (v3.15). Same int16-truncate shape as
+; FLT_AND/FLT_XOR/FLT_OR, but unary -- no FLT_B, no parking needed.
+; Inputs  : SI -> '!' followed by a factor
+; Outputs : FLT_A = NOT int16(operand), as a float
+; Clobbers: AX, BX, CX, DX, DI, SI, FLT_A, FLT_B
+; =============================================================================
+e2_not:
+        inc  si
+        call expr2               ; NOT binds to the following factor
+        call flt_to_int
+        not  ax
+        jmp  flt_from_int
 
 ; =============================================================================
 ; INPUT_NUMBER  parse unsigned decimal integer from [SI]
@@ -2380,7 +2471,7 @@ stmt_tab2:
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "miniBASIC 8088 v3.14"
+str_banner: db "miniBASIC 8088 v3.15"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -2406,6 +2497,21 @@ tab_mul:                        ; multiplicative level (v2.0: float, except %)
 tab_pow:                        ; exponentiation level (v3.13)
         db '^'
         dw flt_pow
+        db 0
+
+tab_and:                        ; bitwise/logical AND level (v3.15)
+        db '&'
+        dw flt_and
+        db 0
+
+tab_xor:                        ; bitwise/logical XOR level (v3.15) -- '~'
+        db '~'                  ; stands in for XOR since '^' is POW here
+        dw flt_xor
+        db 0
+
+tab_or:                         ; bitwise/logical OR level (v3.15)
+        db '|'
+        dw flt_or
         db 0
 
 ; =============================================================================
