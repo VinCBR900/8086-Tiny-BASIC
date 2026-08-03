@@ -1,8 +1,17 @@
 # 8086-Tiny-BASIC
+> **AI Disclosure**: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
+>Specifically:
+> - I architected, reviewed, hand optimized.
+> - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
+> - Gemini created code fragments that were usually wrong but inspired `code golf` techniques.  
+>
+>To be frank, without these agents this work would not have been possible.  
 
 Here we have Tiny BASIC for the 8088 as inspired by Steve Ciarcia's article in BYTE magazine.
 
 2kByte **fully functional** version is available below. 4kByte version with floating point support in progress - Obviously this would not fit into an 8755. 
+> If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
+> [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 
 ## uBASIC 8088 - 2kbyte Tiny BASIC for Toy 8086/88 Embedded systems
 
