@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.5
+; uBASIC 8088  v1.7.7
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -13,12 +13,12 @@
 ; LANGUAGE REFERENCE
 ; ---------------------------------------------------------------------------
 ;
-; Statements  : DELAY, END, FOR..TO [..STEP], NEXT, GOTO, GOSUB, RETURN, IF..THEN,
+; Statements  : END, FOR..TO [..STEP], NEXT, GOTO, GOSUB, RETURN, IF..THEN,
 ;               INPUT, LET, PRINT [CHR$(val)] [TAB(n)] [;], POKE, OUT, REM,
 ;               FREE, HELP, LIST [start,end], NEW, RUN
-; Expressions - Arithmetic : + - * / % (Mod)  unary-
+; Expressions - Arithmetic : + - * / % (Mod)  ^ (power)  unary-
 ;               Relational  : < > <= >= <>
-;               Bitwise     : & (and)  | (or)  ^ (xor)
+;               Bitwise     : & (and)  | (or)  ~ (xor)
 ;               Functions   : ABS(n) IN(port) NOT(n) PEEK(addr) RND(n) USR(addr)
 ;               Variables   : A..Z (signed 16-bit)
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
@@ -81,6 +81,21 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
+;   v1.7.7 (2026-08-13)  8 bytes free
+;     - fixed bug bare where grouping parens used as a factor (e.g. `(-2)^2`,
+;       vs ABS(...) func jumped to e2_par instead of eat_paren_expr, skipping
+;       consuming the opening '(', SI never advanced, stack smashed.
+;     - do_for/do_next: redundant `call spaces` before `call get_var_addr`
+;     - updated SHOWCASE for power operator and bitwise ops
+;   v1.7.6 (2026-08-12)  [archived as uBASIC8088-v1.7.5.asm]
+;     - Added ^ power operator: new expr_pow precedence level, sits above
+;       * / % and below factors (correct BODMAS).
+;     - Added expr_unary precedence level (between expr1 and expr_pow) so a
+;       leading unary minus wraps the whole power expression: -2^2 = -4,
+;       not (-2)^2. Existing unary handling inside expr2 is unchanged, so
+;       2^-3 (sign on the exponent) still parses as before.
+;     - Bitwise XOR moved from ^ to ~ (freed ^ for power; & and | unchanged).
+;     - Removed DELAY statement to make space for power.
 ;   v1.7.5 (2026-05-12)  Bug fixes and size optimisations:
 ;     - Updated Showcase tokens and rmeoved spaces
 ;     - LIST: clean up before/after token spaces
@@ -128,6 +143,7 @@ RAM_SIZE:       equ 2048                ; 2 KB RAM (A12=0 selects RAM)
 ; =============================================================================
 ; RAM LAYOUT  (all offsets relative to RAM_BASE)
 ; =============================================================================
+;                ORG 0
 
 DIV0:           equ RAM_BASE + 0x000    ; 4 bytes : divide-by-zero IVT entry
 CURLN:          equ RAM_BASE + 0x004    ; word    : current line# for error reports
@@ -177,7 +193,6 @@ T_R:            equ 0xD2        ; 'R'+0x80  used by: USR
 T_S:            equ 0xD3        ; 'S'+0x80  used by: ABS
 T_T:            equ 0xD4        ; 'T'+0x80  used by: PRINT, LIST, INPUT, LET, NEXT, NOT
 T_W:            equ 0xD7        ; 'W'+0x80  used by: NEW
-T_Y:            equ 0xD9        ; 'Y'+0x80  used by: DELAY
 T_DS:           equ 0xA4        ; '$'+0x80  used by: CHR$
 
 ; =============================================================================
@@ -202,8 +217,7 @@ TK_RETURN:      equ 0x8E
 TK_FOR:         equ 0x8F
 TK_NEXT:        equ 0x90
 TK_OUT:         equ 0x91
-TK_DELAY:       equ 0x92
-NUM_TOKENS:     equ 19          ; count: TK_PRINT (0x80) .. TK_DELAY (0x92)
+NUM_TOKENS:     equ 18          ; count: TK_PRINT (0x80) .. TK_OUT (0x91)
 
 TK_THEN:        equ 0x93        ; --- sub-keywords (not in st_tab, not dispatched) ---
 TK_TO:          equ 0x94
@@ -229,9 +243,9 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 ;   Lines 550-590 : subroutine: factorial 5
 ;   Lines 600-610 : subroutine: Mandelbrot escape recorder
 ;
-; Token map (v1.7.5):
+; Token map (v1.7.6):
 ;   PRINT=0x80  IF=0x81  GOSUB=0x8D  RETURN=0x8E  END=0x88
-;   FOR=0x8F    NEXT=0x90  OUT=0x91  DELAY=0x92
+;   FOR=0x8F    NEXT=0x90  OUT=0x91
 ;   THEN=0x93   TO=0x94    STEP=0x95  REM=0x87
 ; =============================================================================
 
@@ -243,10 +257,14 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 
 SHOWCASE_DATA:
         ; ── Feature demos ──────────────────────────────────────────────────────
-        db 0x0A,0x00, 0x87,"uBASIC 8088 v1.7.5 showcase",0x0D            ; 10  REM
+        db 0x0A,0x00, 0x87,"uBASIC 8088 v1.7.8 showcase",0x0D            ; 10  REM
         db 0x14,0x00, 0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D            ; 20  PRINT
         db 0x1E,0x00, 0x80,0x22,"2+3=",0x22,";2+3;",0x22,"  6*7=",0x22,";6*7",0x0D      ; 30
         db 0x28,0x00, 0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 40
+        db 0x29,0x00, 0x80,0x22,"3^4=",0x22,";3^4;",0x22,"  2^10=",0x22,";2^10",0x0D    ; 41  power
+        db 0x2A,0x00, 0x80,0x22,"--- BITWISE ---",0x22,0x0D                             ; 42
+        db 0x2B,0x00, 0x80,0x22,"12&10=",0x22,";12&10;",0x22,"  12|10=",0x22,";12|10",0x0D ; 43  AND/OR
+        db 0x2C,0x00, 0x80,0x22,"12~10=",0x22,";12~10",0x0D                             ; 44  XOR
         db 0x32,0x00, 0x80,0x22,"--- COMPARISONS ---",0x22,0x0D           ; 50
         db 0x3C,0x00, 0x81,"5>3",0x93,0x80,0x22,"5>3 ok",0x22,0x0D      ; 60  IF THEN(0x93) PRINT
         db 0x46,0x00, 0x81,"3<5",0x93,0x80,0x22,"3<5 ok",0x22,0x0D      ; 70
@@ -269,9 +287,9 @@ SHOWCASE_DATA:
         db 0xD2,0x00, 0x8F,"C=-128 ",0x94,"16 ",0x95,"4",0x0D             ; 210 FOR C=-128 TO(0x94) 16 STEP(0x95) 4
         db 0xDC,0x00, "D=I:A=C:B=D:E=0",0x0D                              ; 220 init row
         db 0xE6,0x00, 0x8F,"N=1",0x94,"16",0x0D                          ; 230 FOR N=1 TO(0x94) 16
-        db 0xF0,0x00, "T=A*A/64-B*B/64+C",0x0D                            ; 240 iterate
+        db 0xF0,0x00, "T=A^2/64-B^2/64+C",0x0D                            ; 240 iterate
         db 0xFA,0x00, "B=2*A*B/64+D:A=T",0x0D                             ; 250
-        db 0x04,0x01, 0x81,"A*A/64+B*B/64>256",0x93,0x8D,"600",0x0D      ; 260 IF THEN(0x93) GOSUB 600
+        db 0x04,0x01, 0x81,"A^2/64+B^2/64>256",0x93,0x8D,"600",0x0D      ; 260 IF THEN(0x93) GOSUB 600
         db 0x0E,0x01, 0x90,"N",0x0D                                        ; 270 NEXT N
         db 0x18,0x01, 0x81,"E>0",0x93,0x80,"CHR$(E+32);",0x0D            ; 280 IF E>0 THEN(0x93) PRINT
         db 0x22,0x01, 0x81,"E=0",0x93,0x80,"CHR$(32);",0x0D              ; 290 IF E=0 THEN(0x93) PRINT
@@ -953,6 +971,27 @@ math_div:
         ret
 
 ; =============================================================================
+; MATH_POW  integer exponentiation (repeated signed multiply)
+; Inputs  : AX = base, CX = exponent
+; Outputs : AX = base^exponent (16-bit signed, wraps silently on overflow
+;           like the other math primitives)
+; Clobbers: BX
+; Errors  : negative exponent -> ERR_OV (?2), integer BASIC has no fractional
+;           result to return
+; =============================================================================
+math_pow:
+        or   cx, cx
+        js   div_err             ; negative exponent: undefined for int BASIC
+        xchg bx, ax              ; BX = base
+        mov  ax, 1               ; accumulator (x^0 = 1)
+        jcxz .done
+.lp:
+        imul bx
+        loop .lp
+.done:
+        ret
+
+; =============================================================================
 ; PREC_ENGINE  generic left-associative binary operator evaluator
 ; Inputs  : BX -> operator table {char(1), handler_ptr(2), ...}, 0x00 sentinel
 ;           DI = pointer to next-lower-precedence function
@@ -982,6 +1021,33 @@ expr_add:
 
 expr1:
         mov  bx, tab_mul
+        mov  di, expr_unary
+        jmp  short prec_engine
+
+; =============================================================================
+; EXPR_UNARY  unary +/- wrapping a whole power-expression (correct BODMAS:
+; binds looser than ^, so -2^2 = -4, not (-2)^2)
+; Inputs  : SI -> expression text
+; Outputs : AX = value
+; Clobbers: AX, BX, CX, DX, SI
+; =============================================================================
+eu_pos:
+        inc  si
+        jmp  expr_unary
+eu_neg:
+        inc  si
+        call expr_unary
+        neg  ax
+        ret
+expr_unary:
+        call spaces
+        mov  al, [si]
+        cmp  al, '-'
+        je   eu_neg
+        cmp  al, '+'
+        je   eu_pos
+expr_pow:
+        mov  bx, tab_pow
         mov  di, expr2          ; functions are highest precedence
         ; fall through to prec_engine
 
@@ -1029,7 +1095,7 @@ expr2:
         call spaces
         mov  al, [si]
         cmp  al, '('
-        je   e2_par
+        je   eat_paren_expr
         cmp  al, '-'
         je   e2_neg
         cmp  al, '+'
@@ -1109,18 +1175,6 @@ in_tail:
         xor  ah, ah             ; zero-extend to 16-bit
         ret
 
-; do_usr_func is placed near the reset vector (acts as space filler); see below.
-
-; =============================================================================
-; DO_NOT_FUNC  NOT(n) -> bitwise complement
-; Inputs  : AX = value (from eat_paren_expr)
-; Outputs : AX = ~value
-; Clobbers: (none)
-; =============================================================================
-do_not_func:
-        not  ax
-        ret
-
 ; =============================================================================
 ; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
 ; Inputs  : AX = limit n (from eat_paren_expr)
@@ -1146,8 +1200,16 @@ rnd_shuffle:
         xor  ax, 0xA001
 .skip:
         mov  [RND_SEED], ax
+        ; drop through
+; =============================================================================
+; DO_NOT_FUNC  NOT(n) -> bitwise complement
+; Inputs  : AX = value (from eat_paren_expr)
+; Outputs : AX = ~value
+; Clobbers: (none)
+; =============================================================================
+do_not_func:
+        not  ax
         ret
-
 ; =============================================================================
 ; E2_VAR  load variable value at factor level
 ; Inputs  : SI -> variable letter
@@ -1764,8 +1826,7 @@ df_syn:
         mov  al, ERR_OM
         jmp  do_error
 do_for:
-        call spaces
-        call get_var_addr
+        call get_var_addr       ; get_var_addr already skips spaces itself
         mov  [INS_TMP], di      ; save &var
         call expect_equals
         call expr               ; AX = start value
@@ -1848,8 +1909,7 @@ dn_no_for:
         mov  al, ERR_NF
         jmp  do_error
 do_next:
-        call spaces
-        call get_var_addr       ; DI = &var
+        call get_var_addr       ; DI = &var (already skips spaces itself)
         mov  cx, [FOR_SP]
 dn_search:
         jcxz dn_no_for          ; stack empty: no matching FOR
@@ -1883,22 +1943,6 @@ dn_done:
 
 
 ; =============================================================================
-; DO_DELAY  DELAY <count>  (ROM / real-hardware build only)
-; One unit ≈ 0.1 seconds at 5 MHz.  No effect in YASM/8bitworkshop build.
-; Inputs  : SI -> count expression
-; Clobbers: AX, CX
-; =============================================================================
-do_delay:
-        call expr
-.outer_loop:
-        mov  cx, 29412          ; ~0.1 s at 5 MHz (17 cy/iter)
-.inner_loop:
-        loop .inner_loop
-        dec  ax
-        jnz  .outer_loop
-        ret
-
-; =============================================================================
 ; KEYWORD STRINGS  (bit-7 terminated; table ends with 0x00 sentinel)
 ; =============================================================================
 kw_tab_start:
@@ -1920,7 +1964,6 @@ kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N   ; RETURN
 kw_for:     db 0x46,0x4F,T_R                  ; FOR
 kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT
 kw_out:     db 0x4F,0x55,T_T                  ; OUT
-kw_delay:   db 0x44,0x45,0x4C,0x41,T_Y        ; DELAY
 kw_to:      db 0x54,T_O                        ; TO
 kw_step:    db 0x53,0x54,0x45,T_P             ; STEP
 ; --- not statements; included for HELP output ---
@@ -1942,7 +1985,7 @@ tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
         dw kw_help, kw_gosub, kw_return
-        dw kw_for, kw_next, kw_out, kw_delay
+        dw kw_for, kw_next, kw_out
 
 ; Sub-keyword pointer entries (matched individually; not iterated)
 then_tab:   dw kw_then
@@ -1955,7 +1998,7 @@ tab_tab:    dw kw_tab
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.5"
+str_banner: db "uBASIC 8088 v1.7.7"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -1964,7 +2007,7 @@ CRLF:       db 0x0D, 0x0A + 0x80
 st_tab:
         dw do_print,  do_if,     do_goto,   do_list,  do_run,   do_new
         dw do_input,  do_rem,    do_end,    do_let,   do_poke,  do_free
-        dw do_help,   do_gosub,  do_return, do_for,   do_next,  do_out, do_delay
+        dw do_help,   do_gosub,  do_return, do_for,   do_next,  do_out
 
 ; =============================================================================
 ; OPERATOR TABLES  {char(1), handler_ptr(2), ...}, 0x00 sentinel
@@ -1991,8 +2034,13 @@ tab_bitwise:                    ; bitwise level (lowest among binary operators)
         dw bitwise_and
         db '|'
         dw bitwise_or
-        db '^'
+        db '~'
         dw bitwise_xor
+        db 0
+
+tab_pow:                        ; power level (higher precedence than * / %)
+        db '^'
+        dw math_pow
         db 0
 
 ; =============================================================================
