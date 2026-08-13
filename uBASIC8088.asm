@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.7
+; uBASIC 8088  v1.7.9
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -73,16 +73,38 @@
 ;   YASM defines __YASM_MAJOR__ which selects this variant automatically.
 ;   Assembled as a FREEDOS EXE; auto-executes the Mandelbrot showcase.
 ;
-;   Memory map:
-;     ORIGIN   = 0xF800       (8bitworkshop segment base)
-;     RAM_BASE = 0x0000       RAM: 0x0000-0x0FFF, 4 KB
 ;     I/O      = BIOS INT 10h / INT 16h
 ;
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.7.7 (2026-08-13)  8 bytes free
-;     - fixed bug bare where grouping parens used as a factor (e.g. `(-2)^2`,
+;   v1.7.9 (2026-08-13)  24 bytes free  [archived prior as uBASIC8088-v1.7.8.asm]
+;     - input_line/ipl_nbs: v1.7.8 made EVERY LF byte silently discarded,
+;       not just a stray CRLF remainder. Any terminal whose Enter key sends
+;       bare LF (no CR) -- common over raw serial/pipes -- had every line
+;       submission eaten with no echo, no error, no feedback: indistinguishable
+;       from a hang after typing LIST/RUN/etc. Fixed by only discarding LF
+;       when it's the FIRST byte of a new line (cx==0, i.e. genuinely a
+;       leftover CRLF remainder); an LF arriving after real characters have
+;       been typed (cx>0) is now treated as a line terminator, same as CR
+;       (stores 0x0D so the rest of the interpreter sees its usual format).
+;   v1.7.8 (2026-08-13)  32 bytes free
+;     - input_line: stray LF (0x0A) left over from a CRLF line terminator was
+;       falling through to the "ordinary character" path in ipl_nbs -- echoed,
+;       stored, and left as the leading byte of the NEXT line read. That byte
+;       then failed GET_VAR_ADDR's 'A'..'Z' check on the following command,
+;       raising ?4 (bad variable) on any LIST/RUN/numbered-line entry after a
+;       prior line was stored via a terminal sending CRLF. Fixed by ignoring
+;       0x0A silently in ipl_nbs (not stored, not echoed, not counted).
+;     - RAM layout: IBUF declared 64 bytes but RND_SEED located 62 bytes
+;       later (0x00C -> 0x04A), overwriting.
+;     - tk_kw_tab had no terminating `dw 0` before then_tab/to_tab/step_tab/
+;       chrs_tab/tab_tab. TOKENIZE stops on a zero word, so it overan, matching
+;       TO/STEP/THEN/CHR$/TAB as statement keywords, corrupting any stored line
+;       that used them e.g. `FOR I=1 TO 5` tokenized "TO" to garbage raising 
+;       ?3 out-of-memory on RUN. 
+;   v1.7.7 (2026-08-13)  29 bytes free
+;     - fixed bug where grouping parens used as a factor (e.g. `(-2)^2`,
 ;       vs ABS(...) func jumped to e2_par instead of eat_paren_expr, skipping
 ;       consuming the opening '(', SI never advanced, stack smashed.
 ;     - do_for/do_next: redundant `call spaces` before `call get_var_addr`
@@ -133,33 +155,27 @@
 
 ORIGIN:         equ 0xF800              ; ROM base (also YASM segment)
 RAM_BASE:       equ 0x0000
-
-%ifdef __YASM_MAJOR__                   ; 8bitworkshop: YASM defines this
-RAM_SIZE:       equ 4096                ; 4 KB address space
-%else
 RAM_SIZE:       equ 2048                ; 2 KB RAM (A12=0 selects RAM)
-%endif
 
 ; =============================================================================
 ; RAM LAYOUT  (all offsets relative to RAM_BASE)
 ; =============================================================================
-;                ORG 0
 
 DIV0:           equ RAM_BASE + 0x000    ; 4 bytes : divide-by-zero IVT entry
 CURLN:          equ RAM_BASE + 0x004    ; word    : current line# for error reports
 RUN_NEXT:       equ RAM_BASE + 0x006    ; word    : next-line pointer for run loop
 NMI:            equ RAM_BASE + 0x008    ; 4 bytes : NMI IVT entry
 IBUF:           equ RAM_BASE + 0x00C    ; 64 bytes: input line buffer
-RND_SEED:       equ RAM_BASE + 0x04A    ; word    : LFSR random seed
-INS_TMP:        equ RAM_BASE + 0x04C    ; word    : insline / do_for var_ptr scratch
-GOSUB_SP:       equ RAM_BASE + 0x04E    ; word    : GOSUB stack depth (0..7)
-GOSUB_STK:      equ RAM_BASE + 0x050    ; 16 bytes: 8-entry GOSUB return-address stack
-FOR_SP:         equ RAM_BASE + 0x060    ; word    : FOR stack depth (0..3)
-FOR_STK:        equ RAM_BASE + 0x062    ; 32 bytes: 4 x 8-byte FOR frames
-VARS:           equ RAM_BASE + 0x082    ; 52 bytes: variables A-Z (word each)
-RUNNING:        equ RAM_BASE + 0x0B6    ; byte    : 0=immediate mode, 1=running
-PROG_END:       equ RAM_BASE + 0x0B7    ; word    : one past last program byte
-PROGRAM:        equ RAM_BASE + 0x0B9    ; program store start
+RND_SEED:       equ RAM_BASE + 0x04C    ; word    : LFSR random seed
+INS_TMP:        equ RAM_BASE + 0x04E    ; word    : insline / do_for var_ptr scratch
+GOSUB_SP:       equ RAM_BASE + 0x050    ; word    : GOSUB stack depth (0..7)
+GOSUB_STK:      equ RAM_BASE + 0x052    ; 16 bytes: 8-entry GOSUB return-address stack
+FOR_SP:         equ RAM_BASE + 0x062    ; word    : FOR stack depth (0..3)
+FOR_STK:        equ RAM_BASE + 0x064    ; 32 bytes: 4 x 8-byte FOR frames
+VARS:           equ RAM_BASE + 0x084    ; 52 bytes: variables A-Z (word each)
+RUNNING:        equ RAM_BASE + 0x0B8    ; byte    : 0=immediate mode, 1=running
+PROG_END:       equ RAM_BASE + 0x0B9    ; word    : one past last program byte
+PROGRAM:        equ RAM_BASE + 0x0BB    ; program store start
 STACK_TOP:      equ RAM_BASE + RAM_SIZE ; initial SP (grows downward)
 PROGRAM_TOP:    equ STACK_TOP - 0x100   ; 256-byte stack reserve
 
@@ -248,11 +264,13 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 ;   FOR=0x8F    NEXT=0x90  OUT=0x91
 ;   THEN=0x93   TO=0x94    STEP=0x95  REM=0x87
 ; =============================================================================
-
+	ORG 0
 %ifdef __YASM_MAJOR__
         ; Trampoline: 8bitworkshop needs a near jump it can overwrite
-        mov  ax, reset_vec
+        mov  ax, start
         jmp  ax
+%endif
+
         times PROGRAM - ($-$$) db 0     ; pad over VARS / equate area
 
 SHOWCASE_DATA:
@@ -263,8 +281,8 @@ SHOWCASE_DATA:
         db 0x28,0x00, 0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 40
         db 0x29,0x00, 0x80,0x22,"3^4=",0x22,";3^4;",0x22,"  2^10=",0x22,";2^10",0x0D    ; 41  power
         db 0x2A,0x00, 0x80,0x22,"--- BITWISE ---",0x22,0x0D                             ; 42
-        db 0x2B,0x00, 0x80,0x22,"12&10=",0x22,";12&10;",0x22,"  12|10=",0x22,";12|10",0x0D ; 43  AND/OR
-        db 0x2C,0x00, 0x80,0x22,"12~10=",0x22,";12~10",0x0D                             ; 44  XOR
+        db 0x2B,0x00, 0x80,0x22,"12 & 10=",0x22,";12&10;",0x22,"  12 | 10=",0x22,";12|10",0x0D ; 43  AND/OR
+        db 0x2C,0x00, 0x80,0x22,"12 XOR 10=",0x22,";12~10",0x0D                             ; 44  XOR
         db 0x32,0x00, 0x80,0x22,"--- COMPARISONS ---",0x22,0x0D           ; 50
         db 0x3C,0x00, 0x81,"5>3",0x93,0x80,0x22,"5>3 ok",0x22,0x0D      ; 60  IF THEN(0x93) PRINT
         db 0x46,0x00, 0x81,"3<5",0x93,0x80,0x22,"3<5 ok",0x22,0x0D      ; 70
@@ -289,23 +307,23 @@ SHOWCASE_DATA:
         db 0xE6,0x00, 0x8F,"N=1",0x94,"16",0x0D                          ; 230 FOR N=1 TO(0x94) 16
         db 0xF0,0x00, "T=A^2/64-B^2/64+C",0x0D                            ; 240 iterate
         db 0xFA,0x00, "B=2*A*B/64+D:A=T",0x0D                             ; 250
-        db 0x04,0x01, 0x81,"A^2/64+B^2/64>256",0x93,0x8D,"600",0x0D      ; 260 IF THEN(0x93) GOSUB 600
+        db 0x04,0x01, 0x81,"A^2/64+B^2/64>256",0x93,0x8D,"600",0x0D        ; 260 IF THEN(0x93) GOSUB 600
         db 0x0E,0x01, 0x90,"N",0x0D                                        ; 270 NEXT N
-        db 0x18,0x01, 0x81,"E>0",0x93,0x80,"CHR$(E+32);",0x0D            ; 280 IF E>0 THEN(0x93) PRINT
-        db 0x22,0x01, 0x81,"E=0",0x93,0x80,"CHR$(32);",0x0D              ; 290 IF E=0 THEN(0x93) PRINT
+        db 0x18,0x01, 0x81,"E>0",0x93,0x80,"CHR$(E+32);",0x0D              ; 280 IF E>0 THEN(0x93) PRINT
+        db 0x22,0x01, 0x81,"E=0",0x93,0x80,"CHR$(32);",0x0D                ; 290 IF E=0 THEN(0x93) PRINT
         db 0x2C,0x01, 0x90,"C",0x0D                                        ; 300 NEXT C
-        db 0x36,0x01, 0x80,0x0D                                  	; 310 PRINT (newline)
+        db 0x36,0x01, 0x80,0x0D                                        	   ; 310 PRINT (newline)
         db 0x40,0x01, 0x90,"I",0x0D                                        ; 320 NEXT I
         db 0x4A,0x01, 0x88,0x0D                                            ; 330 END
         ; ── Subroutine 500: sum 1..10 ──────────────────────────────────────────
         db 0xF4,0x01, "S=0",0x0D                                           ; 500
-        db 0xFE,0x01, 0x8F,"J=1",0x94,"10",0x0D                          ; 510 FOR J=1 TO(0x94) 10
+        db 0xFE,0x01, 0x8F,"J=1",0x94,"10",0x0D                            ; 510 FOR J=1 TO(0x94) 10
         db 0x08,0x02, "S=S+J",0x0D                                         ; 520
         db 0x12,0x02, 0x90,"J",0x0D                                        ; 530 NEXT J
         db 0x1C,0x02, 0x8E,0x0D                                            ; 540 RETURN
         ; ── Subroutine 550: factorial 5 ────────────────────────────────────────
         db 0x26,0x02, "F=1",0x0D                                           ; 550
-        db 0x30,0x02, 0x8F,"K=1",0x94,"5",0x0D                           ; 560 FOR K=1 TO(0x94) 5
+        db 0x30,0x02, 0x8F,"K=1",0x94,"5",0x0D                             ; 560 FOR K=1 TO(0x94) 5
         db 0x3A,0x02, "F=F*K",0x0D                                         ; 570
         db 0x44,0x02, 0x90,"K",0x0D                                        ; 580 NEXT K
         db 0x4E,0x02, 0x8E,0x0D                                            ; 590 RETURN
@@ -314,10 +332,10 @@ SHOWCASE_DATA:
         db 0x62,0x02, 0x8E,0x0D                                            ; 610 RETURN
         dw 0                                                                ; end sentinel
 SHOWCASE_END:
-        times ORIGIN-($-$$) db 0
-%else
-        org ORIGIN
-%endif
+
+        ; YASM does not like multiple ORGs 
+;        org ORIGIN
+	times ORIGIN-($-$$) db 0
 
 ; =============================================================================
 ; INIT  cold start
@@ -330,41 +348,28 @@ start:
         cld
         mov  ax, cs             ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves at PSP)
 %else
-        cli
         ; ROM: CS=0xF800 after far JMP.  RAM at segment 0.
         xor  ax, ax
 %endif
+        cli
+        ; setup 8088 segments for tiny system
         mov  ds, ax
         mov  es, ax
         mov  ss, ax
         mov  sp, STACK_TOP
         mov  di, RAM_BASE
 
-%ifndef __YASM_MAJOR__
-        ; Zero ALL RAM first (variables, FOR stack, program store, IVT area).
-        ; Must happen BEFORE setting PROG_END.
-        mov  cx, RAM_SIZE / 2
-%else
-        ; Zero only the vars area (program store holds showcase).
-        mov  cx, PROGRAM / 2    ; 0xB9/2 = 92 words
-        xor  ax, ax
-%endif
-        rep  stosw
+        call do_new             ; wipe vars
 
-%ifndef __YASM_MAJOR__
-        ; PROG_END: empty program (set after rep stosw so it isn't wiped)
-        mov  word [PROG_END], PROGRAM
-%else
+        ; delete next line for real ROM
         ; PROG_END: just past last showcase byte (excluding sentinel)
         mov  word [PROG_END], PROGRAM + (SHOWCASE_END - SHOWCASE_DATA) - 2
-%endif
-        mov  word [RND_SEED], 0xACE1    ; seed LFSR
 
         ; Signon banner; fall through to main_loop
         mov  si, str_banner
         call dp_str
         call do_free
-
+        ; drop through
 ; =============================================================================
 ; MAIN_LOOP  prompt / read / dispatch
 ; Inputs  : (none — top-level loop)
@@ -465,7 +470,7 @@ do_if:
         cmp  byte [si], TK_THEN
         jne  di_kw_then
         inc  si                 ; consume token
-        jmp  stmt
+        jmp  short stmt
 
 di_kw_then:
         mov  bx, then_tab       ; THEN is optional in direct mode
@@ -583,6 +588,19 @@ get_var_addr:
         ret
 
 ; =============================================================================
+; EXPECT_TOKEN_OR_KW  match a sub-keyword by token byte or plain text
+; Inputs  : AL = token value (e.g. TK_TO), BX -> keyword table entry (text match)
+; Outputs : CF=0 matched (SI advanced), CF=1 no match
+; Clobbers: AX, DI, DL
+; =============================================================================
+expect_token_or_kw:
+        call spaces
+        cmp  byte [si], al
+        je   etk_match
+;        jmp  kw_match   ; tail call
+        ; ret
+        ; drop through
+; =============================================================================
 ; KW_MATCH  case-insensitive keyword match at [SI]
 ; Inputs  : BX -> table entry (word = pointer to bit-7-terminated keyword string)
 ;           SI -> input text
@@ -623,9 +641,14 @@ kw_match:
         jbe  .fail              ; 0-9: still a word
 .ok:
         pop  ax                 ; discard saved SI
+        ;clc
+        ;ret
+        DB 0xB0 ; swallow next byte
+etk_match:
+        inc  si
         clc
         ret
-.fail:
+kw_match.fail:
         pop  si
         stc
         ret
@@ -720,9 +743,9 @@ dl_eol:
 ; Clobbers: AX, BX, CX, SI
 ; =============================================================================
 do_print:
-dp_top:
         call peek_line
         je   dp_nl              ; bare PRINT -> newline
+dp_top:
         cmp  byte [si], '"'
         jne  dp_chrs
         inc  si                 ; skip opening quote
@@ -731,12 +754,12 @@ dp_str:
         cmp  al, 0x22           ; closing '"'?
         je   dp_after
         test al, 0x80           ; bit-7 terminator (ROM string)?
-        jz   loop_print
-        and  al, 0x7F
-        jmp  output             ; tail-call
-loop_print:
+        pushf                   ; Save flags (ZF=1 if bit 7 is clear)
+        and  al, 0x7F           ; Mask off terminator bit
         call output
-        jmp  short dp_str
+        popf                    ; Restore flags
+        jz   dp_str             ; Loop if it wasn't the terminator
+        ret                     ; Return to caller (do_help/do_free)
 
 dp_chrs:
         mov  bx, chrs_tab
@@ -745,6 +768,7 @@ dp_chrs:
         call eat_paren_expr
         call output
         jmp  short dp_after
+
 dp_tab:
         mov  bx, tab_tab
         call kw_match
@@ -755,20 +779,25 @@ tab_loop:
         call output_space
         loop tab_loop
         jmp  short dp_after
+
 dp_num:
         call expr
         call output_number
+        ; Falls through to dp_after
+        
 dp_after:
         call spaces
         cmp  byte [si], ';'
         jne  dp_nl
         inc  si
-        call peek_line
-        je   dp_ret
-        jmp  short dp_top
+        call peek_line          ; Check if anything follows ';'
+        jne  dp_top             ; If not end of line, loop back up
+dp_ret:
+        ret                     ; End of line after ';', return without newline
 
 ; =============================================================================
-; DO_FREE  print free program-store bytes (also provides dp_nl / newline)
+; DO_FREE  print free program-store bytes 
+; (Moved BEFORE do_help to allow do_help to fall through to dp_nl)
 ; Inputs  : (none)
 ; Clobbers: AX, SI
 ; =============================================================================
@@ -778,10 +807,7 @@ do_free:
         call num_space
         mov  si, kw_free
         call dp_str
-dp_nl:
-        jmp  new_line           ; tail-call
-dp_ret:
-        ret
+        jmp  short dp_nl        ; Jump to the shared newline tail-call
 
 ; =============================================================================
 ; DO_HELP  print all keywords
@@ -795,7 +821,8 @@ dh_lp:
         call output_space
         cmp  byte [si], 0       ; sentinel?
         jne  dh_lp
-        jmp  new_line           ; tail-call
+dp_nl:
+        jmp new_line           ; tail-call
 
 ; =============================================================================
 ; POKE_OUT_HLPR  parse "<addr>, <val>" pair shared by DO_POKE and DO_OUT
@@ -958,6 +985,17 @@ math_mul:
         imul cx
         ret
 
+; =============================================================================
+; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
+; Inputs  : AX = limit n (from eat_paren_expr)
+; Outputs : AX = value in range [0, n)
+; Clobbers: BX, CX, DX
+; =============================================================================
+do_rnd_func:
+        push ax                 ; save limit
+        call rnd_shuffle        ; advance LFSR -> AX
+        pop  cx                 ; CX = limit
+        ; drop through          ; returns AX % CX
 math_mod:
         call math_div
         xchg ax, dx             ; return remainder
@@ -991,28 +1029,10 @@ math_pow:
 .done:
         ret
 
-; =============================================================================
-; PREC_ENGINE  generic left-associative binary operator evaluator
-; Inputs  : BX -> operator table {char(1), handler_ptr(2), ...}, 0x00 sentinel
-;           DI = pointer to next-lower-precedence function
-; Clobbers: AX, BX, CX, DX, SI (via recursive sub-calls)
-; =============================================================================
 expr_bitwise:                   ; lowest precedence
         mov  bx, tab_bitwise
         mov  di, expr_add
         jmp  short prec_engine
-
-bitwise_and:
-        and  ax, cx
-        ret
-
-bitwise_or:
-        or   ax, cx
-        ret
-
-bitwise_xor:
-        xor  ax, cx
-        ret
 
 expr_add:
         mov  bx, tab_add
@@ -1024,6 +1044,18 @@ expr1:
         mov  di, expr_unary
         jmp  short prec_engine
 
+bitwise_or:
+        or   ax, cx
+        ret
+
+bitwise_xor:
+        xor  ax, cx
+        ret
+
+bitwise_and:
+        and  ax, cx
+        ret
+
 ; =============================================================================
 ; EXPR_UNARY  unary +/- wrapping a whole power-expression (correct BODMAS:
 ; binds looser than ^, so -2^2 = -4, not (-2)^2)
@@ -1031,14 +1063,13 @@ expr1:
 ; Outputs : AX = value
 ; Clobbers: AX, BX, CX, DX, SI
 ; =============================================================================
-eu_pos:
-        inc  si
-        jmp  expr_unary
 eu_neg:
         inc  si
         call expr_unary
-        neg  ax
-        ret
+        jmp short jnegax
+
+eu_pos:
+        inc  si
 expr_unary:
         call spaces
         mov  al, [si]
@@ -1051,6 +1082,12 @@ expr_pow:
         mov  di, expr2          ; functions are highest precedence
         ; fall through to prec_engine
 
+; =============================================================================
+; PREC_ENGINE  generic left-associative binary operator evaluator
+; Inputs  : BX -> operator table {char(1), handler_ptr(2), ...}, 0x00 sentinel
+;           DI = pointer to next-lower-precedence function
+; Clobbers: AX, BX, CX, DX, SI (via recursive sub-calls)
+; =============================================================================
 prec_engine:
         push bx                 ; save operator table pointer
         push di                 ; save next-level function pointer
@@ -1081,6 +1118,28 @@ prec_engine:
 .done:
         add  sp, 4              ; discard saved BX and DI
         ret
+
+; =============================================================================
+; DO_ABS_FUNC  ABS(n) -> absolute value
+; Inputs  : AX = value (from eat_paren_expr)
+; Outputs : AX = |value|
+; Clobbers: (none)
+; =============================================================================
+do_abs_func:
+        or   ax, ax     ; already +ve
+        jns  dafd
+jnegax:        
+        neg  ax
+dafd:
+        ret
+
+; =============================================================================
+; E2_NEG  unary negation factor
+; =============================================================================
+e2_neg:
+        inc  si
+        call expr2
+        jmp short jnegax
 
 ; =============================================================================
 ; EXPR2  factor level: unary operators, built-in functions, literals, variables
@@ -1137,19 +1196,6 @@ e2_par:
         ret
 
 ; =============================================================================
-; DO_ABS_FUNC  ABS(n) -> absolute value
-; Inputs  : AX = value (from eat_paren_expr)
-; Outputs : AX = |value|
-; Clobbers: (none)
-; =============================================================================
-do_abs_func:
-        or   ax, ax
-        jns  .done
-        neg  ax
-.done:
-        ret
-
-; =============================================================================
 ; DO_PEEK_FUNC  PEEK(addr) -> byte at memory address
 ; Inputs  : AX = address (from eat_paren_expr)
 ; Outputs : AX = zero-extended byte value
@@ -1159,7 +1205,7 @@ do_abs_func:
 do_peek_func:
         xchg bx, ax
         mov  al, [bx]
-        db   0xBB               ; "mov bx, imm16": swallows do_in_func's xchg+in
+        db   0xBB            ; "mov bx, imm16": swallows do_in_func's xchg+in
         ; fall through to in_tail
 
 ; =============================================================================
@@ -1174,18 +1220,6 @@ do_in_func:
 in_tail:
         xor  ah, ah             ; zero-extend to 16-bit
         ret
-
-; =============================================================================
-; DO_RND_FUNC  RND(n) -> pseudo-random value in [0, n)
-; Inputs  : AX = limit n (from eat_paren_expr)
-; Outputs : AX = value in range [0, n)
-; Clobbers: BX, CX, DX
-; =============================================================================
-do_rnd_func:
-        push ax                 ; save limit
-        call rnd_shuffle        ; advance LFSR -> AX
-        pop  cx                 ; CX = limit
-        jmp  math_mod           ; tail-call: returns AX % CX
 
 ; =============================================================================
 ; RND_SHUFFLE  advance 16-bit Galois LFSR and return new seed value
@@ -1210,6 +1244,7 @@ rnd_shuffle:
 do_not_func:
         not  ax
         ret
+
 ; =============================================================================
 ; E2_VAR  load variable value at factor level
 ; Inputs  : SI -> variable letter
@@ -1219,15 +1254,6 @@ do_not_func:
 e2_var:
         call get_var_addr
         mov  ax, [di]
-        ret
-
-; =============================================================================
-; E2_NEG  unary negation factor
-; =============================================================================
-e2_neg:
-        inc  si
-        call expr2
-        neg  ax
         ret
 
 ; =============================================================================
@@ -1289,9 +1315,16 @@ ipl_lp:
         call backsp
         call output_space
         call backsp
-        jmp  ipl_lp
+        jmp  short ipl_lp
 
 ipl_nbs:
+        cmp  al, 0x0A           ; LF?
+        jne  ipl_chkcr
+        or   cx, cx             ; any chars already stored this line?
+        je   ipl_lp             ; no: stray CRLF remainder -- ignore silently
+        mov  al, 0x0D           ; yes: bare LF is this terminal's line end --
+        jmp  short ipl_cr       ;      treat exactly like CR (store 0x0D)
+ipl_chkcr:
         cmp  al, 0x0D           ; CR?
         je   ipl_cr
         cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
@@ -1303,8 +1336,34 @@ ipl_nbs:
 ipl_cr:
         stosb
         mov  si, IBUF
-	jmp new_line
-        
+	jmp short new_line
+
+; =============================================================================
+; NEW_LINE  emit CR + LF
+; OUTPUT_SPACE  emit a single space character
+; BACKSP  emits BASCKSPACE
+; QUESTION  emits '?'
+; Inputs  : Num_Space AX is num
+; Clobbers: AX
+; =============================================================================
+num_space:
+	call output_number
+        jmp output_space
+new_line:
+        mov  al, 0x0D
+        call output
+        mov  al, 0x0A
+	db 0x3d
+question:
+	mov al, '?'
+	db 0x3d
+backsp:
+	mov al, 0x08
+        db 0x3d
+output_space:
+        mov  al, ' '
+        jmp  short output             ; tail-call 
+
 ; =============================================================================
 ; OUTPUT_NUMBER  print signed 16-bit integer to terminal
 ; Inputs  : AX = signed 16-bit value
@@ -1366,32 +1425,6 @@ output:
         jnz  .out_bit
         ret
 %endif
-
-; =============================================================================
-; NEW_LINE  emit CR + LF
-; OUTPUT_SPACE  emit a single space character
-; BACKSP  emits BASCKSPACE
-; QUESTION  emits '?'
-; Inputs  : Num_Space AX is num
-; Clobbers: AX
-; =============================================================================
-num_space:
-	call output_number
-        jmp output_space
-new_line:
-        mov  al, 0x0D
-        call output
-        mov  al, 0x0A
-	db 0x3d
-question:
-	mov al, '?'
-	db 0x3d
-backsp:
-	mov al, 0x08
-        db 0x3d
-output_space:
-        mov  al, ' '
-        jmp  output             ; tail-call 
    
 ; =============================================================================
 ; INPUT_KEY  read one character from terminal into AL
@@ -1456,7 +1489,7 @@ wl_lp:
         cmp  bx, ax
         jnb  wl_done
         call next_line_ptr
-        jmp  wl_lp
+        jmp  short wl_lp
 
 ; =============================================================================
 ; NEXT_LINE_PTR  advance DI from current line start to next line start
@@ -1600,14 +1633,14 @@ slide_done:
 ; Clobbers: AX, CX, DI
 ; =============================================================================
 do_new:
-        mov  word [PROG_END], PROGRAM
-        mov  di, PROGRAM
-        mov  cx, (PROGRAM_TOP - PROGRAM) / 2
-clr_mem:
+        ; Zero only the vars area (program store holds showcase).
+        mov  cx, PROGRAM / 2    ; 0xB9/2 = 92 words
         xor  ax, ax
-        rep  stosw              ; zeroes sentinel too
-        ; fall through to do_end
+        rep  stosw              ; DI increments and stops at PROGRAM
 
+        mov  word [PROG_END], di        ; di contains PROGRAM value
+        mov  word [RND_SEED], 0xACE1    ; seed LFSR
+        ; fall through to do_end
 ; =============================================================================
 ; DO_END  END statement — stops program execution
 ; Inputs  : (none)
@@ -1619,8 +1652,23 @@ do_end:
         xor  al, al
 run_end:
         mov  byte [RUNNING], al
-dg_ret:
         ret
+        
+; =============================================================================
+; Shared GOTO / GOSUB helper
+; Clobbers: AX, DI
+; =============================================================================
+get_line_or_err:
+        call expr
+        call find_line
+        cmp  [di], ax
+        jne  JERRUL
+dg_ret:
+        ret                     ; Shared return used by get_line_or_err and dg_common
+
+JERRUL:
+        mov  al, ERR_UL
+        jmp  do_error
 
 ; =============================================================================
 ; DO_GOTO  GOTO <linenum>
@@ -1629,20 +1677,37 @@ dg_ret:
 ; Clobbers: AX, BX, DI
 ; =============================================================================
 do_goto:
-        call expr
-        call find_line
-        cmp  [di], ax
-        je   dg_common
-JERRUL:
-        mov  al, ERR_UL
-        jmp  do_error
+        call get_line_or_err
+        jmp  short dg_common
 
 do_run:
         mov  di, PROGRAM
+        jmp  short dg_common
+
+; =============================================================================
+; DO_GOSUB  GOSUB <linenum>
+; Saves RUN_NEXT on dedicated GOSUB stack then jumps to target.
+; Inputs  : SI -> line number expression
+; Clobbers: AX, BX, DI
+; =============================================================================
+do_gosub:
+        call get_line_or_err
+        mov  bx, [GOSUB_SP]
+        cmp  bx, 8
+        jb   gs_push
+        jmp  JERRSN             ; overflow -> syntax error
+
+gs_push:
+        inc  word [GOSUB_SP]
+        add  bx, bx             ; BX is now byte offset (0, 2, 4...)
+        mov  ax, [RUN_NEXT]
+        mov  [bx + GOSUB_STK], ax ; Direct base-indexed addressing! (Replaces LEA bodge)
+        ; fall through to dg_common!
+
 dg_common:
         mov  [RUN_NEXT], di
         cmp  byte [RUNNING], 0
-        jne  dg_ret             ; already running (e.g. mid-GOTO): just return
+        jne  dg_ret             ; already running (mid-GOTO/GOSUB): jump up to shared 'ret'
         inc  byte [RUNNING]
         ; fall through to run_loop
 
@@ -1664,36 +1729,6 @@ run_loop:
         jmp  short run_loop
 
 ; =============================================================================
-; DO_GOSUB  GOSUB <linenum>
-; Saves RUN_NEXT on dedicated GOSUB stack then jumps to target.
-; Inputs  : SI -> line number expression
-; Clobbers: AX, BX, DI
-; =============================================================================
-do_gosub:
-        call expr               ; AX = target line#
-        call find_line          ; DI -> line >= AX
-        cmp  [di], ax
-        jne  JERRUL
-        mov  bx, [GOSUB_SP]
-        cmp  bx, 8
-        jb   gs_push
-        jmp  JERRSN             ; overflow -> syntax error
-
-gs_push:
-        inc  word [GOSUB_SP]
-        add  bx, bx              ; BX is already loaded, use it
-; Bodge for Tinyasm which doesnt udnerstand LEA
-%ifdef __YASM_MAJOR__
-	lea  si, [GOSUB_STK + bx]
-%else
-	db 0x8d, 0x77, 0x50
-%endif
-        mov  ax, [RUN_NEXT]
-        mov  [si], ax            
-        mov  [RUN_NEXT], di      ; DI is target from find_line
-        ret
-
-; =============================================================================
 ; DO_RETURN  RETURN
 ; Pops return address from GOSUB stack and resumes execution.
 ; Inputs  : (none)
@@ -1709,14 +1744,9 @@ do_return:
         jz   gs_underflow		; 2
         dec  ax				; 1
         mov  [si], ax			; 2
-        add  ax, ax             ; byte offset = depth * 2	;2
+        add  ax, ax                     ; byte offset = depth * 2	;2
         xchg ax, bx			; 1
-; Bodge for Tinyasm which doesnt understand LEA
-%ifdef __YASM_MAJOR__
-	lea  si, [GOSUB_STK + bx]
-%else
-	db 0x8d, 0x77, 0x50		; 3
-%endif
+	lea  si, [bx + GOSUB_STK]
         lodsw				; 1
         mov  [RUN_NEXT], ax		; 2
         ret				; 1
@@ -1883,23 +1913,6 @@ for_ptr_hlp:
         ret
 
 ; =============================================================================
-; EXPECT_TOKEN_OR_KW  match a sub-keyword by token byte or plain text
-; Inputs  : AL = token value (e.g. TK_TO), BX -> keyword table entry (text match)
-; Outputs : CF=0 matched (SI advanced), CF=1 no match
-; Clobbers: AX, DI, DL
-; =============================================================================
-expect_token_or_kw:
-        call spaces
-        cmp  byte [si], al
-        je   etk_match
-        call kw_match
-        ret
-etk_match:
-        inc  si
-        clc
-        ret
-
-; =============================================================================
 ; DO_NEXT  NEXT <var>
 ; Increments loop variable, tests exit condition, loops or pops frame.
 ; Inputs  : SI -> line body after NEXT token
@@ -1928,7 +1941,7 @@ dn_search:
         cmp  word [bx+4], 0
         jl   dn_neg
         cmp  ax, dx
-        jge  dn_done
+        jg  dn_done
 dn_loop:
         mov  ax, [bx+6]
         mov  [RUN_NEXT], ax     ; jump back to top of loop
@@ -1940,7 +1953,6 @@ dn_neg:
 dn_done:
         mov  [FOR_SP], cx       ; pop frame (CX = correct new depth)
         ret
-
 
 ; =============================================================================
 ; KEYWORD STRINGS  (bit-7 terminated; table ends with 0x00 sentinel)
@@ -1986,6 +1998,8 @@ tk_kw_tab:
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
         dw kw_help, kw_gosub, kw_return
         dw kw_for, kw_next, kw_out
+        dw 0                     ; terminate tk_kw_tab scan (else TOKENIZE
+                                  ; walks into then_tab/to_tab/step_tab/... below)
 
 ; Sub-keyword pointer entries (matched individually; not iterated)
 then_tab:   dw kw_then
@@ -1998,7 +2012,7 @@ tab_tab:    dw kw_tab
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.7"
+str_banner: db "uBASIC 8088 v1.7.8"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -2061,37 +2075,29 @@ ROM_END:
 ; RESET VECTOR  at 0xFFF0
 ; 8086 resets to CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 ; =============================================================================
-%ifdef __YASM_MAJOR__
-        times 0x7F0-($-start) db 0xFF
-%else
+%ifndef __YASM_MAJOR__
         org 0xFFF0
-        cld
 %endif
 
 reset_vec:
+        cld
         ; Configure 8755 Port A: bit1=RX(input), all others output; TX idles high
         mov  al, 0xFD
         out  DDR_A, al
         mov  al, TX
         out  PORT_A, al
 
-%ifdef __YASM_MAJOR__
-        jmp  start
-%else
-        ; FAR JMP to CS=0xF800 IP=0x0000  (opcode: EA 00 00 00 F8)
+        ; FAR JMP (opcode: EA)
         db   0xEA
-        dw   0x0000             ; IP
-        dw   0xF800             ; CS
-%endif
+        dw   ORIGIN             ; IP
+        dw   0x0000             ; CS
 
-; Placed here as a space-filler between reset vector and pad:
 ; =============================================================================
 ; DO_USR_FUNC  USR(addr) — call arbitrary machine-code address
+; Placed here as a space-filler between reset vector and end of memory
 ; Inputs  : AX = call address (from eat_paren_expr)
 ; Outputs : AX = return value from called routine
 ; Clobbers: whatever the called routine clobbers
 ; =============================================================================
 do_usr_func:
         jmp  ax                 ; tail-call
-
-        times 2048-($-start) db 0xFF    ; pad to exactly 2 KB
