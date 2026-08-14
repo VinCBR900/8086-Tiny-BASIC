@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 8088  v3.15
+; miniBASIC 8088  v3.17
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny-BASIC-derived interpreter for the 8088/8086 with MBF4 32-bit
@@ -7,8 +7,9 @@
 ; ATN, ASIN, ACOS, SQRT, LN, EXP).
 ;
 ; Statements accepted
-;   END  FOR..TO..STEP  FREE  GOSUB  GOTO  IF..THEN  INPUT  LET  LIST [n,m]
-;   NEW  NEXT  POKE  PRINT [TAB(n)][;][CHR$(n)]  REM  RETURN  RUN
+;   END  FOR..TO..STEP  GOSUB  GOTO  IF..THEN  INPUT  LET  
+;   NEW  NEXT  POKE  PRINT [CHR$(n)][TAB(n)][;]  REM  RETURN  
+;   LIST [n,m] RUN
 ;
 ; Expressions:
 ;   + - * / % ^     add, subtract, multiply, divide, MOD, POWER
@@ -17,8 +18,9 @@
 ;   = < > <= >= <>  relational, return -1 (true) or 0 (false)
 ;   unary -         negation
 ;   Precedence, loosest to tightest: | , ~ , & , relational , +/- , */% ,
-;   ^ , unary -/!/functions. All but relational/unary/functions are
-;   left-associative (see KNOWN LIMITATIONS for ^ specifically).
+;   unary -/+ (wraps the whole power expression below, e.g. -2^2 = -4,
+;   not (-2)^2 -- v3.17), ^ , unary !/functions. All but relational/unary/
+;   functions are left-associative (see KNOWN LIMITATIONS for ^ specifically).
 ;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
 ;   FREE  IN(io)  LN(flt)  LOG(flt)  PEEK(addr)  PI  RND  SGN(flt)  SIN(rad)
 ;   TAN(rad)  SQRT(flt)  USR(addr)
@@ -98,13 +100,26 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
+; v3.17 (2026-08-14) - 36 bytes free
+;   - Added a ^ precedence fix: a new EXPR_UNARY level (between EXPR1 and
+;     EXPR_POW) makes a leading unary minus wrap the WHOLE power expression,
+;     so -2^2 now evaluates to -4, not (-2)^2=4. 2^-3 (sign on the exponent)
+;     is unaffected -- EXPR2's own existing unary handling covers that
+;   - EDITLN: added the PROG_END bounds check ported from uBASIC8088 v1.8.1
+;     (DI past PROG_END -> skip the delete-existing-line path) as a
+;     defensive guard against a leftover line number in the not-yet-
+;     overwritten program area being mistaken for a real existing line.
+;   - DO_FOR/DO_NEXT: removed redundant CALL SPACES before CALL GET_VAR_ADDR
 ;
-; v3.15 (2026-07-27) - ROM_END: NASM/ROM 62 bytes, YASM 109 bytes
+; v3.16 (2026-08-14) - 64 bytes 
+;   - Refactored Showcase for ROM version demo 
+;
+; v3.15 (2026-07-27) - 62 bytes, YASM 109 bytes
 ;   - Restored bitwise/logical operators & | ~ ! (AND/OR/XOR/NOT), 
 ;     '~' stands in for XOR since '^' is POW here.
 ;   - Added a BITWISE demo block to showcase demo.
 ;
-; v3.14 (2026-07-27) - ROM_END: NASM/ROM 150 bytes, YASM 197 bytes
+; v3.14 (2026-07-27) - 150 bytes, YASM 197 bytes
 ;   - SIN/COS/TAN given a hard domain guard: |x| >= 2^17 (131072) now
 ;     raises "?2" instead of silent garbage due to FLT_TO_INT's
 ;     int16 saturation. 
@@ -150,7 +165,7 @@
 ; v3.5 (2026-07-19)
 ;   - Fixed DX register corruption bug in EDITLN during line replacements.
 ;   - Replaced overlapping byte trick in FLT_PI_B/FLT_2PI_B with a shared-tail merge.
-;   - Fixed TAB spacing behavior in showcase demo and added visual overflow bell feedback to INPUT_LINE.
+;   - Fixed TAB spacing behavior in showcase demo and added overflow bell feedback to INPUT_LINE.
 ;   - Applied size-optimization passes to math, loop, and dispatch helper routines.
 ;
 ; v3.4 (2026-07-16)
@@ -239,8 +254,8 @@
 
 ORIGIN:         equ 0xF000              ; ROM base (also YASM segment)
 RAM_BASE:       equ 0x0000
-
 RAM_SIZE:       equ 4096                ; 4 KB address space
+MAX_BUF:        equ 62                  ; input buffer size
 
 ; =============================================================================
 ; RAM LAYOUT  (all offsets relative to RAM_BASE)
@@ -341,11 +356,14 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 ;   Lines 730-758 : Hypnotic Eye -- LN/EXP/SQRT/SIN logarithmic ripple
 ;
 ; =============================================================================
-
+	ORG 0
 %ifdef __YASM_MAJOR__
         ; Trampoline: 8bitworkshop needs a near jump it can overwrite
-        mov  ax, reset_vec
+        mov  ax, start
         jmp  ax
+        nop ; 6 bytes
+%endif
+
         times PROGRAM - ($-$$) db 0     ; pad over VARS / equate area
 
 SHOWCASE_DATA:
@@ -603,10 +621,10 @@ SHOWCASE_DATA:
         db "END", 0x0D
         dw 0      ; end sentinel
 SHOWCASE_END:
-        times ORIGIN-($-$$) db 0
-%else
-        org ORIGIN
-%endif
+
+        ; YASM does not like multiple ORGs 
+;        org ORIGIN
+	times ORIGIN-($-$$) db 0
 
 ; =============================================================================
 ; INIT  cold start
@@ -619,39 +637,26 @@ start:
         cld
         mov  ax, cs             ; EXE: normalise DS/ES/SS to CS (FREEDOS leaves at PSP)
 %else
-        cli
-        ; ROM: CS=0xF000 after far JMP.  RAM at segment 0.
+        ; ROM: CS=0xF800 after far JMP.  RAM at segment 0.
         xor  ax, ax
 %endif
+        cli
+        ; setup 8088 segments for tiny system
         mov  ds, ax
         mov  es, ax
         mov  ss, ax
         mov  sp, STACK_TOP
-        mov  di, RAM_BASE
+        ; Clear variable mem
+        call clr_vars
 
-%ifndef __YASM_MAJOR__
-        ; Zero ALL RAM first (variables, FOR stack, program store, IVT area).
-        ; Must happen BEFORE setting PROG_END.
-        mov  cx, RAM_SIZE / 2
-%else
-        ; Zero only the vars area (program store holds showcase).
-        mov  cx, PROGRAM / 2    ; PROGRAM/2 words (symbolic; see RAM LAYOUT)
-        xor  ax, ax
-%endif
-        rep  stosw
-
-%ifndef __YASM_MAJOR__
-        ; PROG_END: empty program (set after rep stosw so it isn't wiped)
-        mov  word [PROG_END], PROGRAM
-%else
+        ; Protect showcase - Delete next lines and instead call DO_NEW for real ROM 
         ; PROG_END: just past last showcase byte (excluding sentinel)
-        mov  word [PROG_END], PROGRAM + (SHOWCASE_END - SHOWCASE_DATA) - 2
-%endif
-        mov  word [RND_SEED], 0xACE1    ; seed LFSR
+        mov  word [PROG_END], SHOWCASE_END - 2
 
         ; Signon banner; fall through to main_loop
         mov  si, str_banner
         call dp_str
+        ; drop through
 
 ; =============================================================================
 ; MAIN_LOOP  prompt / read / dispatch
@@ -1426,8 +1431,34 @@ expr_add:
 ; =============================================================================
 expr1:
         mov  bx, tab_mul
-        mov  di, expr_pow        ; power level binds tighter than * / %
+        mov  di, expr_unary      ; power level (wrapped by unary) binds
+                                  ; tighter than * / %
         jmp  short prec_engine_f
+
+; =============================================================================
+; EXPR_UNARY  unary +/- wrapping a whole power-expression: binds looser
+; than ^, so -2^2 = -4, not (-2)^2 (correct BODMAS -- ported from uBASIC8088
+; v1.7.6). Existing unary handling inside EXPR2 (e2_neg/e2_pos) is
+; unchanged, so a sign on the exponent, e.g. 2^-3, still parses as before.
+; Inputs  : SI -> expression text
+; Outputs : FLT_A = value
+; Clobbers: AX, BX, CX, DX, SI, FLT_A, FLT_B, FLT_C
+; =============================================================================
+eu_neg:
+        inc  si
+        call expr_unary
+        jmp  flt_negate          ; tail-call: FLT_A = -FLT_A
+
+eu_pos:
+        inc  si
+expr_unary:
+        call spaces
+        mov  al, [si]
+        cmp  al, '-'
+        je   eu_neg
+        cmp  al, '+'
+        je   eu_pos
+        ; fall through to expr_pow
 
 ; =============================================================================
 ; EXPR_POW  exponentiation level (^), v3.13. Binds tighter than * / % but
@@ -1700,37 +1731,47 @@ inm_done:
 ; =============================================================================
 input_line:
         mov  di, IBUF
-        xor  cx, cx
+        xor  cx, cx             ; Zeroing
 ipl_lp:
         call input_key
-        cmp  al, 0x08           ; backspace?
-        jne  ipl_nbs
-        or   cx, cx
-        je   ipl_lp             ; buffer empty: ignore
-        dec  di
-        dec  cx
+
+        cmp  al, 0x08           ; Backspace?
+        je   ipl_bs
+        cmp  al, 0x0D           ; CR?
+        je   ipl_cr
+        cmp  al, 0x0A           ; LF?
+        jne  ipl_chkfull
+
+        ; --- LF Handler ---
+        jcxz ipl_lp             ; Buffer empty? Ignore stray LF
+        mov  al, 0x0D           ; Convert LF to CR
+                                ; FALLTHROUGH directly into ipl_cr!
+
+ipl_cr: ; --- CR / End of Line ---
+        stosb                   ; Store the CR (1 byte)
+        mov  si, IBUF
+        jmp  short new_line
+
+ipl_chkfull: ; --- Normal Character ---
+        cmp  cx, MAX_BUF             ; Buffer full?
+        jb   ipl_store          ; No: go store it
+        call bell               ; Yes: audible feedback
+        jmp  short ipl_lp
+
+ipl_store:
+        call output             ; Echo char
+        stosb                   ; Store char in [di], di++ (1 byte)
+        inc  cx                 ; (1 byte)
+        jmp  short ipl_lp
+
+ipl_bs: ; --- Backspace Handler ---
+        jcxz ipl_lp             ; Buffer empty? Ignore backspace
+        dec  di                 ; (1 byte)
+        dec  cx                 ; (1 byte)
         call backsp
         call output_space
         call backsp
-        jmp  ipl_lp
-
-ipl_nbs:
-        cmp  al, 0x0D           ; CR?
-        je   ipl_cr
-        cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
-        jb   ipl_store
-        mov  al, 0x07           ; BELL -- audible "line full" feedback
-        call output
-        jmp  ipl_lp
-ipl_store:
-        call output
-        stosb
-        inc  cx
-        jmp  ipl_lp
-ipl_cr:
-        stosb
-        mov  si, IBUF
-        jmp  new_line
+        jmp  short ipl_lp
 
 ; =============================================================================
 ; OUTPUT_NUMBER  print signed 16-bit integer to terminal
@@ -1806,39 +1847,27 @@ num_space:
         jmp  output_space        ; tail-call
 
 ; =============================================================================
-; NEW_LINE / QUESTION / BACKSP / OUTPUT_SPACE
+; NEW_LINE / QUESTION / BACKSP / OUTPUT_SPACE / Bell
 ;
 ; Four single-character output routines sharing one tail. Each may be
 ; called directly by name for its own character; the fallthrough chain
 ; between them is an internal size optimisation
 ; =============================================================================
 ; NEW_LINE
-; Inputs  : (none)
-; Outputs : CR (0x0D) then LF (0x0A)
-; Clobbers: AX
 new_line:
         mov  al, 0x0D
         call output
         mov  al, 0x0A
         db   0x3D	; consume next2 bytes
-; QUESTION
-; Inputs  : (none)
-; Outputs : '?'
-; Clobbers: AX
 question:
         mov  al, '?'
         db   0x3D ; consume next2 bytes
-; BACKSP
-; Inputs  : (none)
-; Outputs : backspace (0x08)
-; Clobbers: AX
 backsp:
         mov  al, 0x08
         db   0x3D ; consume next2 bytes
-; OUTPUT_SPACE
-; Inputs  : (none)
-; Outputs : ' '
-; Clobbers: AX
+bell:
+        mov  al, 0x07
+        db   0x3D ; consume next2 bytes
 output_space:
         mov  al, ' '
         jmp  output             ; tail-call
@@ -1963,6 +1992,16 @@ el_ldone:
         push bx
         mov  ax, dx
         call find_line          ; DI = insertion point
+        cmp  di, [PROG_END]     ; DI past the logical program end? NEW resets
+        jnb  el_noex            ; PROG_END but leaves old bytes physically
+                                 ; intact (cold boot needs them undisturbed
+                                 ; for the showcase); without this check a
+                                 ; leftover line number here that happens to
+                                 ; match DX looks like a real existing line,
+                                 ; and deleting/re-inserting it walks PROG_END
+                                 ; below PROGRAM, wrapping SLIDE_DATA's byte
+                                 ; count to ~64K on the next insert. Ported
+                                 ; from uBASIC8088 v1.8.1.
         cmp  [di], dx
         jne  el_noex
         ; BUGFIX (ported from prior audit): DELINE documents DX as
@@ -2074,13 +2113,18 @@ slide_done:
 ; Inputs  : (none)
 ; Clobbers: AX, CX, DI
 ; =============================================================================
-do_new:
-        mov  word [PROG_END], PROGRAM
-        mov  di, PROGRAM
-        mov  cx, (PROGRAM_TOP - PROGRAM) / 2
-clr_mem:
+clr_vars:
         xor  ax, ax
-        rep  stosw              ; zeroes sentinel too
+        xor  di, di                     ; clear ram starting from zero
+        mov  cx, PROGRAM                ; 0xB9 
+        rep  stosb                      ; DI increments and stops at PROGRAM
+        mov  word [RND_SEED], 0xACE1    ; seed LFSR
+        ret 
+
+do_new:
+        call clr_vars
+        mov  word [PROG_END], DI   
+        mov  word [DI], ax               ; empty-program sentinel.
         ; fall through to do_end
 
 ; =============================================================================
@@ -2119,8 +2163,7 @@ new_next_disp:
 ; Clobbers: AX, BX, CX, DX, SI, DI, FLT_A, FLT_B, FLT_C
 ; =============================================================================
 do_next:
-        call spaces
-        call get_var_addr       ; DI = &var
+        call get_var_addr       ; DI = &var (already skips spaces itself)
         mov  cx, [FOR_SP]
 dn_search:
         jcxz dn_no_for          ; stack empty: no matching FOR
@@ -2366,8 +2409,7 @@ df_syn:
         mov  al, ERR_OM
         jmp  do_error
 do_for:
-        call spaces
-        call get_var_addr
+        call get_var_addr       ; get_var_addr already skips spaces itself
         mov  [INS_TMP], di      ; save &var
         call expect_equals
         call expr               ; FLT_A = start value
@@ -2471,7 +2513,7 @@ stmt_tab2:
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "miniBASIC 8088 v3.15"
+str_banner: db "miniBASIC 8088 v3.17"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
@@ -4512,28 +4554,22 @@ exp_poly_tbl:  db 0x7A, 0x0B, 0x13, 0xF2  ; C5 = +0.00848864
 ROM_END:
 
 ; =============================================================================
-; RESET VECTOR  at 0xFFF0 - ROM version
+; RESET VECTOR  at 0xFFF0
 ; 8086 resets to CS=0xFFFF IP=0x0000 -> phys 0xFFFF0.
 ; =============================================================================
 %ifndef __YASM_MAJOR__
         org 0xFFF0
-        cld
 %endif
 
 reset_vec:
+        cld
         ; Configure 8755 Port A: bit1=RX(input), all others output; TX idles high
         mov  al, 0xFD
         out  DDR_A, al
         mov  al, TX
         out  PORT_A, al
 
-%ifdef __YASM_MAJOR__
-        jmp  start	; same segment
-%else
-        ; FAR JMP to CS=0xF000 IP=0x0000  (opcode: EA 00 00 00 F0)
+        ; FAR JMP (opcode: EA)
         db   0xEA
-        dw   0x0000             ; IP
-        dw   0xF000             ; CS
-%endif
-
-        times 4096-($-start) db 0xFF    ; pad to exactly 4 KB
+        dw   ORIGIN             ; IP
+        dw   0x0000             ; CS
