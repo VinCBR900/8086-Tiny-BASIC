@@ -25,9 +25,27 @@
     carry v3 was 1, that addition wrapped to 0 *inside the narrow type*
     before ever being widened for the subtraction, silently losing the
     borrow-out -- SBB would report CF=0 when the correct result is CF=1.
+    Confirmed via direct trace (source-level, not just black-box): an
+    8088 BASIC interpreter's FLT_DIV loop got its quotient stuck mid-
+    computation whenever the divisor's mantissa was all-0xFF bytes
+    (e.g. 32767 = 0x7FFF), which forced exactly this src=0xFF/CF=1 case
+    on the internal SBB chain, corrupting the result.
     Fixed by widening to a separate uint16_t/uint32_t 'src' before
     adding the carry, so the intermediate sum can't overflow before the
     subtraction sees it. See flag_sbb8/flag_sbb16 below.
+
+  LOCAL BUGFIX 2 (this bundle):
+    cpu_registerIntCallback() assigned its 'void (*cb)(CPU_t*, uint8_t)'
+    parameter directly into cpu->int_callback[], which cpu.h declares as
+    'void (*)(void*, uint8_t)' (CPU_t isn't defined yet at that point in
+    the header, so it uses void* -- see cpu.h's comment there). GCC only
+    warns about the resulting incompatible-function-pointer-types
+    mismatch, but Clang (as used by Emscripten/emcc) treats it as a hard
+    error, which broke the WebAssembly build without ever affecting the
+    native gcc build. cpu_registerIntCallback() isn't called anywhere in
+    this bundle, so this is otherwise dead code; fixed with an explicit
+    cast at the assignment to match the header's declared signature. See
+    cpu_registerIntCallback() below.
 */
 
 #include <stdint.h>
@@ -3298,5 +3316,5 @@ void cpu_exec(CPU_t* cpu, uint32_t execloops) {
 }
 
 void cpu_registerIntCallback(CPU_t* cpu, uint8_t interrupt, void (*cb)(CPU_t*, uint8_t)) {
-	cpu->int_callback[interrupt] = cb;
+	cpu->int_callback[interrupt] = (void (*)(void*, uint8_t))cb;
 }
