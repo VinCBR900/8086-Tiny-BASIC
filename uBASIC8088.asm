@@ -78,10 +78,10 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.8.2 (2026-08-14)  28 bytes free
+;   v1.8.2 (2026-08-14)  8 bytes free
 ;     - INPUT_LINE: buffer-full keystrokes >62 chars were silently dropped.
-;       Added a BELL primitive and sound it once per rejected keystroke when at
-;       capacity.
+;       Added a BELL for each rejected keystroke at capacity.
+;     - Removed HELP, replaced with HEX$ in PRINT to show unsigned 16bit value. 
 ;   v1.8.1 (2026-08-14)  20 bytes free
 ;     - Added separate demo only mem clear to START instead of calling DO_NEW.
 ;     - EDITLN: NEW then line entry hang - fixed by trusting raw memory compare 
@@ -238,14 +238,14 @@ TK_REM:         equ 0x87
 TK_END:         equ 0x88
 TK_LET:         equ 0x89
 TK_POKE:        equ 0x8A
-TK_FREE:        equ 0x8B
+; TK_FREE:        equ 0x8B ; this is the 18th so now 17
 TK_HELP:        equ 0x8C
 TK_GOSUB:       equ 0x8D
 TK_RETURN:      equ 0x8E
 TK_FOR:         equ 0x8F
 TK_NEXT:        equ 0x90
 TK_OUT:         equ 0x91
-NUM_TOKENS:     equ 18          ; count: TK_PRINT (0x80) .. TK_OUT (0x91)
+NUM_TOKENS:     equ 17          ; count: TK_PRINT (0x80) .. TK_OUT (0x91)
 
 TK_THEN:        equ 0x93        ; --- sub-keywords (not in st_tab, not dispatched) ---
 TK_TO:          equ 0x94
@@ -736,6 +736,35 @@ dl_eol:
         jmp  dl_lp
 
 ; =============================================================================
+; DO_FREE  print free program-store bytes 
+; (Moved BEFORE do_help to allow do_help to fall through to dp_nl)
+; Inputs  : (none)
+; Clobbers: AX, SI
+; =============================================================================
+do_free:
+        mov  ax, PROGRAM_TOP
+        sub  ax, [PROG_END]
+        call num_space
+        mov  si, kw_free
+        call dp_str
+dp_nl:
+        jmp new_line           ; tail-call
+
+; =============================================================================
+; DO_HELP  print all keywords
+; Inputs  : (none)
+; Clobbers: AX, SI
+; =============================================================================
+;do_help:
+;        mov  si, kw_tab_start
+;dh_lp:
+;        call dp_str
+;        call output_space
+;        cmp  byte [si], 0       ; sentinel?
+;        jne  dh_lp
+;        jmp  short dp_nl        ; Jump to the shared newline tail-call
+
+; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
 ; Items: "string literal", CHR$(n), TAB(n), expression.
 ; Trailing ';' suppresses CR+LF.
@@ -773,12 +802,41 @@ dp_chrs:
 dp_tab:
         mov  bx, tab_tab
         call kw_match
-        jc   dp_num
+        jc   dp_hex             
         call eat_paren_expr
         xchg ax, cx
 tab_loop:
         call output_space
         loop tab_loop
+        jmp  short dp_after
+
+; =============================================================================
+; DP_HEX  HEX$(n) 
+; =============================================================================
+dp_hex:
+        mov  bx, hex_tab        
+        call kw_match
+        jc   dp_num             ; If it's not HEX$, fall down to number check
+        call eat_paren_expr     ; Get value into AX
+        xchg ax, bx             ; Put value into BX (1-byte opcode)
+        
+        mov  al, '$'            ; AL = '$' for the very first output
+        mov  cx, 0x0404         ; CH = 4 (Loop count), CL = 4 (Rotate count)
+hex_loop:
+        call output             ; Pass 0 prints '$', Passes 1-4 print Hex chars
+        rol  bx, cl             ; Rotate top nibble into the bottom of BL
+        mov  al, bl
+        and  al, 0x0F           ; Isolate the nibble (0x00 to 0x0F)
+        
+        ; --- 6-Byte Magic Hex-to-ASCII Conversion ---
+        add  al, 0x90
+        daa
+        adc  al, 0x40
+        daa
+        ; --------------------------------------------
+        
+        dec  ch                 ; CH goes 4 -> 3 -> 2 -> 1 -> 0 -> -1
+        jns  hex_loop           ; Loops exactly 5 times (when CH drops to FF, it stops)
         jmp  short dp_after
 
 dp_num:
@@ -795,35 +853,6 @@ dp_after:
         jne  dp_top             ; If not end of line, loop back up
 dp_ret:
         ret                     ; End of line after ';', return without newline
-
-; =============================================================================
-; DO_FREE  print free program-store bytes 
-; (Moved BEFORE do_help to allow do_help to fall through to dp_nl)
-; Inputs  : (none)
-; Clobbers: AX, SI
-; =============================================================================
-do_free:
-        mov  ax, PROGRAM_TOP
-        sub  ax, [PROG_END]
-        call num_space
-        mov  si, kw_free
-        call dp_str
-        jmp  short dp_nl        ; Jump to the shared newline tail-call
-
-; =============================================================================
-; DO_HELP  print all keywords
-; Inputs  : (none)
-; Clobbers: AX, SI
-; =============================================================================
-do_help:
-        mov  si, kw_tab_start
-dh_lp:
-        call dp_str
-        call output_space
-        cmp  byte [si], 0       ; sentinel?
-        jne  dh_lp
-dp_nl:
-        jmp new_line           ; tail-call
 
 ; =============================================================================
 ; POKE_OUT_HLPR  parse "<addr>, <val>" pair shared by DO_POKE and DO_OUT
@@ -1997,25 +2026,26 @@ kw_end:     db 0x45,0x4E,T_D                   ; END
 kw_let:     db 0x4C,0x45,T_T                   ; LET
 kw_poke:    db 0x50,0x4F,0x4B,T_E             ; POKE
 kw_free:    db 0x46,0x52,0x45,T_E             ; FREE
-kw_help:    db 0x48,0x45,0x4C,T_P             ; HELP
+;kw_help:    db 0x48,0x45,0x4C,T_P             ; HELP
 kw_gosub:   db 0x47,0x4F,0x53,0x55,T_B        ; GOSUB
 kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N   ; RETURN
 kw_for:     db 0x46,0x4F,T_R                  ; FOR
 kw_next:    db 0x4E,0x45,0x58,T_T             ; NEXT
 kw_out:     db 0x4F,0x55,T_T                  ; OUT
-kw_to:      db 0x54,T_O                        ; TO
+kw_to:      db 0x54,T_O                       ; TO
 kw_step:    db 0x53,0x54,0x45,T_P             ; STEP
 ; --- not statements; included for HELP output ---
 kw_then:    db 0x54,0x48,0x45,T_N             ; THEN
 kw_chrs:    db 0x43,0x48,0x52,T_DS            ; CHR$
 kw_peek:    db 0x50,0x45,0x45,T_K             ; PEEK
 kw_usr:     db 0x55,0x53,T_R                  ; USR
-kw_in:      db 0x49,T_N                        ; IN
+kw_in:      db 0x49,T_N                       ; IN
 kw_tab:     db 0x54,0x41,T_B                  ; TAB
 kw_abs:     db 0x41,0x42,T_S                  ; ABS
 kw_rnd:     db 0x52,0x4E,T_D                  ; RND
 kw_not:     db 0x4E,0x4F,T_T                  ; NOT
-            db 0                               ; sentinel
+kw_hex:     db 0x48,0x45,0x58,T_DS            ; HEX$
+            db 0                              ; sentinel
 
 ; =============================================================================
 ; TOKEN -> KEYWORD STRING POINTER TABLE  (same order as st_tab / TK_xx)
@@ -2023,7 +2053,8 @@ kw_not:     db 0x4E,0x4F,T_T                  ; NOT
 tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
-        dw kw_help, kw_gosub, kw_return
+        ;dw kw_help, 
+        dw kw_gosub, kw_return
         dw kw_for, kw_next, kw_out
         dw 0                     ; terminate tk_kw_tab scan (else TOKENIZE
                                   ; walks into then_tab/to_tab/step_tab/... below)
@@ -2035,6 +2066,7 @@ step_tab:   dw kw_step
 ; PRINT-only functions (single entry each; matched individually, not iterated)
 chrs_tab:   dw kw_chrs
 tab_tab:    dw kw_tab
+hex_tab:    dw kw_hex
 
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
@@ -2048,12 +2080,12 @@ CRLF:       db 0x0D, 0x0A + 0x80
 st_tab:
         dw do_print,  do_if,     do_goto,   do_list,  do_run,   do_new
         dw do_input,  do_rem,    do_end,    do_let,   do_poke,  do_free
-        dw do_help,   do_gosub,  do_return, do_for,   do_next,  do_out
+        ;dw do_help,   
+        dw do_gosub,  do_return, do_for,   do_next,  do_out
 
 ; =============================================================================
 ; OPERATOR TABLES  {char(1), handler_ptr(2), ...}, 0x00 sentinel
 ; =============================================================================
-
 tab_add:                        ; additive level
         db '+'
         dw math_add
