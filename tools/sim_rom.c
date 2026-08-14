@@ -12,13 +12,66 @@
 #endif
 
 /*
- * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC
+ * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC (v1.4)
  * Leverages Mike Chamber's XTulator project cpu core.
  * Compright Vincent Crabtree 2026, MIT License
  *
  * ---------------------------------------------------------------------------
  * VERSION HISTORY
  * ---------------------------------------------------------------------------
+ * v1.4 : Fixed getchar/putchar hostcall trap silently never firing for ROMs
+ *          whose reset stub far-jumps to a non-zero CS that is nonetheless
+ *          address-equivalent to CS=0 under this sim's flat/16-bit-masked
+ *          memory model (e.g. CS=0xF000:IP=0x0000, as used by a real-
+ *          hardware-style reset vector) -- the trap's gate literally
+ *          checked `cpu.segregs[regcs] == 0`, which only matched a ROM
+ *          whose reset stub happened to jump within CS=0x0000 (flat
+ *          model; e.g. uBASIC8088.asm's `dw ORIGIN / dw 0x0000` far jump)
+ *          and missed the equally-valid `dw 0x0000 / dw 0xF000` style
+ *          (e.g. miniBASIC8088.asm), leaving GETCH/PUTCH un-intercepted:
+ *          the ROM fell through into its real, port-stubbed bitbang UART
+ *          code instead, producing no output and hanging on input.
+ *          Replaced with cs_is_flat_zero(), which accepts any CS whose
+ *          segment base (CS<<4) wraps to 0 mod 0x10000 -- i.e. any of the
+ *          16 segments (0x0000, 0x1000, ... 0xF000) that are physically
+ *          equivalent to CS=0 in this memory model, not just CS==0
+ *          itself. No change to --load/--entry semantics or ASM/binary
+ *          mode handling.
+ * v1.3 : Fixed reset entry point. cpu.ip was hardcoded to load_addr, i.e.
+ *          "wherever the image was placed" rather than "where an 8088
+ *          actually starts fetching after reset" -- correct only by
+ *          coincidence for a 2 KiB image (load_addr happens to equal the
+ *          ROM's start label there) and wrong for a full 64 KiB image
+ *          (load_addr = 0x0000, landing in the VARS/pad area instead of
+ *          the reset stub). Added --entry ADDR, defaulting to 0xFFF0 --
+ *          an 8088 resets to phys 0xFFFF0, which this sim's flat 16-bit
+ *          model (CS forced to 0 at start, see below) truncates to
+ *          0xFFF0, matching where the ROM source's own "org 0xFFF0"
+ *          reset stub actually sits. --load is unaffected: it still only
+ *          controls where the image bytes are placed in memory.
+ * v1.2 : Fixed ASM-mode invocation, which was completely non-functional:
+ *          - Makefile built tinyasm from a nonexistent "tools/ins.c" (the
+ *            file is just "ins.c" at the project root) and hardcoded a ROM
+ *            source filename ("uBASIC8088.asm") that doesn't exist in this
+ *            project -- so `make` could not even produce a tinyasm binary
+ *            for sim_rom to find beside itself, regardless of anything in
+ *            this file. That was the actual root cause of "ASM mode not
+ *            working"; both are fixed in the Makefile, not here.
+ *        Portability fixes for Win11/TCC (64-bit) as well as Linux/gcc:
+ *          - is_asm_file() used strcasecmp(), which is POSIX-only (not
+ *            declared under -std=c11 without _POSIX_C_SOURCE on glibc, and
+ *            entirely absent from the Windows/MSVCRT headers TCC targets
+ *            on Windows). Replaced with a local, portable case-insensitive
+ *            compare.
+ *          - run_tinyasm()'s system() call quoted the tool path and each
+ *            argument individually ("tool" "arg1" "arg2" ...). On Windows,
+ *            cmd.exe (which system() shells out to) applies a special rule
+ *            when a command line both starts and ends with a double quote,
+ *            and can misparse a path containing spaces (e.g. anything
+ *            under "C:\Users\<name>\...") as a result. Fixed by wrapping
+ *            the entire command line in one more pair of quotes on
+ *            _WIN32 builds, which is the standard workaround; no change
+ *            on non-Windows builds.
  * v1.1 : Added three debug features for inspecting MBF4 float-library bugs
  *        without rebuilding instrumented test files each time:
  *          --trace LO:HI / --trace-range LO:HI : scope tracing to an
@@ -62,9 +115,16 @@
  *       2 KiB image  -> 0xF800
  *       64 KiB image -> 0x0000
  *
+ * Default entry point (cpu.ip at power-on):
+ *   If --entry is omitted, cpu.ip = 0xFFF0 always, regardless of image
+ *   size or --load -- this models the 8088 reset vector (phys 0xFFFF0)
+ *   under this simulator's flat, CS-forced-to-0 memory model. --load only
+ *   controls where the image is placed; --entry only controls where
+ *   execution starts. They are independent.
+ *
  * Usage:
  *   sim_rom <program.asm>
- *            [--load ADDR]
+ *            [--load ADDR] [--entry ADDR]
  *            [--trace [LO:HI]]
  *            [--trace-range LO:HI]
  *            [--break-at ADDR[:N]] [--break-continue]
@@ -74,7 +134,7 @@
  *   sim_rom <program.bin>
  *            --getchar ADDR
  *            --putchar ADDR
- *            [--load ADDR]
+ *            [--load ADDR] [--entry ADDR]
  *            [--trace [LO:HI]]
  *            [--trace-range LO:HI]
  *            [--break-at ADDR[:N]] [--break-continue]
@@ -176,9 +236,20 @@ static int parse_u16(const char *s, uint16_t *out) {
     return 0;
 }
 
+/* Portable case-insensitive compare: strcasecmp is POSIX-only (absent on
+ * Windows/MSVCRT, which TCC targets on Windows) -- avoid it entirely
+ * rather than relying on a platform-specific alternative. */
+static int ci_str_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 static int is_asm_file(const char *path) {
     const char *dot = strrchr(path, '.');
-    return dot && strcasecmp(dot, ".asm") == 0;
+    return dot && ci_str_equal(dot, ".asm");
 }
 
 static void lower_copy(char *dst, size_t dst_sz, const char *src) {
@@ -251,6 +322,28 @@ static int resolve_addr_pair_token(const char *s, const char *lst_file, uint16_t
     return 0;
 }
 
+/* =============================================================================
+ * CS_IS_FLAT_ZERO  true if CS's segment base wraps to 0 in this sim's
+ *   16-bit-masked flat memory model (segbase(CS) = CS<<4; mem[] is indexed
+ *   mod 0x10000 -- see cpu_read()/cpu_write() above). Any CS that is a
+ *   multiple of 0x1000 (0x0000, 0x1000, ... 0xF000) satisfies this, since
+ *   CS<<4 is then an exact multiple of 0x10000 and contributes no offset,
+ *   so code/data addressing behaves identically to CS=0x0000.
+ *   Used to gate the getchar/putchar hostcall trap in main()'s run loop:
+ *   some ROMs reset with a flat CS=0x0000, others with a real-hardware-
+ *   style far jump to e.g. CS=0xF000:IP=0x0000 -- both address-equivalent
+ *   here, but v1.3 and earlier only recognised the literal CS==0 case,
+ *   silently disabling GETCH/PUTCH interception for any ROM using the
+ *   latter convention (the ROM would fall through into its real, port-
+ *   stubbed I/O code instead, producing no output and hanging on input).
+ * Inputs  : cs -- CPU's current CS segment register value
+ * Outputs : 1 if CS's segment base is address-equivalent to CS=0, else 0
+ * Clobbers: none
+ * ============================================================================= */
+static int cs_is_flat_zero(uint16_t cs) {
+    return (((uint32_t)cs << 4) & 0xFFFFu) == 0;
+}
+
 static int get_dir_from_argv0(const char *argv0, char *out, size_t out_sz) {
     const char *slash1 = strrchr(argv0, '/');
     const char *slash2 = strrchr(argv0, '\\');
@@ -284,16 +377,29 @@ static int run_tinyasm(const char *argv0, const char *asm_file, char *out_bin, s
     snprintf(out_lst, out_lst_sz, "%s.lst", asm_file);
 
     char cmd[4096];
+#ifdef _WIN32
+    /* cmd.exe (which system() invokes on Windows) special-cases a command
+     * line that both starts and ends with a double quote, and can mis-
+     * parse it when the path contains spaces. Wrapping the whole line in
+     * one extra pair of quotes is the standard workaround. Not needed
+     * (and not applied) on POSIX, where the shell has no such quirk. */
+    snprintf(cmd, sizeof(cmd), "\"\"%s\" -f bin \"%s\" -l \"%s\" -o \"%s\"\"", tool, asm_file, out_lst, out_bin);
+#else
     snprintf(cmd, sizeof(cmd), "\"%s\" -f bin \"%s\" -l \"%s\" -o \"%s\"", tool, asm_file, out_lst, out_bin);
+#endif
     return system(cmd) == 0 ? 0 : -3;
 }
 
 int main(int argc, char **argv) {
     const char *input_file = NULL;
     int load_addr_set = 0;
+    int entry_set = 0;
     int getchar_set = 0;
     int putchar_set = 0;
     uint16_t load_addr = 0;
+    uint16_t entry_addr = 0xFFF0;   /* 8088 reset: phys 0xFFFF0, truncated to
+                                        this sim's flat 16-bit model -> 0xFFF0.
+                                        Overridable via --entry for debugging. */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) {
@@ -324,6 +430,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
             if (parse_u16(argv[++i], &load_addr) != 0) { fprintf(stderr, "Invalid --load value\n"); return 1; }
             load_addr_set = 1;
+        } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
+            if (parse_u16(argv[++i], &entry_addr) != 0) { fprintf(stderr, "Invalid --entry value\n"); return 1; }
+            entry_set = 1;
         } else if (strcmp(argv[i], "--getchar") == 0 && i + 1 < argc) {
             if (parse_u16(argv[++i], &g_getchar_addr) != 0) { fprintf(stderr, "Invalid --getchar value\n"); return 1; }
             getchar_set = 1;
@@ -338,7 +447,7 @@ int main(int argc, char **argv) {
     if (!input_file) {
         fprintf(stderr,
             "Usage:\n"
-            "  %s <program.asm> [--load ADDR] [--trace[ LO:HI]] [--cycles N]\n"
+            "  %s <program.asm> [--load ADDR] [--entry ADDR] [--trace[ LO:HI]] [--cycles N]\n"
             "                    [--trace-range LO:HI] [--break-at ADDR[:N]] [--break-continue]\n"
             "                    [--watch ADDR:LEN]\n"
             "  %s <program.bin> --getchar ADDR --putchar ADDR [above flags also apply]\n\n"
@@ -349,7 +458,10 @@ int main(int argc, char **argv) {
             "Binary mode:\n"
             "  * Requires both --getchar and --putchar addresses.\n"
             "  * getchar is blocking and returns AL; putchar outputs AL.\n"
-            "  * Default load address is 0x10000 - file_size (2 KiB -> 0xF800, 64 KiB -> 0x0000).\n\n"
+            "  * Default load address is 0x10000 - file_size (2 KiB -> 0xF800, 64 KiB -> 0x0000).\n"
+            "  * Default entry point (cpu.ip) is 0xFFF0 (the 8088 reset vector, phys 0xFFFF0,\n"
+            "    truncated to this sim's flat/CS=0 model), independent of --load. Override\n"
+            "    with --entry ADDR.\n\n"
             "Debug flags:\n"
             "  --trace                  Trace every instruction: CS:IP and full register/flag dump.\n"
             "  --trace LO:HI            Same, but only while IP is within [LO,HI].\n"
@@ -446,7 +558,8 @@ int main(int argc, char **argv) {
     signal(SIGINT, sigint_handler);
     cpu_reset(&cpu);
     cpu.segregs[regcs] = cpu.segregs[regds] = cpu.segregs[reges] = cpu.segregs[regss] = 0;
-    cpu.ip = load_addr;
+    cpu.ip = entry_addr;   /* defaults to the 8088 reset vector (0xFFF0); see entry_addr init above */
+    (void)entry_set;
 
     for (int cycles = 0; cycles < opt_maxcycles; cycles++) {
         if (nmi_pending) { nmi_pending = 0; cpu_intcall(&cpu, 2); }
@@ -473,7 +586,7 @@ int main(int argc, char **argv) {
 
         if (cpu.hltstate) break;
 
-        if (cpu.segregs[regcs] == 0) {
+        if (cs_is_flat_zero(cpu.segregs[regcs])) {
             if (cpu.ip == g_putchar_addr) {
                 putchar((int)cpu.regs.byteregs[regal]); fflush(stdout);
                 uint16_t sp = cpu.regs.wordregs[regsp];
