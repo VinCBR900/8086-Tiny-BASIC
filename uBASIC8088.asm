@@ -78,7 +78,7 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.8.2 (2026-08-14)  8 bytes free
+;   v1.8.2 (2026-08-14)  4 bytes free
 ;     - INPUT_LINE: buffer-full keystrokes >62 chars were silently dropped.
 ;       Added a BELL for each rejected keystroke at capacity.
 ;     - Removed HELP, replaced with HEX$ in PRINT to show unsigned 16bit value. 
@@ -238,14 +238,14 @@ TK_REM:         equ 0x87
 TK_END:         equ 0x88
 TK_LET:         equ 0x89
 TK_POKE:        equ 0x8A
-; TK_FREE:        equ 0x8B ; this is the 18th so now 17
+TK_FREE:        equ 0x8B
 TK_HELP:        equ 0x8C
 TK_GOSUB:       equ 0x8D
 TK_RETURN:      equ 0x8E
 TK_FOR:         equ 0x8F
 TK_NEXT:        equ 0x90
 TK_OUT:         equ 0x91
-NUM_TOKENS:     equ 17          ; count: TK_PRINT (0x80) .. TK_OUT (0x91)
+NUM_TOKENS:     equ 18          ; count: TK_PRINT (0x80) .. TK_OUT (0x91)
 
 TK_THEN:        equ 0x93        ; --- sub-keywords (not in st_tab, not dispatched) ---
 TK_TO:          equ 0x94
@@ -287,7 +287,7 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 
 SHOWCASE_DATA:
         ; ── Feature demos ──────────────────────────────────────────────────────
-        db 0x0A,0x00, 0x87,"uBASIC 8088 v1.8.0 showcase",0x0D            ; 10  REM
+        db 0x0A,0x00, 0x87,"uBASIC8088 showcase",0x0D            ; 10  REM
         db 0x14,0x00, 0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D            ; 20  PRINT
         db 0x1E,0x00, 0x80,0x22,"2+3=",0x22,";2+3;",0x22,"  6*7=",0x22,";6*7",0x0D      ; 30
         db 0x28,0x00, 0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 40
@@ -747,22 +747,9 @@ do_free:
         call num_space
         mov  si, kw_free
         call dp_str
+do_help:
 dp_nl:
         jmp new_line           ; tail-call
-
-; =============================================================================
-; DO_HELP  print all keywords
-; Inputs  : (none)
-; Clobbers: AX, SI
-; =============================================================================
-;do_help:
-;        mov  si, kw_tab_start
-;dh_lp:
-;        call dp_str
-;        call output_space
-;        cmp  byte [si], 0       ; sentinel?
-;        jne  dh_lp
-;        jmp  short dp_nl        ; Jump to the shared newline tail-call
 
 ; =============================================================================
 ; DO_PRINT  PRINT [item [; item] ...]
@@ -2026,7 +2013,6 @@ kw_end:     db 0x45,0x4E,T_D                   ; END
 kw_let:     db 0x4C,0x45,T_T                   ; LET
 kw_poke:    db 0x50,0x4F,0x4B,T_E             ; POKE
 kw_free:    db 0x46,0x52,0x45,T_E             ; FREE
-;kw_help:    db 0x48,0x45,0x4C,T_P             ; HELP
 kw_gosub:   db 0x47,0x4F,0x53,0x55,T_B        ; GOSUB
 kw_return:  db 0x52,0x45,0x54,0x55,0x52,T_N   ; RETURN
 kw_for:     db 0x46,0x4F,T_R                  ; FOR
@@ -2053,8 +2039,7 @@ kw_hex:     db 0x48,0x45,0x58,T_DS            ; HEX$
 tk_kw_tab:
         dw kw_print, kw_if, kw_goto, kw_list, kw_run, kw_new
         dw kw_input, kw_rem, kw_end, kw_let, kw_poke, kw_free
-        ;dw kw_help, 
-        dw kw_gosub, kw_return
+        dw kw_free, kw_gosub, kw_return
         dw kw_for, kw_next, kw_out
         dw 0                     ; terminate tk_kw_tab scan (else TOKENIZE
                                   ; walks into then_tab/to_tab/step_tab/... below)
@@ -2080,8 +2065,7 @@ CRLF:       db 0x0D, 0x0A + 0x80
 st_tab:
         dw do_print,  do_if,     do_goto,   do_list,  do_run,   do_new
         dw do_input,  do_rem,    do_end,    do_let,   do_poke,  do_free
-        ;dw do_help,   
-        dw do_gosub,  do_return, do_for,   do_next,  do_out
+        dw do_help,   do_gosub,  do_return, do_for,   do_next,  do_out
 
 ; =============================================================================
 ; OPERATOR TABLES  {char(1), handler_ptr(2), ...}, 0x00 sentinel
