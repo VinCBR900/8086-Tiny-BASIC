@@ -25,11 +25,11 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
 
 ### Functionality
 **Statements**: 
-  - `DELAY`, `END`, `FOR`..`TO`..`[STEP]` `NEXT`, `GOTO`, `GOSUB` `RETURN`, `IF` .. `THEN`, `INPUT`, `LET`, `OUT`, `POKE`, `PRINT [TAB(spaces)] [;] [CHR$(n)]`, `REM`
+  - `END`, `FOR`..`TO`..`[STEP]` `NEXT`, `GOTO`, `GOSUB` `RETURN`, `IF` .. `THEN`, `INPUT`, `LET`, `OUT`, `POKE`, `PRINT [TAB(spaces)] [;] [CHR$(n)]`, `REM`
   - `FREE`, `HELP`, `LIST [start,end]`, `NEW`, `RUN`   
 
 **Expressions**:  
-  - Arithmetic: `+` `-` `*` `/` `% (Mod)`;
+  - Arithmetic: `+` `-` `*` `/` `%` (Mod)  `^` (Power)
   - Relational `<` `>` `<=` `>=` `<>`, unary`-` and `= (assignment)` 
   - Bitwise: `&` (and) `|` (or) `NOT(val)` (not)
   - functions: `PEEK(addr)`, `USR(addr)`, `IN(io)`, `ABS(val)`, `RND(limit)` 
@@ -37,9 +37,11 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
 
 **Numbers**: signed 16-bit (`-32768..32767`)
 
-**Multi-Statement**: colon separator `:` (Does not support `GOSUB`/`RETURN` or `FOR`/`NEXT` on same line)
-
 **Errors**: `?0` syntax, `?1` undef line, `?2` div/zero, `?3` out of memory, `?4` bad variable, `?5` `RETURN` without `GOSUB`, `?6` `NEXT` without `FOR`, `?B` break into program (ROM version)
+
+**Notes**
+  * `^` Power supports negative base but not negative Exponent
+  * Multi-Statement - colon separator `:` **Not Supported**
 
 ### Build instructions 
 
