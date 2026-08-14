@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC 8088  v1.7.9
+; uBASIC 8088  v1.8.2
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; Tiny BASIC interpreter for the 8088/8086.  Single-segment, integer-only.
@@ -22,7 +22,7 @@
 ;               Functions   : ABS(n) IN(port) NOT(n) PEEK(addr) RND(n) USR(addr)
 ;               Variables   : A..Z (signed 16-bit)
 ; Numbers     : signed 16-bit  (-32768 .. 32767)
-; Multi-stmt  : colon separator ':'  (avoid FOR/NEXT or GOSUB/RETURN on same line)
+; Multi-stmt  : NOT supported. One statement per line. 
 ; Errors      : ?0 syntax   ?1 undefined line   ?2 divide/zero   ?3 out of memory
 ;               ?4 bad variable   ?5 RETURN without GOSUB   ?6 NEXT without FOR
 ;
@@ -78,16 +78,27 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
-;   v1.7.9 (2026-08-13)  24 bytes free  [archived prior as uBASIC8088-v1.7.8.asm]
+;   v1.8.2 (2026-08-14)  28 bytes free
+;     - INPUT_LINE: buffer-full keystrokes >62 chars were silently dropped.
+;       Added a BELL primitive and sound it once per rejected keystroke when at
+;       capacity.
+;   v1.8.1 (2026-08-14)  20 bytes free
+;     - Added separate demo only mem clear to START instead of calling DO_NEW.
+;     - EDITLN: NEW then line entry hang - fixed by trusting raw memory compare 
+;       when DI is still within DI < PROG_END.
+;     - EDITLN: replacing an existing line (LIST/GOTO-visible number already
+;       present) calls DELINE to close the gap first. DELINE's own header
+;       documents "Clobbers: ... DX" (DX holds the byte-shift amount for
+;       SLIDE_DATA), but EDITLN still read DX as the line number immediately
+;       afterward for the INSLINE call, storing the leftover shift amount
+;       (old line length, negated) as the line number instead. 
+;   v1.8.0 (2026-08-13)  43 bytes free
+;     - REMOVED partial multi-statement ':' support to matc 65C02/2650 variants
+;     - SHOWCASE: line 220 (D=I:A=C:B=D:E=0) split into 220-223; line 250
+;       (B=2*A*B/64+D:A=T) split into 250-251.
+;   v1.7.9 (2026-08-13)  24 bytes free  
 ;     - input_line/ipl_nbs: v1.7.8 made EVERY LF byte silently discarded,
-;       not just a stray CRLF remainder. Any terminal whose Enter key sends
-;       bare LF (no CR) -- common over raw serial/pipes -- had every line
-;       submission eaten with no echo, no error, no feedback: indistinguishable
-;       from a hang after typing LIST/RUN/etc. Fixed by only discarding LF
-;       when it's the FIRST byte of a new line (cx==0, i.e. genuinely a
-;       leftover CRLF remainder); an LF arriving after real characters have
-;       been typed (cx>0) is now treated as a line terminator, same as CR
-;       (stores 0x0D so the rest of the interpreter sees its usual format).
+;       Fixed by only discarding first LF of a new line (cx==0).
 ;   v1.7.8 (2026-08-13)  32 bytes free
 ;     - input_line: stray LF (0x0A) left over from a CRLF line terminator was
 ;       falling through to the "ordinary character" path in ipl_nbs -- echoed,
@@ -156,6 +167,7 @@
 ORIGIN:         equ 0xF800              ; ROM base (also YASM segment)
 RAM_BASE:       equ 0x0000
 RAM_SIZE:       equ 2048                ; 2 KB RAM (A12=0 selects RAM)
+MAX_BUF:        equ 62                  ; maximum input length
 
 ; =============================================================================
 ; RAM LAYOUT  (all offsets relative to RAM_BASE)
@@ -275,7 +287,7 @@ BAUD:           equ 57          ; bit-period loop count: 17 cy/iter @5MHz ~4800 
 
 SHOWCASE_DATA:
         ; ── Feature demos ──────────────────────────────────────────────────────
-        db 0x0A,0x00, 0x87,"uBASIC 8088 v1.7.8 showcase",0x0D            ; 10  REM
+        db 0x0A,0x00, 0x87,"uBASIC 8088 v1.8.0 showcase",0x0D            ; 10  REM
         db 0x14,0x00, 0x80,0x22,"--- ARITHMETIC ---",0x22,0x0D            ; 20  PRINT
         db 0x1E,0x00, 0x80,0x22,"2+3=",0x22,";2+3;",0x22,"  6*7=",0x22,";6*7",0x0D      ; 30
         db 0x28,0x00, 0x80,0x22,"20/4=",0x22,";20/4;",0x22,"  17%5=",0x22,";17%5",0x0D  ; 40
@@ -303,10 +315,14 @@ SHOWCASE_DATA:
         db 0xBE,0x00, 0x80,0x22,"--- MANDELBROT ---",0x22,0x0D            ; 190
         db 0xC8,0x00, 0x8F,"I=-64",0x94,"56 ",0x95,"6",0x0D              ; 200 FOR I=-64 TO(0x94) 56 STEP(0x95) 6
         db 0xD2,0x00, 0x8F,"C=-128 ",0x94,"16 ",0x95,"4",0x0D             ; 210 FOR C=-128 TO(0x94) 16 STEP(0x95) 4
-        db 0xDC,0x00, "D=I:A=C:B=D:E=0",0x0D                              ; 220 init row
+        db 0xDC,0x00, "D=I",0x0D                                           ; 220 init row
+        db 0xDD,0x00, "A=C",0x0D                                           ; 221
+        db 0xDE,0x00, "B=D",0x0D                                           ; 222
+        db 0xDF,0x00, "E=0",0x0D                                           ; 223
         db 0xE6,0x00, 0x8F,"N=1",0x94,"16",0x0D                          ; 230 FOR N=1 TO(0x94) 16
         db 0xF0,0x00, "T=A^2/64-B^2/64+C",0x0D                            ; 240 iterate
-        db 0xFA,0x00, "B=2*A*B/64+D:A=T",0x0D                             ; 250
+        db 0xFA,0x00, "B=2*A*B/64+D",0x0D                                  ; 250
+        db 0xFB,0x00, "A=T",0x0D                                           ; 251
         db 0x04,0x01, 0x81,"A^2/64+B^2/64>256",0x93,0x8D,"600",0x0D        ; 260 IF THEN(0x93) GOSUB 600
         db 0x0E,0x01, 0x90,"N",0x0D                                        ; 270 NEXT N
         db 0x18,0x01, 0x81,"E>0",0x93,0x80,"CHR$(E+32);",0x0D              ; 280 IF E>0 THEN(0x93) PRINT
@@ -357,13 +373,12 @@ start:
         mov  es, ax
         mov  ss, ax
         mov  sp, STACK_TOP
-        mov  di, RAM_BASE
+        ; Clear variable mem
+        call clr_vars
 
-        call do_new             ; wipe vars
-
-        ; delete next line for real ROM
+        ; Protect showcase - Delete next lines and instead call DO_NEW for real ROM 
         ; PROG_END: just past last showcase byte (excluding sentinel)
-        mov  word [PROG_END], PROGRAM + (SHOWCASE_END - SHOWCASE_DATA) - 2
+        mov  word [PROG_END], SHOWCASE_END - 2
 
         ; Signon banner; fall through to main_loop
         mov  si, str_banner
@@ -389,7 +404,7 @@ main_loop:
         call input_number       ; parse optional line number -> AX
         or   ax, ax
         jne  ml_numbered
-        call stmt_line          ; no line number: execute immediately
+        call stmt               ; no line number: execute immediately
         jmp  short main_loop
 ml_numbered:
         call editln             ; numbered line: store/edit in program
@@ -417,19 +432,6 @@ do_error_nl:
         jmp  main_loop
 
 ; =============================================================================
-; STMT_LINE  execute ':'-separated statements from SI
-; Inputs  : SI -> statement text (tokenised or raw)
-; Clobbers: AX, BX, CX, DX, SI, DI (via stmt)
-; =============================================================================
-stmt_line:
-        call stmt
-        call spaces
-        cmp  byte [si], ':'
-        jne  sl_ret
-        inc  si                 ; consume ':'
-        jmp  stmt_line
-
-; =============================================================================
 ; DO_IF_FALSE  skip remainder of line (IF condition was false)
 ; Inputs  : SI -> chars after condition
 ; Outputs : SI -> CR (not consumed)
@@ -443,15 +445,14 @@ do_if_false:
         ; fall through to peek_line
 
 ; =============================================================================
-; PEEK_LINE  test whether SI is at end-of-statement (CR or ':')
+; PEEK_LINE  test whether SI is at end-of-statement (CR)
+; No multi-statement lines: CR is the only end-of-statement marker.
 ; Inputs  : SI -> current position
-; Outputs : ZF=1 at CR or ':', ZF=0 otherwise
+; Outputs : ZF=1 at CR, ZF=0 otherwise
 ; Clobbers: (none)
 ; =============================================================================
 peek_line:
         call spaces
-        cmp  byte [si], ':'
-        je   sl_ret
         cmp  byte [si], 0x0D
 sl_ret:
         ret
@@ -1303,40 +1304,47 @@ inm_done:
 ; =============================================================================
 input_line:
         mov  di, IBUF
-        xor  cx, cx
+        xor  cx, cx             ; Zeroing
 ipl_lp:
         call input_key
-        cmp  al, 0x08           ; backspace?
-        jne  ipl_nbs
-        or   cx, cx
-        je   ipl_lp             ; buffer empty: ignore
-        dec  di
-        dec  cx
+
+        cmp  al, 0x08           ; Backspace?
+        je   ipl_bs
+        cmp  al, 0x0D           ; CR?
+        je   ipl_cr
+        cmp  al, 0x0A           ; LF?
+        jne  ipl_chkfull
+
+        ; --- LF Handler ---
+        jcxz ipl_lp             ; Buffer empty? Ignore stray LF
+        mov  al, 0x0D           ; Convert LF to CR
+                                ; FALLTHROUGH directly into ipl_cr!
+
+ipl_cr: ; --- CR / End of Line ---
+        stosb                   ; Store the CR (1 byte)
+        mov  si, IBUF
+        jmp  short new_line
+
+ipl_chkfull: ; --- Normal Character ---
+        cmp  cx, MAX_BUF             ; Buffer full?
+        jb   ipl_store          ; No: go store it
+        call bell               ; Yes: audible feedback
+        jmp  short ipl_lp
+
+ipl_store:
+        call output             ; Echo char
+        stosb                   ; Store char in [di], di++ (1 byte)
+        inc  cx                 ; (1 byte)
+        jmp  short ipl_lp
+
+ipl_bs: ; --- Backspace Handler ---
+        jcxz ipl_lp             ; Buffer empty? Ignore backspace
+        dec  di                 ; (1 byte)
+        dec  cx                 ; (1 byte)
         call backsp
         call output_space
         call backsp
         jmp  short ipl_lp
-
-ipl_nbs:
-        cmp  al, 0x0A           ; LF?
-        jne  ipl_chkcr
-        or   cx, cx             ; any chars already stored this line?
-        je   ipl_lp             ; no: stray CRLF remainder -- ignore silently
-        mov  al, 0x0D           ; yes: bare LF is this terminal's line end --
-        jmp  short ipl_cr       ;      treat exactly like CR (store 0x0D)
-ipl_chkcr:
-        cmp  al, 0x0D           ; CR?
-        je   ipl_cr
-        cmp  cx, 62             ; buffer full? (62 chars + CR + guard byte)
-        jnb  ipl_lp
-        call output
-        stosb
-        inc  cx
-        jmp  ipl_lp
-ipl_cr:
-        stosb
-        mov  si, IBUF
-	jmp short new_line
 
 ; =============================================================================
 ; NEW_LINE  emit CR + LF
@@ -1360,6 +1368,9 @@ question:
 backsp:
 	mov al, 0x08
         db 0x3d
+bell:
+        mov  al, 0x07            ; BEL -- audible buffer-full feedback (v1.8.2)
+        db   0x3d
 output_space:
         mov  al, ' '
         jmp  short output             ; tail-call 
@@ -1532,11 +1543,23 @@ el_ldone:
         push bx
         mov  ax, dx
         call find_line          ; DI = insertion point
+        cmp  di, [PROG_END]     ; DI past the logical program end? NEW resets
+        jnb  el_noex            ; PROG_END but leaves old bytes physically
+                                 ; intact (cold boot needs them undisturbed
+                                 ; for the showcase); without this check a
+                                 ; leftover line number here that happens to
+                                 ; match DX looks like a real existing line,
+                                 ; and deleting/re-inserting it walks PROG_END
+                                 ; below PROGRAM, wrapping SLIDE_DATA's byte
+                                 ; count to ~64K on the next insert -- the
+                                 ; reported NEW-then-line-entry hang. (v1.8.1)
         cmp  [di], dx
         jne  el_noex
         push cx
+        push dx                 ; DELINE clobbers DX -- save line number (v1.8.1)
         call deline             ; delete existing line
-        pop  cx
+        pop  dx                 ; restore line number (else INSLINE below
+        pop  cx                 ;  would store DELINE's leftover shift amount)
 el_noex:
         pop  bx
         cmp  byte [bx], 0x0D   ; empty body = delete only
@@ -1632,14 +1655,18 @@ slide_done:
 ; Inputs  : (none)
 ; Clobbers: AX, CX, DI
 ; =============================================================================
-do_new:
-        ; Zero only the vars area (program store holds showcase).
-        mov  cx, PROGRAM / 2    ; 0xB9/2 = 92 words
+clr_vars:
         xor  ax, ax
-        rep  stosw              ; DI increments and stops at PROGRAM
-
-        mov  word [PROG_END], di        ; di contains PROGRAM value
+        xor  di, di                     ; clear ram starting from zero
+        mov  cx, PROGRAM                ; 0xB9 
+        rep  stosb                      ; DI increments and stops at PROGRAM
         mov  word [RND_SEED], 0xACE1    ; seed LFSR
+        ret 
+
+do_new:
+        call clr_vars
+        mov  word [PROG_END], DI   
+        mov  word [DI], ax               ; empty-program sentinel.
         ; fall through to do_end
 ; =============================================================================
 ; DO_END  END statement — stops program execution
@@ -1725,7 +1752,7 @@ run_loop:
         mov  [CURLN], ax
         call next_line_ptr      ; DI -> start of next line
         mov  [RUN_NEXT], di
-        call stmt_line
+        call stmt
         jmp  short run_loop
 
 ; =============================================================================
@@ -2012,7 +2039,7 @@ tab_tab:    dw kw_tab
 ; =============================================================================
 ; STRINGS  (bit-7 terminated)
 ; =============================================================================
-str_banner: db "uBASIC 8088 v1.7.8"
+str_banner: db "uBASIC 8088 v1.8.2"
 CRLF:       db 0x0D, 0x0A + 0x80
 
 ; =============================================================================
