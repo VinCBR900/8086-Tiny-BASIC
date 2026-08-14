@@ -4573,3 +4573,4 @@ reset_vec:
         db   0xEA
         dw   ORIGIN             ; IP
         dw   0x0000             ; CS
+	    dw   0xFEED 			; Pad to exactly 0xffff bytes
