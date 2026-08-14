@@ -7,21 +7,24 @@
 >
 >To be frank, without these agents this work would not have been possible.  
 
-Here we have Tiny BASIC for the 8088 as inspired by Steve Ciarcia's article in BYTE magazine.
+Here we have two Tiny BASICs for the 8088 as inspired by Steve Ciarcia's article in BYTE magazine.
+  * **Tokenzied 16bit signed Tiny BASIC - FAST** - includes `GOSUB`/`RETURN`, `FOR`/`NEXT`,`AND`/`OR`/`XOR`/`NOT`/`HEX$` and bitbang serial in 2kbytes of ROM
+  * **Mini-BASIC 32bit float BASIC - TRIG/Transcendental** - includes `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and `LN`/`EXP`/`LOG`/`SQRT`,`^(Power)` and bitbang serial in 4kbytes of ROM
 
-2kByte **fully functional** version is available below. 4kByte version with floating point support in progress - Obviously this would not fit into an 8755. 
+You can play with these online at the link below - both versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.
+[https://vincbr900.github.io/8086-Tiny-BASIC/](https://vincbr900.github.io/8086-Tiny-BASIC/)
+
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 
-## uBASIC 8088 - 2kbyte Tiny BASIC for Toy 8086/88 Embedded systems
+Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), which is leveraged here.   
+Credit to **XTulator: A portable, open-source 80186 PC emulator, Copyright (C)2020 Mike Chambers**, for the CPU core. See [https://github.com/mikechambers84/XTulator](https://github.com/mikechambers84/XTulator)
+
+## uBASIC 8088 - 2kbyte 16bit signed Int Tiny BASIC for Toy 8086/88 Embedded systems
 
 Target: <=2048 bytes code ROM, 2048/4096 bytes RAM.
 
 Copyright (c) 2026 Vincent Crabtree, MIT License
-
-Originally inspired by the 1980s BYTE magazine article "Ease into 16 bit Computing" by Steve Ciarcia.
-
-Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), which is leveraged here.
 
 ### Functionality
 **Statements**: 
@@ -43,59 +46,8 @@ Credit to [Oscar Toledo's bootBASIC](https://github.com/VinCBR900/bootBASIC), wh
   * `^` Power supports negative base but not negative Exponent
   * Multi-Statement - colon separator `:` **Not Supported**
 
-### Build instructions 
-
-Use the project Makefile to build the ROM image and simulator locally, or copy/paste into 8bitworkshop to run the embedded demo program.
-
-http://8bitworkshop.com/v3.12.1/?redir.html?platform=x86&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2F8086-Tiny-BASIC&file=uBASIC8088.asm
-
-#### Prerequisites
-- C compiler (`cc`/`gcc`/`clang`)
-- `make`
-
-The build uses the bundled `tools/tinyasm.c` assembler which is a subset clone of NASM.
-
-**Build everything**
-```bash
-make
-```
-Builds both the ROM image and simulator.
-
-**Build ROM image**
-```bash
-make rom
-```
-Output: `build/uBASIC_rom.bin` (2KB ROM image).
-
-**Build simulator**
-```bash
-make sim
-```
-Output: `build/sim_rom`.
-
-**Run ROM in simulator**
-```bash
-make rom-run
-```
-Runs `uBASIC8088.asm` in the simulator using tinyasm assembler mode.
-
-
-**Clean artifacts**
-```bash
-make clean
-```
-
-### Memory/hardware notes
-- ORIGIN   = `0xF800` (ROM occupies `0xF800-0xFFFF`, reset stub at `0xFFF0`)
-- RAM_BASE = `0x0000` (RAM `0x0000-0x07FF`)
-- RAM_SIZE = `2048` (2KB)
-- STACK    = `0x0800` (top of RAM)
-- I/O      = bitbang UART via 8755 Port A
-
-Simulator memory model (`tools/sim_rom.c`):
-- `CS=DS=ES=SS=0x0000` (flat single-segment)
-- `addr >= 0xF800 -> ROM[addr & 0x7FF]`
-- `addr <  0xF800 -> RAM[addr & 0x7FF]`
+## To-Do - MiniBASIC8088 - 4kbyte 32bit Float Tiny BASIC for Toy 8086/88 Embedded systems
+See the file header for now. 
 
 ## License
 
