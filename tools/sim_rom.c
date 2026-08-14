@@ -7,18 +7,42 @@
 #include <limits.h>
 #include "./cpu.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 /*
- * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC (v1.4)
+ * sim_rom.c  --  Minimal 8088 CPU simulator wrapper for uBASIC (v1.5)
  * Leverages Mike Chamber's XTulator project cpu core.
  * Compright Vincent Crabtree 2026, MIT License
  *
  * ---------------------------------------------------------------------------
  * VERSION HISTORY
  * ---------------------------------------------------------------------------
+ * v1.5 : Added Emscripten/WebAssembly browser support, guarded entirely by
+ *          #ifdef __EMSCRIPTEN__ -- native CLI behaviour and code paths are
+ *          unchanged (verified by rebuilding and regressing without the
+ *          define). Binary-mode only in the browser: there's no in-browser
+ *          assembler (tinyasm is a separate native process the CLI shells
+ *          out to, which WASM can't do), so sim8088_select() only ever
+ *          loads pre-assembled .bin ROMs from the preloaded MEMFS. New
+ *          exports: sim8088_select(), sim8088_input(), sim8088_run_chunk(),
+ *          sim8088_cycles(), sim8088_set_io_addrs()  (mandatory -- there's
+ *          no .lst to auto-detect getchar/putchar from in this build),
+ *          sim8088_set_load_addr(), sim8088_set_entry_addr(),
+ *          sim8088_set_maxcycles(). JS owns the input FIFO and output sink
+ *          via sim_browser_char_available/getchar_nonblock/putchar/
+ *          enqueue_line EM_JS bridges, driven from sim8088_run_chunk()'s
+ *          non-blocking RUNNING/WAITING_INPUT/DONE state, mirroring
+ *          sim65c02_run_chunk()'s contract in the 65C02 web front end.
+ *          Factored the getchar/putchar hostcall "simulate a RET" logic
+ *          (pop return address off SS:SP) out of main()'s loop into a new
+ *          shared hostcall_return() so the native and browser loops can't
+ *          drift out of sync.
  * v1.4 : Fixed getchar/putchar hostcall trap silently never firing for ROMs
  *          whose reset stub far-jumps to a non-zero CS that is nonetheless
  *          address-equivalent to CS=0 under this sim's flat/16-bit-masked
@@ -179,6 +203,55 @@ uint8_t port_read(CPU_t *cpu, uint16_t port) { (void)cpu; (void)port; return 0xF
 uint16_t port_readw(CPU_t *cpu, uint16_t port) { return (uint16_t)port_read(cpu, port); }
 void port_write(CPU_t *cpu, uint16_t port, uint8_t value) { (void)cpu; (void)port; (void)value; }
 void port_writew(CPU_t *cpu, uint16_t port, uint16_t value) { port_write(cpu, port, (uint8_t)value); }
+
+#ifdef __EMSCRIPTEN__
+/* =============================================================================
+ * BROWSER (Emscripten) SUPPORT
+ *   Binary-mode only -- there is no in-browser assembler (tinyasm runs as a
+ *   separate native process on the CLI, which WASM can't shell out to), so
+ *   the browser build only ever loads pre-assembled .bin ROM images from
+ *   the preloaded MEMFS (see Makefile's web-assets target). Because there's
+ *   no .lst to auto-detect getchar/putchar from either, the JS side MUST
+ *   call sim8088_set_io_addrs() before sim8088_select() -- see
+ *   web/index8088.html, which reads them from the generated
+ *   web/assets/rom-io.json per ROM.
+ *   JS owns the input FIFO and the output sink; sim8088_run_chunk() below
+ *   polls/pushes through the sim_browser_* bridges, non-blocking, and never
+ *   calls the native getchar()/putchar() used by main()'s CLI loop.
+ * ============================================================================= */
+
+#define SIM_RUN_RUNNING       0
+#define SIM_RUN_WAITING_INPUT 1
+#define SIM_RUN_DONE           2
+
+static int       browser_io_active  = 0;
+static long long browser_maxcycles  = 0;      /* 0 = unlimited, mirrors CLI --cycles */
+static uint16_t  browser_entry_addr = 0xFFF0; /* mirrors CLI default --entry */
+static int       browser_entry_set  = 0;
+static uint16_t  browser_load_addr  = 0;
+static int       browser_load_set   = 0;
+
+EM_JS(int, sim_browser_char_available, (void), {
+    return (typeof Module.simCharAvailable === 'function' && Module.simCharAvailable()) ? 1 : 0;
+});
+
+EM_JS(int, sim_browser_getchar_nonblock, (void), {
+    if (typeof Module.simGetcharNonblock !== 'function') return -1;
+    return Module.simGetcharNonblock();
+});
+
+EM_JS(void, sim_browser_putchar, (int ch), {
+    if (typeof Module.simPutchar === 'function') Module.simPutchar(ch);
+});
+
+EM_JS(void, sim_browser_enqueue_line, (const char *line), {
+    if (typeof Module.simEnqueueLine === 'function') Module.simEnqueueLine(UTF8ToString(line));
+});
+
+static void sim_browser_put_text(const char *s) {
+    while (*s) sim_browser_putchar((unsigned char)*s++);
+}
+#endif /* __EMSCRIPTEN__ */
 
 static volatile int nmi_pending = 0;
 static void sigint_handler(int sig) { (void)sig; nmi_pending = 1; signal(SIGINT, sigint_handler); }
@@ -344,6 +417,23 @@ static int cs_is_flat_zero(uint16_t cs) {
     return (((uint32_t)cs << 4) & 0xFFFFu) == 0;
 }
 
+/* =============================================================================
+ * HOSTCALL_RETURN  simulate a subroutine RET after a getchar/putchar
+ *   hostcall trap completes: pop the return address pushed by the ROM's
+ *   CALL getchar/putchar off the stack (SS:SP) into cpu->ip, and advance
+ *   SP past it. Shared by the native run loop (main()) and, once added,
+ *   the browser run-chunk loop, so both stay in lockstep.
+ * Inputs  : cpu -- CPU whose hostcall is completing (SP must point at the
+ *           CALL's pushed return address)
+ * Outputs : none
+ * Clobbers: cpu->ip, cpu->regs.wordregs[regsp]
+ * ============================================================================= */
+static void hostcall_return(CPU_t *cpu) {
+    uint16_t sp = cpu->regs.wordregs[regsp];
+    cpu->ip = cpu_readw(cpu, ((uint32_t)cpu->segregs[regss] << 4) + sp);
+    cpu->regs.wordregs[regsp] = sp + 2;
+}
+
 static int get_dir_from_argv0(const char *argv0, char *out, size_t out_sz) {
     const char *slash1 = strrchr(argv0, '/');
     const char *slash2 = strrchr(argv0, '\\');
@@ -389,6 +479,174 @@ static int run_tinyasm(const char *argv0, const char *asm_file, char *out_bin, s
 #endif
     return system(cmd) == 0 ? 0 : -3;
 }
+
+#ifdef __EMSCRIPTEN__
+static CPU_t   em_cpu;
+static int     em_halted = 1;
+static long long em_cycles = 0;
+static uint32_t browser_last_load_base = 0;
+static uint32_t browser_last_load_size = 0;
+
+/* =============================================================================
+ * BROWSER_LOAD_BIN  read a .bin ROM image (from the Emscripten MEMFS
+ *   preload) into mem[] at the resolved load address.
+ * Inputs  : path -- MEMFS path, e.g. "assets/uBASIC8088.bin"
+ * Outputs : 0 on success, -1 on failure (diagnostic pushed to the terminal)
+ * Clobbers: mem[], browser_last_load_base, browser_last_load_size
+ * ============================================================================= */
+static int browser_load_bin(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { sim_browser_put_text("ROM binary open failed.\n"); return -1; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); sim_browser_put_text("ROM seek failed.\n"); return -1; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > (long)MEM_SIZE) {
+        fclose(f); sim_browser_put_text("ROM binary has an invalid size.\n"); return -1;
+    }
+    rewind(f);
+
+    uint16_t load_addr = browser_load_set ? browser_load_addr : (uint16_t)(0x10000u - (unsigned)sz);
+    if ((unsigned)load_addr + (unsigned)sz > MEM_SIZE) {
+        fclose(f); sim_browser_put_text("ROM does not fit at its load address.\n"); return -1;
+    }
+
+    size_t n = (size_t)sz;
+    if (fread(&mem[load_addr], 1, n, f) != n) {
+        fclose(f); sim_browser_put_text("ROM read failed.\n"); return -1;
+    }
+    fclose(f);
+
+    browser_last_load_base = load_addr;
+    browser_last_load_size = (uint32_t)sz;
+    return 0;
+}
+
+/*
+ * SIM8088_SET_IO_ADDRS  set the GETCH/PUTCH hostcall trap addresses for
+ *   the next sim8088_select() -- mandatory, since the browser build has
+ *   no .lst to auto-detect them from. Inputs/Outputs/Clobbers: see header
+ *   comment above BROWSER (Emscripten) SUPPORT.
+ */
+EMSCRIPTEN_KEEPALIVE
+void sim8088_set_io_addrs(int getchar_addr, int putchar_addr) {
+    g_getchar_addr = (uint16_t)getchar_addr;
+    g_putchar_addr = (uint16_t)putchar_addr;
+}
+
+/* SIM8088_SET_LOAD_ADDR  override the auto (0x10000-size) ROM load address. */
+EMSCRIPTEN_KEEPALIVE
+void sim8088_set_load_addr(int addr) { browser_load_addr = (uint16_t)addr; browser_load_set = 1; }
+
+/* SIM8088_SET_ENTRY_ADDR  override the default 0xFFF0 reset-vector entry. */
+EMSCRIPTEN_KEEPALIVE
+void sim8088_set_entry_addr(int addr) { browser_entry_addr = (uint16_t)addr; browser_entry_set = 1; }
+
+/* SIM8088_SET_MAXCYCLES  instruction cap for sim8088_run_chunk(); 0 = unlimited. */
+EMSCRIPTEN_KEEPALIVE
+void sim8088_set_maxcycles(double n) { browser_maxcycles = (n > 0) ? (long long)n : 0; }
+
+/*
+ * SIM_LOAD_FOR_BROWSER  (re)load the given .bin ROM and reset the browser
+ *   CPU/machine state ready to run; pushes a config banner to the
+ *   terminal. Common body behind sim8088_select().
+ * Inputs  : bin_path -- MEMFS path to the ROM image
+ * Outputs : 0 on success, -1 on failure
+ * Clobbers: mem[], em_cpu, em_cycles, em_halted, browser_io_active
+ */
+static int sim_load_for_browser(const char *bin_path) {
+    memset(mem, 0, sizeof(mem));
+    memset(&em_cpu, 0, sizeof(em_cpu));
+    em_cycles = 0;
+    em_halted = 1;
+    browser_io_active = 1;
+
+    if (g_getchar_addr == 0 && g_putchar_addr == 0) {
+        sim_browser_put_text("GETCH/PUTCH addresses not set -- call sim8088_set_io_addrs() first.\n");
+        return -1;
+    }
+    if (browser_load_bin(bin_path) < 0) return -1;
+
+    cpu_reset(&em_cpu);
+    em_cpu.segregs[regcs] = em_cpu.segregs[regds] = em_cpu.segregs[reges] = em_cpu.segregs[regss] = 0;
+    em_cpu.ip = browser_entry_set ? browser_entry_addr : 0xFFF0;
+
+    char mcbuf[24];
+    if (browser_maxcycles > 0) snprintf(mcbuf, sizeof mcbuf, "%lld", browser_maxcycles);
+    else                       snprintf(mcbuf, sizeof mcbuf, "unlimited");
+    char buf[320];
+    snprintf(buf, sizeof buf,
+        "Loaded %u bytes from '%s' ($%04X-$%04X)\n"
+        "sim_rom.c v1.5 (browser)\n"
+        "Config: GETCH=$%04X  PUTCH=$%04X  entry=$%04X  maxcycles=%s\n\n",
+        (unsigned)browser_last_load_size, bin_path,
+        (unsigned)browser_last_load_base,
+        (unsigned)(browser_last_load_base + browser_last_load_size - 1),
+        g_getchar_addr, g_putchar_addr, em_cpu.ip, mcbuf);
+    sim_browser_put_text(buf);
+
+    em_halted = 0;
+    return 0;
+}
+
+/* SIM8088_SELECT  load bin_path and reset state; returns 0/-1. See above. */
+EMSCRIPTEN_KEEPALIVE
+int sim8088_select(const char *bin_path) { return sim_load_for_browser(bin_path); }
+
+/* SIM8088_INPUT  enqueue a line of typed input (JS owns the FIFO). */
+EMSCRIPTEN_KEEPALIVE
+void sim8088_input(const char *line) { if (line) sim_browser_enqueue_line(line); }
+
+/*
+ * SIM8088_RUN_CHUNK  run up to instruction_budget instructions of the
+ *   browser CPU, non-blocking. GETCH hostcalls that find no input queued
+ *   return WAITING_INPUT immediately WITHOUT advancing IP -- the trap is
+ *   simply retried on the next call once JS has enqueued a character, so
+ *   (unlike a polling-loop ROM) no idle/backoff bookkeeping is needed here.
+ * Inputs  : instruction_budget -- instructions to execute this call
+ *           (<=0 defaults to 1000)
+ * Outputs : SIM_RUN_RUNNING / SIM_RUN_WAITING_INPUT / SIM_RUN_DONE
+ * Clobbers: em_cpu, em_cycles, em_halted
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim8088_run_chunk(int instruction_budget) {
+    if (em_halted) return SIM_RUN_DONE;
+    if (instruction_budget <= 0) instruction_budget = 1000;
+
+    for (int i = 0; i < instruction_budget; i++) {
+        if (browser_maxcycles != 0 && em_cycles >= browser_maxcycles) {
+            em_halted = 1;
+            return SIM_RUN_DONE;
+        }
+
+        if (cs_is_flat_zero(em_cpu.segregs[regcs])) {
+            if (em_cpu.ip == g_putchar_addr) {
+                sim_browser_putchar((int)em_cpu.regs.byteregs[regal]);
+                hostcall_return(&em_cpu);
+                em_cycles++;
+                continue;
+            }
+            if (em_cpu.ip == g_getchar_addr) {
+                if (!sim_browser_char_available()) return SIM_RUN_WAITING_INPUT;
+                int c = sim_browser_getchar_nonblock();
+                if (c < 0) return SIM_RUN_WAITING_INPUT;
+                if (c == '\n') c = '\r';
+                em_cpu.regs.byteregs[regal] = (uint8_t)c;
+                hostcall_return(&em_cpu);
+                em_cycles++;
+                continue;
+            }
+        }
+
+        cpu_exec(&em_cpu, 1);
+        em_cycles++;
+        if (em_cpu.hltstate) { em_halted = 1; return SIM_RUN_DONE; }
+    }
+    return SIM_RUN_RUNNING;
+}
+
+/* SIM8088_CYCLES  instruction counter readout for the browser status line. */
+EMSCRIPTEN_KEEPALIVE
+long long sim8088_cycles(void) { return em_cycles; }
+#endif /* __EMSCRIPTEN__ */
 
 int main(int argc, char **argv) {
     const char *input_file = NULL;
@@ -589,18 +847,14 @@ int main(int argc, char **argv) {
         if (cs_is_flat_zero(cpu.segregs[regcs])) {
             if (cpu.ip == g_putchar_addr) {
                 putchar((int)cpu.regs.byteregs[regal]); fflush(stdout);
-                uint16_t sp = cpu.regs.wordregs[regsp];
-                cpu.ip = cpu_readw(&cpu, ((uint32_t)cpu.segregs[regss] << 4) + sp);
-                cpu.regs.wordregs[regsp] = sp + 2;
+                hostcall_return(&cpu);
                 continue;
             }
             if (cpu.ip == g_getchar_addr) {
                 int c = getchar();
                 if (c == EOF) { cpu.hltstate = 1; break; }
                 cpu.regs.byteregs[regal] = (uint8_t)c;
-                uint16_t sp = cpu.regs.wordregs[regsp];
-                cpu.ip = cpu_readw(&cpu, ((uint32_t)cpu.segregs[regss] << 4) + sp);
-                cpu.regs.wordregs[regsp] = sp + 2;
+                hostcall_return(&cpu);
                 continue;
             }
         }
