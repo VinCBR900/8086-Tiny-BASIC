@@ -1,5 +1,5 @@
 # =============================================================================
-# Makefile  --  8088 Tiny BASIC: native tools/ROMs + browser (Wasm) build (v1)
+# Makefile  --  8088 Tiny BASIC: native tools/ROMs + browser (Wasm) build (v2)
 #
 # Layout assumed:
 #   tools/            sim_rom.c, cpu.c, cpu.h, tinyasm.c, ins.c, ...
@@ -19,6 +19,14 @@
 #   make clean          remove all build output
 #
 # History:
+#   v2 (Aug 2026) -- web-dist now also `cp -R`s web/assets/ into dist/assets/
+#     as literal static files, alongside the existing --preload-file step.
+#     --preload-file only bakes web/assets/ into the WASM's virtual MEMFS
+#     (for sim8088_select()'s own fopen() calls at runtime); it does not
+#     produce real files under dist/, so index8088.html's plain
+#     fetch('assets/rom-io.json') was 404ing on GitHub Pages (served the
+#     Pages 404 HTML page back where JSON was expected -- reported after
+#     the first live deploy).
 #   v1 (Aug 2026) -- initial Makefile for this project. Mirrors the sibling
 #     65C02 project's Makefile/emscripten-pages.yml shape (native-smoke +
 #     web-assets + web-dist targets, same emcc flag set), adapted for this
@@ -124,6 +132,14 @@ web-assets: $(WEB_ROMS) $(ROM_IO_JSON)
 web-dist: web-assets
 	mkdir -p $(DIST_DIR)
 	cp $(WEB_DIR)/index8088.html $(DIST_DIR)/index.html
+	# Real static copy for the browser's own fetch('assets/rom-io.json') --
+	# --preload-file below only bakes web/assets/ into the WASM's virtual
+	# MEMFS (for sim8088_select()'s fopen() calls at runtime), it does NOT
+	# put literal files under dist/, so without this GitHub Pages 404s on
+	# a plain fetch() and the JS gets an HTML error page back where it
+	# expected JSON.
+	rm -rf $(DIST_DIR)/assets
+	cp -R $(WEB_ASSETS_DIR) $(DIST_DIR)/assets
 	$(EMCC) $(SIM_SRC) $(CPU_SRC) \
 		-O2 \
 		-s MODULARIZE=0 \
